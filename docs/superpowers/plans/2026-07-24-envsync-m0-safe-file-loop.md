@@ -1,8 +1,9 @@
 # EnvSync M0 安全文件闭环实施计划
 
-> **执行要求：** 实施时必须使用 `subagent-driven-development` 或
-> `executing-plans`，每个行为先写失败测试，再写最小实现；完成前使用
-> `verification-before-completion`。
+> **For agentic workers:** REQUIRED SUB-SKILL: Use
+> superpowers:subagent-driven-development (recommended) or
+> superpowers:executing-plans to implement this plan task-by-task. 实施时每个行为先写失败
+> 测试，再写最小实现；完成前使用 superpowers:verification-before-completion。
 
 **目标：** 交付可验证、可回滚的 Local Backend 文件同步闭环：capture、plan、
 CAS publish、apply、verify、rollback。
