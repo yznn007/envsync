@@ -8,17 +8,20 @@
 //! `serde_json::json!`：字段名是对外承诺，写错时应当编译失败，改动时应当被 golden
 //! test 抓住。
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
+use envsync_adapters::{AdapterContext, AdapterRegistry, DiscoveredResource, ROOT_SYSTEM};
 use envsync_core::{
     ApplyOutcome, CoreError, CoreResult, DoctorReport, EnvSyncService, RecoveryDiagnosis,
-    RecoveryReport, RecoverySuggestion, StatusReport, WorkspaceConfig,
+    RecoveryReport, RecoverySuggestion, ResourceConfig, StatusReport, WorkspaceConfig,
 };
 use envsync_domain::{
-    ActionKind, BackupPolicy, ConflictId, ConflictKind, DesiredDisposition, OperationId, PlanId,
-    ProjectionNoteKind, ResolutionChoice, Risk, RollbackCapability,
+    ActionKind, BackupPolicy, ConflictId, ConflictKind, DesiredDisposition, DeviceProfile,
+    FileMode, OperationId, PlanId, ProjectionNoteKind, ResolutionChoice, Risk, RollbackCapability,
+    Selector, StructuredFormat,
 };
 
 use crate::output::DiagnosticOut;
@@ -74,6 +77,10 @@ pub enum CommandData {
     ConflictResolve(ConflictResolveData),
     /// `profile explain` 的数据（schema v2 起）。
     ProfileExplain(ProfileExplainData),
+    /// `adapters list` 的数据（schema v2 起）。
+    AdapterList(AdapterListData),
+    /// `adapters discover` 的数据（schema v2 起）。
+    AdapterDiscover(AdapterDiscoverData),
 }
 
 impl CommandData {
@@ -93,6 +100,8 @@ impl CommandData {
             CommandData::ConflictShow(data) => data.render(),
             CommandData::ConflictResolve(data) => data.render(),
             CommandData::ProfileExplain(data) => data.render(),
+            CommandData::AdapterList(data) => data.render(),
+            CommandData::AdapterDiscover(data) => data.render(),
         }
     }
 
@@ -102,7 +111,12 @@ impl CommandData {
     /// 只在 v2 才有的整条命令不走这里：它们在派发阶段就被拒绝。
     pub fn v2_only_fields(&self) -> &'static [&'static str] {
         match self {
-            CommandData::Status(_) => &["open_conflicts"],
+            CommandData::Status(_) => &[
+                "open_conflicts",
+                "backend_reachable",
+                "last_known_revision_at_unix_ms",
+            ],
+            CommandData::Init(_) => &["discovered_resources"],
             CommandData::Plan(_) => &["device_view"],
             _ => &[],
         }
@@ -128,41 +142,86 @@ pub struct InitData {
     pub backend_kind: String,
     /// 本地状态目录（journal / 草稿 / 备份）。
     pub state_dir: String,
+    /// 由内建适配器自动写进配置的资源数量（schema v2 起）。
+    ///
+    /// 没有加 `--discover` 时恒为 `0`：初始化默认生成**空**资源列表，由用户自己决定
+    /// 管什么。
+    pub discovered_resources: usize,
 }
 
 impl InitData {
     fn render(&self) -> String {
+        let next = if self.discovered_resources > 0 {
+            format!(
+                "已自动写入 {} 个由内建适配器发现的资源。\n\
+                 下一步：`envsync adapters discover` 可复核这份清单，确认无误后运行 \
+                 `envsync capture`。",
+                self.discovered_resources
+            )
+        } else {
+            "下一步：编辑配置里的 resources（`envsync adapters discover` 可生成一份建议），\
+             然后运行 `envsync capture`。"
+                .to_owned()
+        };
         [
             format!("已初始化工作区 {}", self.workspace),
             format!("  设备：{}（{}）", self.device_name, self.device),
             format!("  配置：{}", self.config_path),
             format!("  后端：{}", self.backend_kind),
             format!("  状态目录：{}", self.state_dir),
-            "下一步：编辑配置里的 resources，然后运行 `envsync capture`。".to_owned(),
+            next,
         ]
         .join("\n")
     }
 }
 
 /// 初始化工作区。
+///
+/// `discover` 为 `true` 时，在生成配置之后立刻跑一次适配器发现，把结果写回同一个配置
+/// 文件。发现是纯计算，不读用户文件也不联网，因此这一步不会因为「机器上还没有 `.zshrc`」
+/// 而失败——它声明的是「这台设备上**应该**管哪些文件」，实际存不存在由 `capture` 观察。
 pub fn init(
     config_path: &Path,
     device_name: Option<&str>,
     backend_path: &Path,
+    discover: bool,
 ) -> CoreResult<CommandOutput> {
     let device_name = device_name
         .map(str::to_owned)
         .unwrap_or_else(default_device_name);
-    let config = EnvSyncService::init_workspace(config_path, &device_name, backend_path)?;
+    let mut config = EnvSyncService::init_workspace(config_path, &device_name, backend_path)?;
 
-    Ok(CommandOutput::plain(CommandData::Init(InitData {
-        workspace: config.workspace_id.to_string(),
-        device_name: config.device.name.clone(),
-        device: config.device.device_id().to_hex(),
-        config_path: display_path(config_path),
-        backend_kind: config.backend.kind().to_owned(),
-        state_dir: display_path(&config.state_dir),
-    })))
+    let mut diagnostics = Vec::new();
+    if discover {
+        let (discovered, _) = discover_resources(&config);
+        config.resources = to_resource_configs(&discovered);
+        // 重写刚刚生成的那个文件。这里**不是**覆盖用户的已有工作区：`init_workspace`
+        // 已经确认过配置文件原本不存在，这个文件是本命令自己在几行之前写下的。
+        std::fs::write(config_path, config.to_yaml()?).map_err(|error| {
+            // 只回显文件名与错误类别，绝不把绝对路径写进诊断。
+            envsync_platform_error(config_path, &error)
+        })?;
+        if config.resources.is_empty() {
+            diagnostics.push(DiagnosticOut::warning(
+                "adapters.nothing_discovered",
+                "没有发现任何可管理的资源，配置里的 resources 仍然是空的。".to_owned(),
+            ));
+        }
+        diagnostics.extend(system_root_note(&config));
+    }
+
+    Ok(CommandOutput {
+        data: CommandData::Init(InitData {
+            workspace: config.workspace_id.to_string(),
+            device_name: config.device.name.clone(),
+            device: config.device.device_id().to_hex(),
+            config_path: display_path(config_path),
+            backend_kind: config.backend.kind().to_owned(),
+            state_dir: display_path(&config.state_dir),
+            discovered_resources: config.resources.len(),
+        }),
+        diagnostics,
+    })
 }
 
 /// 未显式指定时的设备名。
@@ -437,13 +496,23 @@ pub struct StatusData {
     pub device: String,
     /// 后端种类。
     pub backend_kind: String,
-    /// 后端当前 revision。
+    /// 后端是否可达（schema v2 起）。
+    ///
+    /// 为 `false` 时 `revision` / `head` / `resources` 反映的是本地记录的**上次已知**
+    /// 状态，而不是远端此刻的内容。
+    pub backend_reachable: bool,
+    /// 上次成功读到后端 Ref 的本机时刻，Unix 毫秒（schema v2 起）。
+    ///
+    /// 只在 `backend_reachable` 为 `false` 时有值：它回答「这份状态有多旧」。
+    pub last_known_revision_at_unix_ms: Option<u64>,
+    /// 后端当前 revision；后端不可达时是上次已知的 revision。
     pub revision: u64,
-    /// 后端当前头；从未发布过时为 `null`。
+    /// 后端当前头；从未发布过时为 `null`。后端不可达时是上次已知的头。
     pub head: Option<String>,
     /// 本地草稿头；没有未发布草稿时为 `null`。
     pub draft_head: Option<String>,
-    /// 整体状态：`clean` / `drifted` / `conflicted` / `published_not_converged`。
+    /// 整体状态：`clean` / `drifted` / `conflicted` / `published_not_converged` /
+    /// `backend_unreachable`。
     pub state: &'static str,
     /// 待应用动作数量。
     pub pending_actions: usize,
@@ -457,10 +526,24 @@ pub struct StatusData {
 
 impl StatusData {
     fn render(&self) -> String {
+        let backend_line = if self.backend_reachable {
+            format!("  后端：{}，revision {}", self.backend_kind, self.revision)
+        } else {
+            // 不可达时把「这是旧数据」写在最显眼的位置，避免读者顺手把 revision 当现状。
+            format!(
+                "  后端：{}，不可达；以下为上次已知状态（revision {}{}）",
+                self.backend_kind,
+                self.revision,
+                match self.last_known_revision_at_unix_ms {
+                    Some(at) => format!("，本机时刻 {at} ms"),
+                    None => String::new(),
+                }
+            )
+        };
         let mut text = [
             format!("工作区 {}（{}）", self.workspace, state_label(self.state)),
             format!("  设备：{}", self.device),
-            format!("  后端：{}，revision {}", self.backend_kind, self.revision),
+            backend_line,
             format!("  当前头：{}", self.head.as_deref().unwrap_or("（无）")),
             format!(
                 "  草稿头：{}",
@@ -498,6 +581,7 @@ fn state_label(state: &str) -> String {
         "drifted" => "存在待应用变更",
         "conflicted" => "存在冲突",
         "published_not_converged" => "已发布但本地未收敛",
+        "backend_unreachable" => "后端不可达，显示的是上次已知状态",
         _ => "未知",
     };
     format!("{state}／{label}")
@@ -511,6 +595,8 @@ pub fn status(config_path: &Path) -> CoreResult<CommandOutput> {
         workspace: report.workspace.to_string(),
         device: report.device.to_hex(),
         backend_kind: report.backend_kind.to_owned(),
+        backend_reachable: report.backend_reachable,
+        last_known_revision_at_unix_ms: report.last_known_revision_at_unix_ms,
         revision: report.revision,
         head: report.head.map(|id| id.to_hex()),
         draft_head: report.draft_head.map(|id| id.to_hex()),
@@ -1164,6 +1250,339 @@ pub fn profile_explain(config_path: &Path) -> CoreResult<CommandOutput> {
             .collect(),
     };
     Ok(CommandOutput::plain(CommandData::ProfileExplain(data)))
+}
+
+// ---------------------------------------------------------------------------
+// adapters
+//
+// 这两条命令是 `envsync-adapters` 的**消费者**：在此之前那个 crate 虽然完整实现并有
+// 跨平台 fixture 覆盖，却没有任何调用方，用户只能照着文档手抄资源表。
+//
+// 分工保持不变：适配器只做纯计算（给定 Profile 与授权根前缀，算出「应该管哪些文件」），
+// 真正的读写仍然由配置驱动。因此 `discover` 的产物是**一段可粘贴的配置**，而不是一条
+// 绕过配置直接生效的旁路——用户始终看得到、改得动、审阅得了自己在同步什么。
+// ---------------------------------------------------------------------------
+
+/// 由配置推导适配器可见的「授权根别名 -> 相对前缀」表。
+///
+/// 前缀一律是空串：EnvSync 的授权根**就是**配置里那个绝对路径，适配器的资源路径本来
+/// 就相对它。`AdapterContext` 之所以留了这个前缀，是为了容纳「授权根是主目录的上一层」
+/// 这类布局；本 CLI 不使用那种布局。
+///
+/// 只放**配置里真实声明过**的别名：凭空补一个 `system` 会让 `discover` 产出一条指向
+/// 未授权目录的资源，而用户根本没同意过写那里。
+fn adapter_roots(config: &WorkspaceConfig) -> BTreeMap<String, String> {
+    config
+        .roots
+        .keys()
+        .map(|alias| (alias.clone(), String::new()))
+        .collect()
+}
+
+/// 文件管理模式的稳定短名，与配置里的写法一致（照抄即可）。
+fn mode_name(mode: FileMode) -> &'static str {
+    match mode {
+        FileMode::FullFile => "full_file",
+        FileMode::ManagedBlock => "managed_block",
+        FileMode::StructuredMerge => "structured_merge",
+        FileMode::GeneratedInclude => "generated_include",
+    }
+}
+
+/// 期望处置的稳定短名，与配置里的写法一致。
+fn disposition_name(disposition: DesiredDisposition) -> &'static str {
+    match disposition {
+        DesiredDisposition::Managed => "managed",
+        DesiredDisposition::EnsureAbsent => "ensure_absent",
+        DesiredDisposition::Unmanaged => "unmanaged",
+    }
+}
+
+/// 适配器发现出的一条资源。
+#[derive(Debug, Serialize)]
+pub struct AdapterResourceData {
+    /// 资源标识。
+    pub resource: String,
+    /// 授权根别名。
+    pub root: String,
+    /// 相对该授权根的目标路径。
+    pub target: String,
+    /// 文件管理模式。
+    pub mode: FileMode,
+    /// 期望处置。内建适配器只会产出 `managed` 或 `unmanaged`，绝不产出 `ensure_absent`。
+    pub disposition: DesiredDisposition,
+    /// 结构化合并格式；不适用时为 `null`。
+    pub structured_format: Option<StructuredFormat>,
+    /// 该资源的选择器在本设备上是否命中；无选择器时恒为 `true`。
+    pub selected: bool,
+}
+
+impl AdapterResourceData {
+    fn from_discovered(discovered: &DiscoveredResource, profile: &DeviceProfile) -> Self {
+        AdapterResourceData {
+            resource: discovered.id.to_string(),
+            root: discovered.root.clone(),
+            target: discovered.target.clone(),
+            mode: discovered.mode,
+            disposition: discovered.disposition,
+            structured_format: discovered.policy.structured_format,
+            selected: selector_matches(discovered.selector.as_ref(), profile),
+        }
+    }
+}
+
+/// 求值资源级选择器；与 `AdapterRegistry::discover_all` 用同一条规则。
+///
+/// 先 `validate` 再 `matches`：选择器虽然来自内建适配器（可信），但这是 `Selector` 的
+/// 使用契约，校验失败时保守判为「不匹配」。
+fn selector_matches(selector: Option<&Selector>, profile: &DeviceProfile) -> bool {
+    match selector {
+        None => true,
+        Some(selector) => selector.validate().is_ok() && selector.matches(profile),
+    }
+}
+
+/// 一个内建适配器的自述与它在本设备上的资源。
+#[derive(Debug, Serialize)]
+pub struct AdapterData {
+    /// 稳定 ID，跨版本不变。
+    pub id: String,
+    /// 展示名。
+    pub display_name: String,
+    /// 适配器版本。
+    pub version: u32,
+    /// 支持的操作系统。
+    pub supported_os: Vec<String>,
+    /// 所需能力；设备 Profile 必须**全部**具备，适配器才会参与发现。
+    pub required_capabilities: Vec<String>,
+    /// 主要文件管理模式，仅用于展示与诊断。
+    pub default_mode: FileMode,
+    /// 本适配器是否适用于当前设备（操作系统在支持列表内 ∧ 所需能力全部具备）。
+    pub applies: bool,
+    /// 该适配器在当前授权根下的目标资源。
+    pub resources: Vec<AdapterResourceData>,
+}
+
+/// `adapters list` 的数据。
+#[derive(Debug, Serialize)]
+pub struct AdapterListData {
+    /// 是否列出了全部适配器（`--all`），而不是只列适用于本设备的。
+    pub all: bool,
+    /// 本设备的操作系统。
+    pub os: &'static str,
+    /// 本设备的处理器架构。
+    pub arch: &'static str,
+    /// 列出的适配器数量。
+    pub count: usize,
+    /// 逐个适配器。
+    pub adapters: Vec<AdapterData>,
+}
+
+impl AdapterListData {
+    fn render(&self) -> String {
+        let mut text = format!(
+            "内建适配器：{} 个（{}；本设备 {} / {}）",
+            self.count,
+            if self.all {
+                "全部"
+            } else {
+                "已按本设备 Profile 过滤，`--all` 可看全部"
+            },
+            self.os,
+            self.arch,
+        );
+        for adapter in &self.adapters {
+            text.push_str(&format!(
+                "\n  {mark} {id} v{version}（{name}）",
+                mark = if adapter.applies { "✓" } else { "·" },
+                id = adapter.id,
+                version = adapter.version,
+                name = adapter.display_name,
+            ));
+            text.push_str(&format!(
+                "\n      平台：{}；能力：{}；默认模式：{}",
+                join_or_dash(&adapter.supported_os),
+                join_or_dash(&adapter.required_capabilities),
+                mode_name(adapter.default_mode),
+            ));
+            for resource in &adapter.resources {
+                text.push_str(&format!(
+                    "\n      {mark} {resource} → {root}:{target}（{mode}／{disposition}）",
+                    mark = if resource.selected { "-" } else { "·" },
+                    resource = resource.resource,
+                    root = resource.root,
+                    target = resource.target,
+                    mode = mode_name(resource.mode),
+                    disposition = disposition_name(resource.disposition),
+                ));
+            }
+        }
+        text
+    }
+}
+
+/// `adapters discover` 的数据。
+#[derive(Debug, Serialize)]
+pub struct AdapterDiscoverData {
+    /// 本设备标识。
+    pub device: String,
+    /// 发现到的资源数量。
+    pub count: usize,
+    /// 逐条资源。
+    pub resources: Vec<AdapterResourceData>,
+    /// 可直接粘贴进配置的 `resources:` YAML 片段。
+    ///
+    /// 它由与 `WorkspaceConfig::to_yaml` **同一套**线格式类型序列化，因此粘贴之后一定
+    /// 能被解析回来。
+    pub yaml: String,
+}
+
+impl AdapterDiscoverData {
+    fn render(&self) -> String {
+        if self.count == 0 {
+            return "没有发现任何可管理的资源。\n\
+                    常见原因：本设备的 Profile 没有命中任何适配器，或配置里声明的授权根\
+                    不含 `home`。"
+                .to_owned();
+        }
+        format!(
+            "发现 {} 个可管理的资源（设备 {}）。\n\
+             把下面这段粘贴进配置文件的顶层即可：\n\n{}",
+            self.count, self.device, self.yaml,
+        )
+    }
+}
+
+/// 在当前设备上运行一次适配器发现。
+///
+/// 返回「发现结果 + 本设备 Profile」。发现是**纯计算**：不读用户文件、不联网，因此
+/// 即使后端不可达也能正常工作。
+fn discover_resources(config: &WorkspaceConfig) -> (Vec<DiscoveredResource>, DeviceProfile) {
+    let profile = config.device_profile();
+    let roots = adapter_roots(config);
+    let context = AdapterContext::new(&profile, &roots, "");
+    let registry = AdapterRegistry::builtin();
+    let mut discovered = registry.discover_all(&context);
+    // `AdapterContext::prefix` 对缺失的 `home` 会退回 `home_relative`，因此即使配置里
+    // 没声明 `home` 也会产出主目录资源。这里再筛一道：配置没授权的根，不该出现在建议
+    // 里——照抄下去只会得到一条 `config.unknown_root`。
+    discovered.retain(|resource| config.roots.contains_key(&resource.root));
+    (discovered, profile)
+}
+
+/// 把发现结果转成配置层的资源声明。
+///
+/// 两者字段一一对应，因此这里没有任何「猜测」：适配器已经决定了标识、根、目标、模式、
+/// 处置与策略。`device_overrides` 留空——按设备改写落地位置是用户的决定，不是适配器的。
+fn to_resource_configs(discovered: &[DiscoveredResource]) -> Vec<ResourceConfig> {
+    discovered
+        .iter()
+        .map(|item| ResourceConfig {
+            id: item.id.clone(),
+            root: item.root.clone(),
+            target: item.target.clone(),
+            mode: item.mode,
+            disposition: item.disposition,
+            policy: item.policy.clone(),
+            comment_prefix: item.comment_prefix.clone(),
+            selector: item.selector.clone(),
+            device_overrides: BTreeMap::new(),
+        })
+        .collect()
+}
+
+/// 没有声明 `system` 授权根时的说明性诊断。
+///
+/// 这不是错误：不授权 `system` 是**推荐**配置（见 docs/adapters.md）。但如果不说一声，
+/// 用户会以为清单漏了系统级 Git 配置。
+fn system_root_note(config: &WorkspaceConfig) -> Option<DiagnosticOut> {
+    if config.roots.contains_key(ROOT_SYSTEM) {
+        return None;
+    }
+    Some(DiagnosticOut::info(
+        "adapters.system_root_not_declared",
+        format!(
+            "配置未声明 `{ROOT_SYSTEM}` 授权根，系统级配置（只观察、绝不写入）未列出；\
+             这是推荐配置，见 docs/adapters.md。"
+        ),
+    ))
+}
+
+/// 列出内建适配器。
+pub fn adapters_list(config_path: &Path, all: bool) -> CoreResult<CommandOutput> {
+    let config = WorkspaceConfig::load(config_path)?;
+    let profile = config.device_profile();
+    let roots = adapter_roots(&config);
+    let context = AdapterContext::new(&profile, &roots, "");
+    let registry = AdapterRegistry::builtin();
+
+    let mut adapters = Vec::new();
+    for adapter in registry.adapters() {
+        let descriptor = adapter.descriptor();
+        let applies = descriptor.applies_to(&profile);
+        if !applies && !all {
+            continue;
+        }
+        // 单个适配器出错不该让整条命令失败——与 `discover_all` 的处理保持一致。
+        let discovered = adapter.discover(&context).unwrap_or_default();
+        let resources: Vec<AdapterResourceData> = discovered
+            .iter()
+            .filter(|resource| config.roots.contains_key(&resource.root))
+            .map(|resource| AdapterResourceData::from_discovered(resource, &profile))
+            // 不带 `--all` 时只列本设备真正会用到的资源。
+            .filter(|resource| all || resource.selected)
+            .collect();
+        adapters.push(AdapterData {
+            id: descriptor.id.to_owned(),
+            display_name: descriptor.display_name.to_owned(),
+            version: descriptor.version,
+            supported_os: descriptor
+                .supported_os
+                .iter()
+                .map(|os| os.as_str().to_owned())
+                .collect(),
+            required_capabilities: descriptor
+                .required_capabilities
+                .iter()
+                .map(|capability| (*capability).to_owned())
+                .collect(),
+            default_mode: descriptor.default_mode,
+            applies,
+            resources,
+        });
+    }
+
+    Ok(CommandOutput {
+        data: CommandData::AdapterList(AdapterListData {
+            all,
+            os: profile.os.as_str(),
+            arch: profile.arch.as_str(),
+            count: adapters.len(),
+            adapters,
+        }),
+        diagnostics: system_root_note(&config).into_iter().collect(),
+    })
+}
+
+/// 对当前设备运行适配器发现，产出可粘贴的配置片段。
+pub fn adapters_discover(config_path: &Path) -> CoreResult<CommandOutput> {
+    let config = WorkspaceConfig::load(config_path)?;
+    let (discovered, profile) = discover_resources(&config);
+    let resources = to_resource_configs(&discovered);
+    let yaml = WorkspaceConfig::resources_to_yaml(&resources)?;
+
+    Ok(CommandOutput {
+        data: CommandData::AdapterDiscover(AdapterDiscoverData {
+            device: profile.device.map(|id| id.to_hex()).unwrap_or_default(),
+            count: discovered.len(),
+            resources: discovered
+                .iter()
+                .map(|resource| AdapterResourceData::from_discovered(resource, &profile))
+                .collect(),
+            yaml,
+        }),
+        diagnostics: system_root_note(&config).into_iter().collect(),
+    })
 }
 
 // ---------------------------------------------------------------------------

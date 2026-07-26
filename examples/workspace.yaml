@@ -1,17 +1,23 @@
-# EnvSync 工作区配置示例
+# EnvSync 工作区配置示例（配置版本 2 / M1）
 #
 # 这份文件被 `crates/envsync-core/tests/config.rs` 用 `include_str!` 读入并真实解析，
 # 因此它**永远不会过期**：字段一旦改名或语义变化，测试立刻失败。
 #
-# 三条阅读须知：
+# 想看 Git 后端的完整配置，见同目录的 `workspace-git.yaml`。
+# （那一份**不**被自动测试解析，请改动后手工核对。）
+#
+# 四条阅读须知：
 #
 # 1. 所有路径都是占位符（`/home/YOUR_USER`、`/srv/YOUR_BACKEND`），请替换成你自己的
-#    真实路径。示例里绝不写入任何真实用户名、主机名或密钥。
+#    真实路径。示例里绝不写入任何真实用户名、主机名或凭据。
 # 2. 相对路径一律相对**本配置文件所在目录**解析，与你在哪个目录执行命令无关。
 # 3. 未知字段会被直接拒绝（不是忽略）。写错字段名会报错，而不是让你以为策略生效了。
+# 4. 版本 2 新增 `profile`、资源级 `selector`、`device_overrides` 与 Git 后端。
+#    在声明 `version: 1` 的文档里写这些字段会报 `config.field_requires_version`，
+#    而不是被静默忽略。
 
-# 配置版本。当前只支持 1；写别的值会报错，不会被静默按旧版语义解释。
-version: 1
+# 配置版本。可读取的范围是 1～2；范围之外报错，绝不按别的版本猜测语义。
+version: 2
 
 # 工作区标识，UUID。由 `envsync init` 生成，之后不要手改：它参与快照与引用的绑定。
 workspace_id: "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
@@ -25,7 +31,7 @@ device:
   # 下面这一串只是示例占位值，请勿在真实环境使用。
   seed_hex: "3a7f1c92b4de5068a1cf23947db6e50f8c41a2937be05d6c1f83a4b72e90cd15"
 
-# 同步后端。M0 只支持本地目录（内容寻址对象库 + 引用文件）。
+# 同步后端。本地目录（内容寻址对象库 + 引用文件）或 Git 远端。
 backend:
   kind: local
   # 后端根目录。可以是任何你能读写的目录，包括挂载的网盘目录。
@@ -34,6 +40,7 @@ backend:
 # 本地状态目录：journal 数据库、草稿库、备份都放在这里。
 # 可省略，默认就是本配置文件同目录下的 `.envsync`。
 # 具体布局：<state_dir>/journal.db、<state_dir>/draft/、<state_dir>/backups/
+# （Git 后端还会在 <state_dir>/git-cache/ 放一个私有 bare clone。）
 state_dir: ".envsync"
 
 # 授权根：EnvSync 被允许触碰的目录白名单。
@@ -44,11 +51,35 @@ roots:
   # 可以声明多个根，例如把 XDG 配置目录单独授权，方便按目录收紧范围：
   # xdg_config: "/home/YOUR_USER/.config"
 
+# ---- 设备 Profile（版本 2 起可用） ------------------------------------------
+#
+# 这里声明的是「这台设备是什么角色、有什么能力」，供资源级 selector 求值。
+#
+# 注意这里**没有** os 与 arch：它们由编译期探测得到，配置层没有覆盖入口。
+# 配置会被同步到所有设备，允许一台设备自报平台就等于允许它冒充另一台，
+# 从而绕过所有按 os 编写的 selector。详见 docs/profiles.md §1.1。
+#
+# 三个字段都可省略。取值在解析期做规范化校验：trim 后非空、单值不超过 256 字节、
+# 集合元素不超过 128 个，违反时报 config.invalid_profile_value。
+profile:
+  # 主机名覆盖；省略时 Profile 的 hostname 为 null，即不参与投影。
+  hostname: "workstation"
+  # 设备标签，用来表达「这台机器扮演什么角色」。
+  # `git-xdg` 是一个约定标签：只有打上它，`~/.config/git/config` 才会被下发
+  # （git 在 ~/.gitconfig 存在时根本不读 XDG 路径，默认下发会造成静默失效）。
+  tags:
+    - "work"
+    - "laptop"
+  # 本设备可用能力。它是「自述」，投影时还要与安全 policy 认定的能力取**交集**，
+  # 因此自报一个并不存在的能力只会让资源被排除，而不会让它被下发。
+  capabilities:
+    - "pwsh"
+
 # 被管理的资源列表。允许为空（空工作区是合法配置），之后再逐个添加。
 resources:
   # ---- 示例一：整文件管理 ----------------------------------------------------
   # full_file 表示这个文件完全由 EnvSync 拥有：内容以快照为准，本地手改会被视为漂移。
-  # 适合“纯粹从仓库分发”的配置，例如 git 的全局配置。
+  # 适合“纯粹从仓库分发”的配置。
   - id: git/config/global
     root: home
     target: .config/git/config
@@ -79,11 +110,75 @@ resources:
       # 是否是秘密资源。true 时禁止退化到可能暴露明文的写入路径。默认 false。
       secret: false
 
-  # ---- 示例三：显式删除 ------------------------------------------------------
+  # ---- 示例三：selector（版本 2 起可用） -------------------------------------
+  #
+  # selector 声明「哪些设备适用该资源」。每个节点都是一个**恰好一个键**的映射：
+  #   组合子：all（序列）、any（序列）、not（单个节点）
+  #   谓词：  os、arch、hostname、tag、capability、device（取值都是字符串）
+  #
+  # 上限：嵌套深度 16、节点总数 256；超限报 config.invalid_selector。
+  # 未命中的资源**只是本次不下发**，绝不会被删除——想删除必须写 ensure_absent。
+  - id: shell/powershell/profile
+    root: home
+    target: Documents/PowerShell/Microsoft.PowerShell_profile.ps1
+    mode: managed_block
+    disposition: managed
+    selector:
+      all:
+        - os: windows
+        # 把能力也写上：os 只说明平台，不说明装没装 PowerShell。
+        # 没装的机器会得到一条 unsupported_capability 诊断，明确指出缺什么，
+        # 而不是一条晦涩的写入失败。
+        - capability: pwsh
+
+  # 按标签分流：工作机上才下发；同时打了 work 和 personal 时以 work 优先。
+  - id: net/proxy/corp
+    root: home
+    target: .config/envsync/corp-proxy.conf
+    mode: full_file
+    disposition: managed
+    selector:
+      all:
+        - tag: work
+        - not:
+            tag: ci
+
+  # ---- 示例四：device_overrides（版本 2 起可用） -----------------------------
+  #
+  # 键必须是 64 个小写十六进制字符的设备标识（可从 `envsync profile explain` 或
+  # `envsync status` 的 data.device 拿到）。键拼错会报
+  # config.invalid_device_override_key，而不是静默失效。
+  #
+  # 两个可覆盖字段的作用面完全不同：
+  #   disposition —— 影响**期望状态**，在投影阶段生效；
+  #   target      —— 只影响**本机落地位置**，在计划阶段生效，不进入共享 Snapshot。
+  #
+  # 覆盖是**无条件**的：即使 selector 未命中，命中 device_overrides 的设备照样纳入
+  # 该资源。唯一能推翻它的是安全 policy。
+  # 条目里两个字段都省略会报 config.empty_device_override。
+  - id: editor/settings
+    root: home
+    target: .config/Code/User/settings.json
+    mode: full_file
+    disposition: managed
+    policy:
+      # 声明结构化格式后，跨设备协调时会走**语义**三方合并而不是逐行文本合并。
+      # 取值：json | yaml | toml | ini | git_config。详见 docs/merge.md。
+      structured_format: json
+    device_overrides:
+      # 这台机器用 Insiders 版，同一份内容写到另一个路径。
+      "9f2c3d4e5a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f":
+        target: .config/Code - Insiders/User/settings.json
+      # 这台机器完全不接管该文件，只记录存在性。
+      "1122334455667788990011223344556677889900112233445566778899001122":
+        disposition: unmanaged
+
+  # ---- 示例五：显式删除 ------------------------------------------------------
   # disposition 有三种取值：
   #   managed       —— 收敛到快照内容；
   #   ensure_absent —— 显式删除（tombstone）。只有这一种能产生删除动作；
-  #                    “文件读不出来”“平台不支持”永远不会被推断成删除意图；
+  #                    “文件读不出来”“平台不支持”“selector 未命中”“缺少能力”
+  #                    永远不会被推断成删除意图；
   #   unmanaged     —— 不归 EnvSync 管理，仅记录存在性。
   # - id: shell/bash/legacy
   #   root: home
@@ -91,28 +186,38 @@ resources:
   #   mode: full_file
   #   disposition: ensure_absent
 
-# ---- 高级用法（M1 起可用，M0 会直接报错） -----------------------------------
+# ---- 关于 mode 的当前边界 ----------------------------------------------------
 #
-# structured_merge：对结构化配置做语义合并，而不是整文件覆盖。
-# 使用时必须同时声明 policy.structured_format（json | yaml | toml | ini | git_config），
-# 否则报 config.structured_without_format。M0 阶段即使写全也会报 config.mode_not_supported。
+# 配置层接受 mode: full_file、managed_block 与 structured_merge；
+# 只有 generated_include 会被拒绝（config.mode_not_supported）。
 #
-# - id: editor/vscode/settings
-#   root: home
-#   target: .config/Code/User/settings.json
-#   mode: structured_merge
-#   disposition: managed
-#   policy:
-#     structured_format: json
+# * **结构化合并**：mode: structured_merge **必须**同时声明
+#   policy.structured_format，否则报 config.structured_without_format——声明了
+#   「按结构合并」却不说按哪种语法，是配置本身自相矛盾。
 #
-# generated_include：生成一个独立文件，再向主配置注入一条 include/source 指令。
-# 同样是 M1 起才启用。
+#   mode 与 structured_format 的分工：前者声明**落盘语义**（Structured Merge 与
+#   Full File 一样，把权威字节整份写入），后者声明**跨设备协调时按哪种语法比较**。
+#   因此 mode: full_file + structured_format: git_config 与
+#   mode: structured_merge + structured_format: git_config 行为一致，
+#   后者只是把意图写得更明白。
 #
-# - id: shell/zsh/generated
-#   root: home
-#   target: .config/envsync/zsh.zsh
-#   mode: generated_include
-#   disposition: managed
+# * **生成 + 注入**（设计文档里的 Generated Include）本来就是两条资源的组合：
+#   一条 full_file 生成独立文件，一条 managed_block 向主配置注入 include 语句。
+#   WezTerm 的内建适配器正是这么做的，见 docs/adapters.md §3：
+#
+#   - id: terminal/wezterm/module
+#     root: home
+#     target: .config/wezterm/envsync.lua
+#     mode: full_file
+#     disposition: managed
+#     comment_prefix: "-- "
+#
+#   - id: terminal/wezterm/include
+#     root: home
+#     target: .wezterm.lua
+#     mode: managed_block
+#     disposition: managed
+#     comment_prefix: "-- "
 #
 # ---- target 的书写规则 -------------------------------------------------------
 #

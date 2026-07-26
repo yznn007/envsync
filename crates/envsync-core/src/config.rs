@@ -435,6 +435,38 @@ impl WorkspaceConfig {
         }
     }
 
+    /// 把一组资源单独序列化成 `resources:` YAML 片段。
+    ///
+    /// `envsync adapters discover` 用它产出**可直接粘贴进配置**的文本：输出的字段名、
+    /// 取值写法与 [`WorkspaceConfig::to_yaml`] 完全一致（同一套线格式类型），因此粘进
+    /// 配置文件后一定能被 [`WorkspaceConfig::parse_yaml`] 读回来——不会出现「文档教的
+    /// 写法和解析器接受的写法不一样」这类问题。
+    ///
+    /// 只序列化资源本身：授权根、后端、设备身份都不在片段里，粘贴不会覆盖用户已有的
+    /// 那些字段。
+    ///
+    /// 与 [`WorkspaceConfig::to_yaml`] 的一处差别：**取默认值的策略字段被省略**。
+    /// 理由有两条——
+    ///
+    /// 1. 片段是给人读、给人改的，`max_bytes: 16777216` 这类噪声只会淹没真正要看的
+    ///    `unix_mode` 与 `structured_format`；
+    /// 2. 全量写出会包含 `secret: false` 这一行，而 CLI 的脱敏器按**键名**工作，会把它
+    ///    渲染成 `secret: <redacted>`，粘贴回去就是一份解析不了的 YAML。省略默认值让
+    ///    这条键根本不出现，从而不必为了输出好看去削弱脱敏器。
+    ///
+    /// 省略是安全的：所有被省略的字段在解析时都会取回同一个默认值，往返语义不变。
+    pub fn resources_to_yaml(resources: &[ResourceConfig]) -> Result<String, ConfigError> {
+        let raw = ResourcesFragment {
+            resources: resources
+                .iter()
+                .map(RawResource::from_config_minimal)
+                .collect(),
+        };
+        serde_yaml_ng::to_string(&raw).map_err(|error| ConfigError::Serialize {
+            message: error.to_string(),
+        })
+    }
+
     /// 序列化回 YAML（`envsync init` 写文件用）。
     ///
     /// 输出里的路径都是解析后的绝对路径，因此再次 [`WorkspaceConfig::parse_yaml`]
@@ -511,9 +543,16 @@ pub enum ConfigError {
         resource: String,
     },
 
-    /// 使用了 M0 尚未实现的文件模式。
-    #[error("资源 `{resource}` 使用的模式 `{mode}` 在 M0 尚未支持")]
-    ModeNotSupportedInM0 {
+    /// 使用了本实现不接受的文件模式。
+    ///
+    /// M1 起 `structured_merge` 已经放开；仍被拒绝的只有 `generated_include`。
+    /// 错误码保持 `config.mode_not_supported` 不变，避免破坏既有契约。
+    #[error(
+        "资源 `{resource}` 使用的模式 `{mode}` 不被支持：\
+         Generated Include 由适配器拆成 Full File + Managed Block 两个资源实现，\
+         见 docs/adapters.md"
+    )]
+    ModeNotSupported {
         /// 出问题的资源标识。
         resource: String,
         /// 被拒绝的模式名。
@@ -671,7 +710,7 @@ impl ConfigError {
             ConfigError::RootNotAbsolute { .. } => "config.root_not_absolute",
             ConfigError::NoRoots => "config.no_roots",
             ConfigError::StructuredWithoutFormat { .. } => "config.structured_without_format",
-            ConfigError::ModeNotSupportedInM0 { .. } => "config.mode_not_supported",
+            ConfigError::ModeNotSupported { .. } => "config.mode_not_supported",
             ConfigError::InvalidDeviceSeed { .. } => "config.invalid_device_seed",
             ConfigError::InvalidWorkspaceId => "config.invalid_workspace_id",
             ConfigError::InvalidResourceId { .. } => "config.invalid_resource_id",
@@ -1033,6 +1072,15 @@ struct RawConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     profile: Option<RawProfile>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    resources: Vec<RawResource>,
+}
+
+/// 只含 `resources:` 一个键的片段，供 [`WorkspaceConfig::resources_to_yaml`] 使用。
+///
+/// 刻意复用 [`RawResource`] 而不是另写一套序列化：片段的写法必须与完整配置逐字段一致，
+/// 否则「照抄 discover 的输出」就会写出解析不了的配置。
+#[derive(Serialize)]
+struct ResourcesFragment {
     resources: Vec<RawResource>,
 }
 
@@ -1502,27 +1550,24 @@ impl RawResource {
         }
         policy.structured_format = raw_policy.structured_format;
 
-        // 先报“缺少格式”，再报“模式未实现”：前者是配置本身自相矛盾，
-        // 无论哪个里程碑都是错的；后者只是当前版本的能力边界。
+        // 先报“缺少格式”，再报“模式不被支持”：前者是配置本身自相矛盾（声明了结构化
+        // 合并却没说用哪种语法），无论哪个里程碑都是错的；后者是本实现的能力边界。
         if self.mode == FileMode::StructuredMerge && policy.structured_format.is_none() {
             return Err(ConfigError::StructuredWithoutFormat {
                 resource: id.to_string(),
             });
         }
         match self.mode {
-            FileMode::StructuredMerge => {
-                return Err(ConfigError::ModeNotSupportedInM0 {
-                    resource: id.to_string(),
-                    mode: "structured_merge",
-                })
-            }
+            // Generated Include 不是一种渲染模式，而是「生成独立文件 + 向主配置注入
+            // include」这两件事的组合；内建适配器把它拆成 Full File 与 Managed Block
+            // 两个资源实现，因此配置层没有它对应的落地语义。
             FileMode::GeneratedInclude => {
-                return Err(ConfigError::ModeNotSupportedInM0 {
+                return Err(ConfigError::ModeNotSupported {
                     resource: id.to_string(),
                     mode: "generated_include",
                 })
             }
-            FileMode::FullFile | FileMode::ManagedBlock => {}
+            FileMode::FullFile | FileMode::ManagedBlock | FileMode::StructuredMerge => {}
         }
 
         // 选择器来自会被同步到所有设备的配置，是不可信输入：转换时限深，转换后再
@@ -1585,6 +1630,55 @@ impl RawResource {
             selector,
             device_overrides,
         })
+    }
+
+    /// 强类型 -> 线格式，**省略一切取默认值的字段**。
+    ///
+    /// 供 [`WorkspaceConfig::resources_to_yaml`] 产出可粘贴的片段；理由见那里的文档。
+    /// 省略后的片段与全量写法解析结果完全相同。
+    fn from_config_minimal(resource: &ResourceConfig) -> Self {
+        let default_policy = ResourcePolicy::default();
+        let policy = RawPolicy {
+            max_bytes: (resource.policy.max_bytes != default_policy.max_bytes)
+                .then_some(resource.policy.max_bytes),
+            line_ending: (resource.policy.line_ending != default_policy.line_ending)
+                .then_some(resource.policy.line_ending),
+            unix_mode: resource.policy.unix_mode.map(RawUnixMode::from_mode),
+            // `secret: false` 是默认值，因此非秘密资源根本不会写出这一行。
+            secret: (resource.policy.secret != default_policy.secret)
+                .then_some(resource.policy.secret),
+            structured_format: resource.policy.structured_format,
+        };
+        let policy_is_default = policy.max_bytes.is_none()
+            && policy.line_ending.is_none()
+            && policy.unix_mode.is_none()
+            && policy.secret.is_none()
+            && policy.structured_format.is_none();
+
+        RawResource {
+            id: resource.id.to_string(),
+            root: resource.root.clone(),
+            target: resource.target.clone(),
+            mode: resource.mode,
+            disposition: resource.disposition,
+            comment_prefix: (resource.comment_prefix != DEFAULT_COMMENT_PREFIX)
+                .then(|| resource.comment_prefix.clone()),
+            policy: (!policy_is_default).then_some(policy),
+            selector: resource.selector.as_ref().map(selector_to_yaml),
+            device_overrides: resource
+                .device_overrides
+                .iter()
+                .map(|(key, overrides)| {
+                    (
+                        key.clone(),
+                        RawResourceOverride {
+                            disposition: overrides.disposition,
+                            target: overrides.target.clone(),
+                        },
+                    )
+                })
+                .collect(),
+        }
     }
 
     /// 强类型 -> 线格式。策略字段全量写出，保证往返一致。

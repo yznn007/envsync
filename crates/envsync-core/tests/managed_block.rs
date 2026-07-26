@@ -531,11 +531,27 @@ fn managed_block_rejects_non_utf8_file() {
 fn render_rejects_unsupported_modes() {
     let resource = rid(MAIN);
     let policy = policy(LineEnding::Preserve);
-    for mode in [FileMode::StructuredMerge, FileMode::GeneratedInclude] {
-        let err = render(&input(&resource, None, b"x\n", mode, &policy)).expect_err("必须拒绝");
-        assert_eq!(err, RenderError::UnsupportedMode { mode });
-        assert_eq!(err.code(), "render.unsupported_mode");
-    }
+
+    // Generated Include 不是一种渲染模式：它由适配器拆成 Full File + Managed Block
+    // 两个资源实现，渲染层没有它对应的语义。
+    let mode = FileMode::GeneratedInclude;
+    let err = render(&input(&resource, None, b"x\n", mode, &policy)).expect_err("必须拒绝");
+    assert_eq!(err, RenderError::UnsupportedMode { mode });
+    assert_eq!(err.code(), "render.unsupported_mode");
+
+    // Structured Merge 反过来必须**被接受**：合并已经在 `sync` 阶段完成，落到本地的
+    // 就是合并后的权威字节，写盘语义与 Full File 逐字节相同。
+    let structured = render(&input(
+        &resource,
+        None,
+        b"x\n",
+        FileMode::StructuredMerge,
+        &policy,
+    ))
+    .expect("structured_merge 按 Full File 语义渲染");
+    let full_file = render(&input(&resource, None, b"x\n", FileMode::FullFile, &policy))
+        .expect("full_file 渲染");
+    assert_eq!(structured, full_file);
 }
 
 /// 超过 max_bytes 时报 TooLarge，不截断。

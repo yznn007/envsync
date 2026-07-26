@@ -409,9 +409,11 @@ fn schema_v2_is_the_default_and_v1_drops_new_fields() {
         keys(&v2_status["data"]),
         [
             "backend_kind",
+            "backend_reachable",
             "device",
             "draft_head",
             "head",
+            "last_known_revision_at_unix_ms",
             "open_conflicts",
             "pending_actions",
             "resources",
@@ -533,4 +535,250 @@ fn v2_only_commands_refuse_schema_v1() {
         assert_eq!(value["status"], "error");
         assert_eq!(value["schema_version"], 1);
     }
+}
+
+// ---------------------------------------------------------------------------
+// adapters：让 `envsync-adapters` 真正有消费者
+//
+// 在此之前，`envsync-adapters` 是一个完整实现、有跨平台 fixture 覆盖、却**没有任何
+// 调用方**的库：全仓库除 workspace 成员声明之外没人引用它，用户只能照着文档手抄资源表。
+// 下面这组测试钉死的是「它现在真的被用上了」这件事——尤其是 `discover` 的产物必须能被
+// 配置解析器读回来，否则这条命令等于给了用户一段假的配置。
+// ---------------------------------------------------------------------------
+
+/// 只跑一次 `init`、不改资源列表的干净设备。
+///
+/// `World::device` 会把资源覆盖成固定两条；`adapters discover` 要验的恰恰是「不预设
+/// 任何资源时，适配器给出什么」，因此这里另起一个更朴素的脚手架。
+fn bare_device(world: &World, name: &str, extra_init_args: &[&str]) -> (Device, Value) {
+    let home = world.root.path().join(name).join("home");
+    let config = world.root.path().join(name).join("envsync.yaml");
+    std::fs::create_dir_all(&home).expect("应当能创建 home 目录");
+
+    let config_arg = path_arg(&config);
+    let backend_arg = path_arg(&world.backend());
+    let mut args = vec![
+        "init",
+        "--config",
+        &config_arg,
+        "--backend-path",
+        &backend_arg,
+        "--device-name",
+        name,
+        "--json",
+    ];
+    args.extend_from_slice(extra_init_args);
+    let output = run(&args);
+    assert_eq!(code(&output), 0, "init 应当成功：{}", stderr_of(&output));
+    let init_json = json_of(&output);
+
+    // 把授权根指向本测试自己的 home，避免碰到跑测试那台机器的真实主目录。
+    let device = Device { home, config };
+    let mut loaded = device.config();
+    loaded.roots.insert("home".to_owned(), device.home.clone());
+    device.write_config(&loaded);
+    (device, init_json)
+}
+
+#[test]
+fn adapters_commands_expose_help() {
+    for args in [
+        vec!["adapters", "--help"],
+        vec!["adapters", "list", "--help"],
+        vec!["adapters", "discover", "--help"],
+    ] {
+        let output = run(&args);
+        assert_eq!(code(&output), 0, "`{args:?}` 的帮助应当成功");
+        assert!(
+            !stdout_of(&output).trim().is_empty(),
+            "`{args:?}` 应当输出帮助文本"
+        );
+    }
+}
+
+#[test]
+fn adapters_list_reports_builtin_adapters_and_filters_by_profile() {
+    let world = World::new();
+    let (device, _) = bare_device(&world, "alice", &[]);
+
+    let output = device.json(&["adapters", "list"]);
+    assert_eq!(code(&output), 0, "{}", stderr_of(&output));
+    let data = json_of(&output)["data"].clone();
+
+    assert_eq!(
+        keys(&data),
+        ["adapters", "all", "arch", "count", "os"],
+        "adapters list 的字段集合是对外契约"
+    );
+    assert_eq!(data["all"], false);
+    let adapters = data["adapters"].as_array().expect("adapters 是数组");
+    assert!(!adapters.is_empty(), "至少应当列出一个适配器：{data}");
+    assert_eq!(data["count"], adapters.len());
+
+    // 过滤掉的是「本设备用不上的」：默认 Profile 没有 pwsh 能力，
+    // 因此 PowerShell 适配器不该出现在默认清单里，但 `--all` 里必须有。
+    let ids: Vec<&str> = adapters
+        .iter()
+        .map(|adapter| adapter["id"].as_str().expect("id 是字符串"))
+        .collect();
+    assert!(ids.contains(&"builtin.vcs.git"), "{ids:?}");
+    assert!(
+        !ids.contains(&"builtin.shell.powershell"),
+        "缺少 pwsh 能力时不该列出 PowerShell 适配器：{ids:?}"
+    );
+    for adapter in adapters {
+        assert_eq!(adapter["applies"], true, "默认清单里的都必须适用本设备");
+        assert_eq!(
+            keys(adapter),
+            [
+                "applies",
+                "default_mode",
+                "display_name",
+                "id",
+                "required_capabilities",
+                "resources",
+                "supported_os",
+                "version",
+            ]
+        );
+    }
+
+    // 每条资源都带上「目标资源」的完整坐标。
+    let git = adapters
+        .iter()
+        .find(|adapter| adapter["id"] == "builtin.vcs.git")
+        .expect("应当有 Git 适配器");
+    let user = git["resources"]
+        .as_array()
+        .expect("resources 是数组")
+        .iter()
+        .find(|resource| resource["resource"] == "vcs/git/user")
+        .unwrap_or_else(|| panic!("Git 适配器应当管理 vcs/git/user：{git}"));
+    assert_eq!(user["root"], "home");
+    assert_eq!(user["target"], ".gitconfig");
+    assert_eq!(user["mode"], "structured_merge");
+    assert_eq!(user["disposition"], "managed");
+    assert_eq!(user["structured_format"], "git_config");
+
+    // `--all` 不按 Profile 过滤。
+    let all = device.json(&["adapters", "list", "--all"]);
+    assert_eq!(code(&all), 0, "{}", stderr_of(&all));
+    let all_data = json_of(&all)["data"].clone();
+    assert_eq!(all_data["all"], true);
+    let all_ids: Vec<&str> = all_data["adapters"]
+        .as_array()
+        .expect("adapters 是数组")
+        .iter()
+        .map(|adapter| adapter["id"].as_str().expect("id 是字符串"))
+        .collect();
+    assert!(
+        all_ids.contains(&"builtin.shell.powershell"),
+        "`--all` 必须列出全部适配器：{all_ids:?}"
+    );
+    assert!(all_ids.len() > ids.len());
+}
+
+#[test]
+fn adapters_discover_emits_a_pasteable_resources_snippet() {
+    let world = World::new();
+    let (device, _) = bare_device(&world, "alice", &[]);
+
+    let output = device.json(&["adapters", "discover"]);
+    assert_eq!(code(&output), 0, "{}", stderr_of(&output));
+    let data = json_of(&output)["data"].clone();
+    assert_eq!(keys(&data), ["count", "device", "resources", "yaml"]);
+
+    let count = data["count"].as_u64().expect("count 是整数");
+    assert!(count > 0, "默认配置声明了 home 根，应当发现到资源：{data}");
+
+    // 关键断言：产出的片段**真的能被配置解析器读回来**。把它粘进一份最小配置里，
+    // 用真正的 `WorkspaceConfig::parse_yaml` 解析——「可直接粘贴」不是一句形容词。
+    let snippet = data["yaml"].as_str().expect("yaml 是字符串");
+    assert!(snippet.starts_with("resources:"), "{snippet}");
+
+    let mut config = device.config();
+    let text = config.to_yaml().expect("配置可序列化");
+    // 原配置的 resources 是空的（`init` 不带 `--discover`），因此直接追加即可。
+    assert!(!text.contains("resources:"), "前提：初始配置没有资源列表");
+    let pasted = format!("{text}\n{snippet}");
+    let base_dir = device.config.parent().expect("配置有父目录");
+    let parsed = WorkspaceConfig::parse_yaml(&pasted, base_dir)
+        .expect("discover 产出的片段必须能被配置解析器读回来");
+    assert_eq!(parsed.resources.len() as u64, count);
+
+    // 粘贴之后 CLI 也认：写回文件，`plan` 能跑起来（不再报 unknown_root 之类的错）。
+    config.resources = parsed.resources.clone();
+    device.write_config(&config);
+    let capture = device.json(&["capture"]);
+    assert_eq!(
+        code(&capture),
+        0,
+        "粘贴后的配置必须能被真实命令使用：{}",
+        stderr_of(&capture)
+    );
+
+    // 片段里绝不能出现脱敏占位符——那会让粘贴回去的 YAML 解析不了。
+    assert!(!snippet.contains("<redacted>"), "{snippet}");
+
+    // 内建适配器绝不产出 tombstone。
+    for resource in data["resources"].as_array().expect("resources 是数组") {
+        assert_ne!(
+            resource["disposition"], "ensure_absent",
+            "内建适配器绝不产出删除意图：{resource}"
+        );
+    }
+}
+
+#[test]
+fn init_with_discover_writes_the_discovered_resources_into_the_config() {
+    let world = World::new();
+
+    // 不带 `--discover`：资源列表保持为空，由用户自己决定管什么。
+    let (plain, plain_json) = bare_device(&world, "plain", &[]);
+    assert_eq!(plain_json["data"]["discovered_resources"], 0);
+    assert!(plain.config().resources.is_empty());
+
+    // 带 `--discover`：初始化就把发现结果写进配置。
+    let (discovered, discovered_json) = bare_device(&world, "discovered", &["--discover"]);
+    let count = discovered_json["data"]["discovered_resources"]
+        .as_u64()
+        .expect("discovered_resources 是整数");
+    assert!(count > 0, "应当发现到资源：{discovered_json}");
+
+    // 写进去的资源必须能被解析回来，而且与 `adapters discover` 的结论一致。
+    let config = discovered.config();
+    assert_eq!(config.resources.len() as u64, count);
+    let listed = discovered.json(&["adapters", "discover"]);
+    assert_eq!(code(&listed), 0, "{}", stderr_of(&listed));
+    let expected: Vec<String> = json_of(&listed)["data"]["resources"]
+        .as_array()
+        .expect("resources 是数组")
+        .iter()
+        .map(|resource| {
+            resource["resource"]
+                .as_str()
+                .expect("resource 是字符串")
+                .to_owned()
+        })
+        .collect();
+    let actual: Vec<String> = config
+        .resources
+        .iter()
+        .map(|resource| resource.id.to_string())
+        .collect();
+    assert_eq!(actual, expected);
+
+    // 其中确实包含一条 `structured_merge`——这条模式在缺口修复前会被配置层直接拒绝，
+    // 因此它同时也是「配置层已经接受 structured_merge」的回归测试。
+    assert!(
+        config
+            .resources
+            .iter()
+            .any(|resource| resource.mode == FileMode::StructuredMerge),
+        "Git 配置应当以 structured_merge 写入：{actual:?}"
+    );
+
+    // 初始化之后立刻可用。
+    let capture = discovered.json(&["capture"]);
+    assert_eq!(code(&capture), 0, "{}", stderr_of(&capture));
 }

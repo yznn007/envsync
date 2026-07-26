@@ -114,6 +114,8 @@ enum Command {
     Conflicts(ConflictsArgs),
     /// 查看设备 Profile 相关信息。
     Profile(ProfileArgs),
+    /// 查看内建适配器，或让它们为本设备生成资源配置。
+    Adapters(AdaptersArgs),
 }
 
 impl Command {
@@ -138,6 +140,10 @@ impl Command {
             Command::Profile(args) => match args.command {
                 ProfileCommand::Explain(_) => "profile.explain",
             },
+            Command::Adapters(args) => match args.command {
+                AdaptersCommand::List(_) => "adapters.list",
+                AdaptersCommand::Discover(_) => "adapters.discover",
+            },
         }
     }
 
@@ -148,9 +154,42 @@ impl Command {
     fn requires_v2(&self) -> bool {
         matches!(
             self,
-            Command::Fetch(_) | Command::Merge(_) | Command::Conflicts(_) | Command::Profile(_)
+            Command::Fetch(_)
+                | Command::Merge(_)
+                | Command::Conflicts(_)
+                | Command::Profile(_)
+                | Command::Adapters(_)
         )
     }
+}
+
+/// `adapters` 的参数。
+#[derive(Debug, Args)]
+struct AdaptersArgs {
+    /// 要执行的子命令。
+    #[command(subcommand)]
+    command: AdaptersCommand,
+}
+
+/// `adapters` 的子命令。
+#[derive(Debug, Subcommand)]
+enum AdaptersCommand {
+    /// 列出内建适配器及其目标资源，默认只列适用于本设备的。
+    List(AdaptersListArgs),
+    /// 对本设备运行一次发现，输出可直接粘贴进配置的 `resources:` 片段。
+    Discover(CommonArgs),
+}
+
+/// `adapters list` 的参数。
+#[derive(Debug, Args)]
+struct AdaptersListArgs {
+    /// 工作区配置文件路径（YAML）。
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+
+    /// 列出全部适配器与资源，不按本设备 Profile 与资源选择器过滤。
+    #[arg(long)]
+    all: bool,
 }
 
 /// `conflicts` 的参数。
@@ -274,6 +313,13 @@ struct InitArgs {
     /// 本地后端目录路径；不存在时创建。
     #[arg(long, value_name = "PATH")]
     backend_path: PathBuf,
+
+    /// 用内建适配器发现本设备上该管理的资源，并写进生成的配置。
+    ///
+    /// 不加时生成空的 resources 列表，由你自己决定管什么；
+    /// 加了之后可以用 `envsync adapters discover` 随时复核这份清单。
+    #[arg(long)]
+    discover: bool,
 }
 
 /// `sync` 的参数。
@@ -332,6 +378,7 @@ fn dispatch(command: &Command, schema_version: u32) -> Result<CommandOutput, Cor
             &args.config,
             args.device_name.as_deref(),
             &args.backend_path,
+            args.discover,
         ),
         Command::Capture(args) => commands::capture(&args.config),
         Command::Plan(args) => commands::plan(&args.config),
@@ -358,6 +405,10 @@ fn dispatch(command: &Command, schema_version: u32) -> Result<CommandOutput, Cor
         },
         Command::Profile(args) => match &args.command {
             ProfileCommand::Explain(args) => commands::profile_explain(&args.config),
+        },
+        Command::Adapters(args) => match &args.command {
+            AdaptersCommand::List(args) => commands::adapters_list(&args.config, args.all),
+            AdaptersCommand::Discover(args) => commands::adapters_discover(&args.config),
         },
     }
 }
@@ -474,7 +525,8 @@ mod tests {
                 "fetch",
                 "merge",
                 "conflicts",
-                "profile"
+                "profile",
+                "adapters"
             ]
         );
     }

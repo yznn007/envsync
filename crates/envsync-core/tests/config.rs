@@ -450,9 +450,10 @@ fn rule08_structured_merge_without_format_is_rejected() {
 }
 
 #[test]
-fn rule08_structured_merge_with_format_is_rejected_in_m0() {
-    // 配置写全了也仍然拒绝：M0 还没实现语义合并，静默降级成整文件覆盖会毁掉用户数据。
-    let error = parse(&yaml_with_resource(
+fn rule08_structured_merge_with_format_is_accepted() {
+    // M1 起五种结构化合并器都已实现，配置层因此接受 `structured_merge`；
+    // 「必须同时声明 structured_format」这条校验保留（见上一个测试）。
+    let config = parse(&yaml_with_resource(
         "id: editor/vscode/settings\n\
          root: home\n\
          target: .config/Code/User/settings.json\n\
@@ -461,16 +462,37 @@ fn rule08_structured_merge_with_format_is_rejected_in_m0() {
          policy:\n\
          \x20 structured_format: json\n",
     ))
-    .expect_err("M0 不支持 structured_merge");
-    assert_eq!(error.code(), "config.mode_not_supported");
-    match error {
-        ConfigError::ModeNotSupportedInM0 { mode, .. } => assert_eq!(mode, "structured_merge"),
-        other => panic!("错误类型不符：{other:?}"),
-    }
+    .expect("structured_merge + structured_format 是合法配置");
+    let resource = &config.resources[0];
+    assert_eq!(resource.mode, FileMode::StructuredMerge);
+    assert_eq!(
+        resource.policy.structured_format,
+        Some(StructuredFormat::Json)
+    );
 }
 
 #[test]
-fn rule08_generated_include_is_rejected_in_m0() {
+fn rule08_structured_merge_survives_yaml_round_trip() {
+    // 往返稳定性：`to_yaml` 写出的模式必须还能被自己读回来，否则 `envsync init
+    // --discover` 写出的配置在下一条命令里就会被拒绝。
+    let config = parse(&yaml_with_resource(
+        "id: vcs/git/user\n\
+         root: home\n\
+         target: .gitconfig\n\
+         mode: structured_merge\n\
+         disposition: managed\n\
+         policy:\n\
+         \x20 structured_format: git_config\n",
+    ))
+    .expect("structured_merge 合法");
+    let text = config.to_yaml().expect("可序列化");
+    assert!(text.contains("structured_merge"), "{text}");
+    let again = WorkspaceConfig::parse_yaml(&text, Path::new("/tmp")).expect("往返可解析");
+    assert_eq!(again.resources, config.resources);
+}
+
+#[test]
+fn rule08_generated_include_is_rejected_and_points_at_the_docs() {
     let error = parse(&yaml_with_resource(
         "id: shell/zsh/generated\n\
          root: home\n\
@@ -478,10 +500,19 @@ fn rule08_generated_include_is_rejected_in_m0() {
          mode: generated_include\n\
          disposition: managed\n",
     ))
-    .expect_err("M0 不支持 generated_include");
+    .expect_err("generated_include 没有对应的落地语义");
     assert_eq!(error.code(), "config.mode_not_supported");
+    let message = error.to_string();
+    assert!(
+        message.contains("docs/adapters.md"),
+        "错误信息必须指向文档，实际是：{message}"
+    );
+    assert!(
+        message.contains("Full File") && message.contains("Managed Block"),
+        "错误信息必须说明它被拆成哪两个资源，实际是：{message}"
+    );
     match error {
-        ConfigError::ModeNotSupportedInM0 { mode, .. } => assert_eq!(mode, "generated_include"),
+        ConfigError::ModeNotSupported { mode, .. } => assert_eq!(mode, "generated_include"),
         other => panic!("错误类型不符：{other:?}"),
     }
 }

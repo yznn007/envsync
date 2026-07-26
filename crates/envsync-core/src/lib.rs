@@ -12,13 +12,15 @@
 //! | 模块 | 职责 |
 //! |---|---|
 //! | [`config`] | 工作区配置 schema、解析与校验 |
-//! | [`render`] | Full File / Managed Block 纯函数渲染 |
+//! | [`render`] | Full File / Managed Block / Structured Merge 的纯函数渲染 |
 //! | [`planner`] | 由配置 + 目标状态 + 观察结果生成不可变计划 |
 //! | [`apply`] | 事务化应用引擎（preflight → publish → apply → verify → journal） |
 //! | [`mod@merge`] | 文本与结构化三方合并，只产出干净结果或显式 Conflict |
 //! | [`projection`] | Workspace 到 DeviceView 的纯函数投影 |
 //! | [`sync`] | fetch、合并基、三方合并与冲突裁决的编排 |
 //! | [`recovery`] | 崩溃恢复与显式回滚 |
+//! | [`last_known`] | 「上次成功读到的后端 Ref」的本地留存，供后端不可达时降级作答 |
+//! | [`offline`] | 后端联系不上时的占位实现：服务照常打开，只有真正需要远端的调用才失败 |
 //! | [`service`] | CLI 与桌面端共用的应用服务门面 |
 //! | [`ports`] | 时钟、观察、文件变更三个端口抽象及其平台实现 |
 //! | [`error`] | 带稳定错误码的统一错误类型 |
@@ -32,7 +34,9 @@
 pub mod apply;
 pub mod config;
 pub mod error;
+pub mod last_known;
 pub mod merge;
+pub mod offline;
 pub mod planner;
 pub mod ports;
 pub mod projection;
@@ -47,11 +51,16 @@ pub use config::{
     ResourceOverride, WorkspaceConfig,
 };
 pub use error::{CoreError, CoreResult};
+pub use last_known::{
+    is_backend_error_unreachable, is_backend_unreachable, LastKnownRef, LastKnownRefStore,
+    LAST_KNOWN_REF_FILE,
+};
 pub use merge::{
     merge, merge_structured, merge_structured_with, merge_text, IniPolicy, MergeError, MergeInput,
     MergeOptions, MergeProvenance, MergeResult, MultiValuePolicy, MAX_INPUT_BYTES, MAX_NODES,
     MAX_PARSE_DEPTH,
 };
+pub use offline::UnreachableBackend;
 pub use planner::{build_plan, BlobSource, PlanOutcome, PlanRequest};
 pub use ports::{ActionReceipt, Clock, FileMutator, FixedClock, Observer, SystemClock};
 pub use projection::{

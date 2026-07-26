@@ -384,9 +384,14 @@ fn status_json_shape_is_locked() {
         keys(&value["data"]),
         [
             "backend_kind",
+            // 后端不可达时的降级作答标记（schema v2 新增）：为 false 时
+            // revision/head 是本地记录的上次已知状态，而不是远端此刻的内容。
+            "backend_reachable",
             "device",
             "draft_head",
             "head",
+            // 这份「上次已知状态」有多旧；后端可达时为 null（schema v2 新增）。
+            "last_known_revision_at_unix_ms",
             // M1（schema v2）新增；v1 形状里没有它，见 m1_cli.rs 的 golden 测试。
             "open_conflicts",
             "pending_actions",

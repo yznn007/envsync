@@ -409,3 +409,118 @@ fn fetch_is_idempotent_and_touches_no_user_file() {
     assert!(!bob.exists(".zshrc"));
     assert!(!bob.exists(".gitconfig"));
 }
+
+// ---------------------------------------------------------------------------
+// 场景 5：`mode: structured_merge` 在 capture → plan → sync 上真正走得通
+//
+// 在此之前配置层直接拒绝这个模式（`config.mode_not_supported`），于是虽然 M1 已经实现
+// 了五种结构化合并器，用户却只能把资源写成 `full_file` + `policy.structured_format`。
+// 现在模式本身放开，落盘语义是 **Full File**：结构化合并发生在 `sync` 的 merge 阶段，
+// 写到本地的就是合并后的权威字节（见 `envsync_core::render` 的模块级文档）。
+// ---------------------------------------------------------------------------
+
+/// 用 `mode: structured_merge` 声明的 Git config 资源。
+fn structured_merge_resource(id: &str, target: &str) -> ResourceConfig {
+    let mut resource = text_resource(id, target);
+    resource.mode = FileMode::StructuredMerge;
+    resource.policy = ResourcePolicy {
+        structured_format: Some(StructuredFormat::GitConfig),
+        ..ResourcePolicy::default()
+    };
+    resource
+}
+
+/// 只声明一个 `structured_merge` 资源的设备。
+fn structured_device(world: &World, name: &str, seed: &str) -> Device {
+    let mut device = world.device(name, seed);
+    device.config.resources = vec![structured_merge_resource(GITCONFIG, ".gitconfig")];
+    device
+}
+
+#[test]
+fn structured_merge_mode_goes_through_capture_plan_and_sync() {
+    let world = World::new();
+    let alice = structured_device(&world, "alice", SEED_A);
+    let bob = structured_device(&world, "bob", SEED_B);
+
+    // ---- capture：整份文件即受管内容 ----------------------------------------
+    const BASE: &str = "[user]\n\temail = base@example.com\n";
+    alice.write(".gitconfig", BASE);
+    let outcome = alice.capture_plan_sync();
+    assert!(
+        matches!(
+            outcome,
+            ApplyOutcome::Completed {
+                published: true,
+                ..
+            }
+        ),
+        "首次同步必须把快照发布出去：{outcome:?}"
+    );
+
+    // ---- plan + sync：B 从零收敛，落地字节与 A 完全一致 ----------------------
+    bob.service().fetch().expect("fetch 应当成功");
+    let plan = bob.service().build_plan().expect("plan 应当成功");
+    assert_eq!(
+        plan.actions.len(),
+        1,
+        "B 手上还没有这个文件，应当正好有一个创建动作"
+    );
+    assert_eq!(
+        plan.actions[0].kind,
+        envsync_domain::ActionKind::CreateFile,
+        "structured_merge 的落盘语义是 Full File，因此是整份创建"
+    );
+    bob.plan_sync();
+    assert_eq!(bob.read(".gitconfig"), BASE, "落地的必须是权威字节本身");
+
+    // ---- 三方合并：双方改**不同的键**，结构化合并把两边都留下 ----------------
+    bob.write(
+        ".gitconfig",
+        "[user]\n\temail = base@example.com\n\tname = Bob\n",
+    );
+    let mut bob_service = bob.service();
+    bob_service.capture().expect("capture 应当成功");
+
+    alice.write(
+        ".gitconfig",
+        "[core]\n\teditor = nvim\n[user]\n\temail = base@example.com\n",
+    );
+    alice.capture_plan_sync();
+
+    bob_service.fetch().expect("fetch 应当成功");
+    let merged = bob_service.merge_states().expect("merge 应当成功");
+    assert_eq!(
+        merged.kind,
+        MergeKind::Merged,
+        "改的是不同的键，必须是干净的三方合并"
+    );
+    assert!(merged.conflicts.is_empty(), "键不重叠时不该有冲突");
+
+    let plan = bob_service.build_plan().expect("plan 应当成功");
+    bob_service
+        .apply_plan(plan.id())
+        .expect("应用合并结果应当成功");
+
+    // 合并后的权威字节被整份写进本地：两侧的键都在。
+    let merged_text = bob.read(".gitconfig");
+    assert!(merged_text.contains("name = Bob"), "{merged_text}");
+    assert!(merged_text.contains("editor = nvim"), "{merged_text}");
+    assert!(
+        merged_text.contains("email = base@example.com"),
+        "{merged_text}"
+    );
+
+    // A 收敛回同一份字节：两端逐字节一致，State Root 也一致。
+    alice.plan_sync();
+    assert_eq!(alice.read(".gitconfig"), merged_text);
+    assert_eq!(alice.state_root(), bob.state_root());
+
+    // 幂等：再跑一轮不产生任何动作。
+    let again = bob.service().build_plan().expect("plan 应当成功");
+    assert!(
+        again.actions.is_empty(),
+        "已经收敛之后不该再有动作：{:?}",
+        again.actions
+    );
+}

@@ -685,6 +685,8 @@ impl FileMutator for FakeMutator {
             original_digest: action.expected_before,
             applied_digest: action.expected_after,
             guarantee: RollbackCapability::Exact,
+            // 内存 fake 不碰真实文件系统，因此永远不会创建中间目录。
+            created_dirs: Vec::new(),
         })
     }
 

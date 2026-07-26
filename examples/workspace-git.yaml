@@ -1,0 +1,277 @@
+# EnvSync 工作区配置示例：Git 后端 + Profile + selector + 设备覆盖（配置版本 2 / M1）
+#
+# 与同目录的 `workspace.yaml` 的关系：
+#
+#   workspace.yaml       本地目录后端，逐字段注释，**被 crates/envsync-core/tests/config.rs
+#                        用 include_str! 真实解析**，因此永远不会过期。
+#   workspace-git.yaml   本文件。演示 Git 后端的完整配置。
+#                        **本文件不被自动测试解析**——改动后请手工核对：
+#
+#                            envsync doctor --config examples/workspace-git.yaml --json
+#
+#                        只要错误码不是 `config.*`，就说明解析这一关已经过了
+#                        （占位主机 git.example.com 连不上是预期内的）。
+#
+# 所有主机名、路径、标识都是**虚构占位值**：
+#   主机   git.example.com
+#   路径   /home/YOUR_USER、/srv/YOUR_BACKUP
+# 本文件不含任何真实凭据，也**不可能**含：Git 后端在解析期就拒绝带 userinfo
+# 或查询串的远端 URL。凭据只能来自 ssh-agent、git credential helper，
+# 或 M2 起的 Vault secret 引用。
+
+version: 2
+
+# 同一个工作区在所有设备上必须使用**同一个** workspace_id。
+workspace_id: "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+
+# 本设备信息。每台设备的 name 与 seed_hex 都必须**各不相同**：
+# seed_hex 是本机私有材料，派生出的 DeviceId 是 device_overrides 的键、
+# `device` 谓词的取值和快照作者字段。绝不要在设备之间复制它。
+device:
+  name: "laptop"
+  seed_hex: "3a7f1c92b4de5068a1cf23947db6e50f8c41a2937be05d6c1f83a4b72e90cd15"
+
+# ---- Git 后端 ---------------------------------------------------------------
+#
+# 布局（在受信分支上）：
+#   .envsync/format                          "envsync-git-format=1\n"
+#   .envsync/objects/ab/cdef….blob           与 local 后端逐字节相同的对象
+#   .envsync/refs/<workspace-uuid>.cbor      canonical CBOR 编码的 WorkspaceRef
+#
+# CAS：push 永不带 force；发布前做 lease 校验（比对远端 revision），
+# 发布后回读确认远端分支确实包含本次提交。前提是远端拒绝非 fast-forward 更新
+# ——所有主流 Git 服务端默认如此。详见 docs/backends/git.md。
+backend:
+  kind: git
+
+  # 远端 URL。解析期强制的规则（违反报 config.invalid_backend）：
+  #   * scheme 只允许 https / ssh / file，或无 scheme 的本地路径 / scp 风格；
+  #     http 与 git 协议不加密，直接拒绝。
+  #   * **不得包含 userinfo**。唯一例外是 ssh 的登录名（下面的 `git@`），
+  #     且只要 userinfo 里出现 `:`（即带密码段）立刻拒绝。
+  #   * **不得携带查询串或片段**。
+  #   * 不含控制字符或空白，长度不超过 2048 字节。
+  #
+  # scp 风格 ssh：`git` 是 ssh 登录名，不是凭据。
+  remote_url: "git@git.example.com:team/dotfiles.git"
+  #
+  # 其他合法写法：
+  #   remote_url: "ssh://git@git.example.com:2222/team/dotfiles.git"
+  #   remote_url: "https://git.example.com/team/dotfiles.git"
+  #
+  # 以下写法一律被拒绝：
+  #   "https://user:pass@git.example.com/team/dotfiles.git"   带 userinfo
+  #   "https://user@git.example.com/team/dotfiles.git"        带 userinfo（非 ssh）
+  #   "https://git.example.com/r.git?access_token=xxxxxxxx"   带查询串
+  #   "http://git.example.com/team/dotfiles.git"              未加密协议
+
+  # EnvSync 使用的分支。可省略，默认 "envsync"。
+  #
+  # 这是**唯一受信来源**：读取与 CAS 都只看它，远端 HEAD 指向哪里无关紧要。
+  # 分支不存在时视为「空后端」，第一次发布会连同格式标记一起创建它。
+  # 分支上有内容但没有 .envsync/format 时报 format_mismatch —— EnvSync
+  # **绝不**在别人的分支上追加提交。
+  #
+  # 命名限制：只允许 A-Za-z0-9._/- ，不超过 255 字节，不得以 / 或 . 开头/结尾，
+  # 不得含 // 或 ..，不得以 .lock 结尾。
+  branch: "envsync"
+
+  # 私有 bare cache clone 的位置。可省略，默认 <state_dir>/git-cache。
+  #
+  # 它是远端的镜像，Unix 上权限收紧到 0700；远端以**匿名 remote** 访问，
+  # URL 不会被写进仓库 config，凭据相关配置也就不会落盘。
+  # cache 里不含任何只存在于本地的事实，损坏时直接删掉即可自动重建。
+  cache_dir: ".envsync/git-cache"
+
+  # 认证方式。只有三种被允许，其余（用户名+密码、URL 内嵌凭据、明文文件）
+  # 在类型层面就无法表达。
+  auth:
+    # ssh-agent：私钥留在 agent 里，EnvSync 只拿到签名结果。
+    kind: ssh-agent
+    #
+    # HTTPS 请改用 credential helper（凭据由 git 现取现用，EnvSync 不接触）：
+    #   kind: credential-helper
+    #
+    # M2 的 Vault 落地后可用：只保存一个**引用标识**，不是凭据本身。
+    # M1 阶段配置能通过校验，但发起连接时会报错。
+    # secret_id 只能含 A-Za-z0-9._:- —— 这条限制顺便挡下了「把凭据原文粘进来」
+    # 这个最常见的误用。
+    #   kind: token-secret-ref
+    #   secret_id: "envsync:git:example"
+
+state_dir: ".envsync"
+
+roots:
+  home: "/home/YOUR_USER"
+
+# ---- 本设备 Profile ---------------------------------------------------------
+#
+# 没有 os / arch：它们由编译期探测得到（详见 docs/profiles.md §1.1）。
+profile:
+  hostname: "laptop"
+  tags:
+    - "work"
+    - "laptop"
+  capabilities:
+    - "pwsh"
+
+resources:
+  # ---- 全局资源：所有设备都下发 ----------------------------------------------
+  - id: shell/zsh/main
+    root: home
+    target: .zshrc
+    mode: managed_block
+    disposition: managed
+    comment_prefix: "# "
+    policy:
+      unix_mode: "0644"
+
+  # ---- 用户级 Git 配置：走 git config 语义合并 -------------------------------
+  #
+  # 键 identity 是 section/subsection/name：section 与 name 大小写不敏感，
+  # subsection 大小写敏感；多值键（例如 remote.origin.fetch）按有序列表整体合并。
+  # include.path 按规范化路径识别身份，但合并器**绝不打开或跟随 include 目标**。
+  #
+  # 注意：配置层目前只接受 mode: full_file / managed_block，
+  # 真正决定合并器的是 policy.structured_format，与 mode 无关。
+  - id: vcs/git/user
+    root: home
+    target: .gitconfig
+    mode: full_file
+    disposition: managed
+    comment_prefix: "# "
+    policy:
+      structured_format: git_config
+      unix_mode: "0644"
+
+  # ---- XDG 布局的 Git 配置：需要 git-xdg 标签才下发 --------------------------
+  #
+  # git 在 ~/.gitconfig 存在时**不会**读取 ~/.config/git/config。两者都设为受管
+  # 会产生「写了却不生效」的静默失败，还会让两份内容各自漂移。
+  # 因此它只在设备明确声明 git-xdg 标签时才下发。
+  #
+  # 上面的 profile.tags 没有 git-xdg，所以本设备上这条资源会被排除，
+  # `envsync profile explain` 会给出 excluded_by_selector 诊断。
+  # 排除 ≠ 删除：这个文件不会被动。
+  - id: vcs/git/user-xdg
+    root: home
+    target: .config/git/config
+    mode: full_file
+    disposition: managed
+    comment_prefix: "# "
+    policy:
+      structured_format: git_config
+      unix_mode: "0644"
+    selector:
+      all:
+        - tag: git-xdg
+
+  # ---- 按平台 + 能力分流 -----------------------------------------------------
+  - id: shell/powershell/profile-windows
+    root: home
+    target: Documents/PowerShell/Microsoft.PowerShell_profile.ps1
+    mode: managed_block
+    disposition: managed
+    comment_prefix: "# "
+    policy:
+      unix_mode: "0644"
+    selector:
+      all:
+        - os: windows
+        - capability: pwsh
+
+  - id: shell/powershell/profile-xdg
+    root: home
+    target: .config/powershell/Microsoft.PowerShell_profile.ps1
+    mode: managed_block
+    disposition: managed
+    comment_prefix: "# "
+    policy:
+      unix_mode: "0644"
+    selector:
+      all:
+        - any:
+            - os: macos
+            - os: linux
+        - capability: pwsh
+
+  # ---- WezTerm：生成 + 注入（两条资源的组合） --------------------------------
+  #
+  # 设计文档里的 Generated Include 本质上是两件事，各自对应一种已有模式：
+  #   module  —— full_file，EnvSync 独占的生成文件；
+  #   include —— managed_block，向用户主配置注入一段 include 语句，块外内容逐字保留。
+  # 注释前缀必须写成 Lua 的 "-- "，否则 marker 行本身就是语法错误。
+  - id: terminal/wezterm/module
+    root: home
+    target: .config/wezterm/envsync.lua
+    mode: full_file
+    disposition: managed
+    comment_prefix: "-- "
+    policy:
+      unix_mode: "0644"
+
+  - id: terminal/wezterm/include
+    root: home
+    target: .wezterm.lua
+    mode: managed_block
+    disposition: managed
+    comment_prefix: "-- "
+    policy:
+      unix_mode: "0644"
+
+  # ---- 按标签分流 + 单机特例 -------------------------------------------------
+  #
+  # device_overrides 的键是 64 个小写十六进制字符的设备标识，
+  # 可从 `envsync profile explain --json | jq -r .data.device` 拿到。
+  # 键拼错报 config.invalid_device_override_key，不会静默失效。
+  #
+  # 覆盖是**无条件**的：即使 selector 未命中，命中 device_overrides 的设备
+  # 照样纳入该资源。唯一能推翻它的是安全 policy。
+  - id: editor/settings
+    root: home
+    target: .config/Code/User/settings.json
+    mode: full_file
+    disposition: managed
+    policy:
+      structured_format: json
+    selector:
+      all:
+        - tag: work
+        - not:
+            tag: ci
+    device_overrides:
+      # 这台机器用 Insiders 版：同一份内容，另一个落地路径。
+      # target 只影响本机，不进入共享 Snapshot。
+      "9f2c3d4e5a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f":
+        target: .config/Code - Insiders/User/settings.json
+      # 这台机器不接管该文件，只记录存在性。
+      # disposition 影响期望状态，在投影阶段生效。
+      "1122334455667788990011223344556677889900112233445566778899001122":
+        disposition: unmanaged
+
+# ---- 多设备使用要点 ---------------------------------------------------------
+#
+# 1. 每台设备各有自己的 device.name / device.seed_hex / state_dir，
+#    但共用同一个 workspace_id、同一个 remote_url 与同一个 branch。
+#    **不要**把一台设备的 state_dir 复制到另一台：里面是本机的操作日志、
+#    草稿库和备份，跨设备复用会让崩溃恢复读到别人的历史。
+#
+# 2. 日常闭环：
+#
+#      envsync fetch   --config <cfg>            # 拉远端对象，不碰用户文件
+#      envsync merge   --config <cfg>            # 三方合并；有冲突只登记，退出码仍是 0
+#      envsync capture --config <cfg>            # 观察本机现状
+#      envsync plan    --config <cfg>            # 生成不可变计划
+#      envsync sync    --config <cfg> --plan <id>
+#      envsync status  --config <cfg>
+#
+# 3. 退出码 10（CAS 冲突）= 别的设备先发布了，本地一个字节都没写过：
+#    fetch → merge → plan → sync 重来即可。
+#    退出码 13（合并冲突）= 需要人裁决，本地文件与远端 Ref 都没变：
+#    envsync conflicts list / show / resolve，然后重新 merge。
+#
+# 4. 备份：远端仓库（`git clone --mirror`）+ 本机的 <state_dir>（journal.db、
+#    draft/、backups/）+ 本配置文件（含 device.seed_hex）。
+#    <state_dir>/git-cache/ 不用备份，删了会自动重建。
+#
+# 更多细节：docs/backends/git.md、docs/profiles.md、docs/conflicts.md、docs/merge.md

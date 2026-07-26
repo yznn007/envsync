@@ -232,6 +232,31 @@ fn is_reserved_device_name(segment: &str) -> bool {
         .any(|name| stem.eq_ignore_ascii_case(name))
 }
 
+/// 新建中间目录的默认 POSIX 权限位。
+pub const DEFAULT_DIR_MODE: u32 = 0o755;
+
+/// 秘密资源的中间目录 POSIX 权限位。
+///
+/// 秘密文件本身是 `0o600`（见 [`crate::writer::SECRET_DEFAULT_MODE`]），但一个
+/// `0o755` 的父目录会让同机的其他用户至少枚举到文件名与大小。目录因此收紧到只有
+/// 属主可进入。
+pub const SECRET_DIR_MODE: u32 = 0o700;
+
+/// 中间目录缺失时的处理方式。
+///
+/// 默认是 [`MissingDirs::Reject`]：读取与删除路径都不应该顺手在用户磁盘上造目录。
+/// 只有写入路径显式选择 [`MissingDirs::Create`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissingDirs {
+    /// 不创建：中间目录不存在时报 `NotFound`，由调用方判定为「目标不存在」。
+    Reject,
+    /// 在**授权根内**按需逐段创建，新目录使用给定权限位。
+    Create {
+        /// 新建目录的 POSIX 权限位；非 unix 平台上被忽略。
+        unix_mode: u32,
+    },
+}
+
 /// 已完成校验的解析结果：目标所在目录的能力句柄 + 文件名。
 ///
 /// 拿到 `ResolvedPath` 就意味着「路径边界检查已经通过」。所有真实的读写都通过
@@ -249,6 +274,11 @@ pub struct ResolvedPath {
     absolute: PathBuf,
     /// `alias:a/b/c` 形式的展示串。
     display: String,
+    /// 本次解析**新创建**的中间目录，按创建顺序、以相对授权根的路径表示。
+    ///
+    /// 它只包含相对分段，可以安全地写进收据与日志。回滚**不会**删除这些目录，
+    /// 见 [`crate::writer::SafeWriter::rollback`]。
+    created_dirs: Vec<String>,
 }
 
 impl ResolvedPath {
@@ -283,6 +313,13 @@ impl ResolvedPath {
     /// `alias:a/b/c` 形式的展示串，可安全出现在诊断中。
     pub fn display_target(&self) -> &str {
         &self.display
+    }
+
+    /// 本次解析新创建的中间目录（相对授权根的路径，按创建顺序）。
+    ///
+    /// [`AuthorizedRoot::resolve`] 永远返回空切片：它不创建任何目录。
+    pub fn created_dirs(&self) -> &[String] {
+        &self.created_dirs
     }
 }
 
@@ -363,6 +400,10 @@ impl AuthorizedRoot {
     /// `open_dir` 进入。对**最终**段：若已存在则确认不是符号链接；不存在是允许的
     /// （写入新文件的场景），由调用方决定如何处理。
     ///
+    /// 本方法**绝不创建任何目录**：中间目录不存在时报 `NotFound`，调用方据此判定
+    /// 「目标不存在」。需要按需建目录的写入路径请用
+    /// [`AuthorizedRoot::resolve_for_create`]。
+    ///
     /// # 错误
     ///
     /// * [`PlatformError::SymlinkRejected`]：任意一段是符号链接。
@@ -370,6 +411,39 @@ impl AuthorizedRoot {
     /// * [`PlatformError::Io`] 且 `kind == NotFound`：中间目录不存在。
     ///   调用方据此判定为 [`envsync_domain::ObservedState::Absent`]。
     pub fn resolve(&self, target: &RelativeTarget) -> Result<ResolvedPath, PlatformError> {
+        self.resolve_with(target, MissingDirs::Reject)
+    }
+
+    /// 逐段 no-follow 解析相对目标，并在**授权根内**按需创建缺失的中间目录。
+    ///
+    /// 语义与 [`AuthorizedRoot::resolve`] 完全一致，只多一件事：中间段不存在时创建
+    /// 一个权限位为 `unix_mode` 的普通目录，而不是报 `NotFound`。写入路径用它；
+    /// 读取与删除路径继续用 [`AuthorizedRoot::resolve`]——「目标不存在」对它们来说是
+    /// 有意义的答案，顺手造目录只会在用户磁盘上留下垃圾。
+    ///
+    /// 安全性与 `resolve` 逐条对齐：
+    ///
+    /// * 所有操作都相对授权根的能力句柄执行，因此**只可能**在授权根内创建目录；
+    /// * 每一段仍然先 `symlink_metadata` 再进入，已存在的符号链接段一律拒绝；
+    /// * 新建目录后**再 stat 一次**确认它确实是普通目录——创建与进入之间如果有人把它
+    ///   换成符号链接，这一步会把它挡下来；
+    /// * **已存在**的目录权限一个字节都不动：那是用户的目录，不是我们的。
+    ///
+    /// 新建的目录记录在 [`ResolvedPath::created_dirs`] 里，供收据与日志留痕。
+    pub fn resolve_for_create(
+        &self,
+        target: &RelativeTarget,
+        unix_mode: u32,
+    ) -> Result<ResolvedPath, PlatformError> {
+        self.resolve_with(target, MissingDirs::Create { unix_mode })
+    }
+
+    /// [`AuthorizedRoot::resolve`] 与 [`AuthorizedRoot::resolve_for_create`] 的共同实现。
+    pub fn resolve_with(
+        &self,
+        target: &RelativeTarget,
+        missing: MissingDirs,
+    ) -> Result<ResolvedPath, PlatformError> {
         let segments = target.segments();
         let (file_name, parents) = segments
             .split_last()
@@ -380,11 +454,30 @@ impl AuthorizedRoot {
             .try_clone()
             .map_err(|error| PlatformError::io("克隆授权根句柄", &error))?;
         let mut absolute = self.path.clone();
+        let mut created_dirs: Vec<String> = Vec::new();
+        let mut walked: Vec<String> = Vec::with_capacity(parents.len());
 
         for (index, segment) in parents.iter().enumerate() {
-            let metadata = dir
-                .symlink_metadata(segment)
-                .map_err(|error| PlatformError::io("读取中间目录元数据", &error))?;
+            let metadata = match dir.symlink_metadata(segment) {
+                Ok(metadata) => metadata,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && matches!(missing, MissingDirs::Create { .. }) =>
+                {
+                    let MissingDirs::Create { unix_mode } = missing else {
+                        unreachable!("上面的 matches! 已经确认是 Create")
+                    };
+                    create_dir_with_mode(&dir, segment, unix_mode)?;
+                    walked.push(segment.clone());
+                    created_dirs.push(walked.join("/"));
+                    walked.pop();
+                    // 创建之后重新 stat：这一步既是对「刚创建的东西确实是目录」的确认，
+                    // 也堵住「创建与进入之间被换成符号链接」的窗口。
+                    dir.symlink_metadata(segment)
+                        .map_err(|error| PlatformError::io("读取新建中间目录元数据", &error))?
+                }
+                Err(error) => return Err(PlatformError::io("读取中间目录元数据", &error)),
+            };
             if metadata.is_symlink() {
                 return Err(PlatformError::SymlinkRejected {
                     alias: self.alias.clone(),
@@ -402,6 +495,7 @@ impl AuthorizedRoot {
                 .open_dir(segment)
                 .map_err(|error| PlatformError::io("打开中间目录", &error))?;
             absolute.push(segment);
+            walked.push(segment.clone());
         }
 
         // 最终段：存在则必须不是符号链接；不存在是合法的（待创建）。
@@ -419,6 +513,14 @@ impl AuthorizedRoot {
         }
         absolute.push(file_name);
 
+        if !created_dirs.is_empty() {
+            tracing::info!(
+                alias = %self.alias,
+                dirs = %created_dirs.join("、"),
+                "已在授权根内创建缺失的中间目录"
+            );
+        }
+
         Ok(ResolvedPath {
             alias: self.alias.clone(),
             dir,
@@ -426,8 +528,33 @@ impl AuthorizedRoot {
             file_index: parents.len(),
             absolute,
             display: format!("{}:{}", self.alias, target.display_path()),
+            created_dirs,
         })
     }
+}
+
+/// 在 `dir` 下创建单个子目录，并把权限位设成 `unix_mode`。
+///
+/// 先 `create_dir` 再显式 `set_permissions`：`mkdir` 的 mode 会被进程 umask 削弱，
+/// 而秘密资源的 `0o700` 必须是确定的，不能取决于调用者的 umask。
+///
+/// 并发下另一个进程刚好创建了同名目录时（`AlreadyExists`）视为成功：调用方紧接着会
+/// 重新 `symlink_metadata` 确认它是普通目录，因此这里放行不会削弱任何检查。
+fn create_dir_with_mode(dir: &Dir, segment: &str, unix_mode: u32) -> Result<(), PlatformError> {
+    match dir.create_dir(segment) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(error) => return Err(PlatformError::io("创建中间目录", &error)),
+    }
+    #[cfg(unix)]
+    {
+        use cap_std::fs::{Permissions, PermissionsExt};
+        dir.set_permissions(segment, Permissions::from_mode(unix_mode & 0o7777))
+            .map_err(|error| PlatformError::io("设置中间目录权限", &error))?;
+    }
+    #[cfg(not(unix))]
+    let _ = unix_mode;
+    Ok(())
 }
 
 impl std::fmt::Debug for AuthorizedRoot {

@@ -13,6 +13,7 @@ name = "envsync"
 path = "src/main.rs"
 
 [dependencies]
+envsync-adapters.workspace = true
 envsync-core.workspace = true
 envsync-domain.workspace = true
 envsync-backend.workspace = true

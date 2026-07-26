@@ -275,6 +275,7 @@ name = "envsync-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "envsync-adapters",
  "envsync-backend",
  "envsync-core",
  "envsync-domain",
@@ -321,9 +322,11 @@ dependencies = [
 name = "envsync-e2e"
 version = "0.1.0"
 dependencies = [
+ "envsync-backend",
  "envsync-core",
  "envsync-domain",
  "envsync-storage",
+ "git2",
  "serde_json",
  "tempfile",
 ]

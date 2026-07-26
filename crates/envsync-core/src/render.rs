@@ -1,9 +1,30 @@
-//! Full File 与 Managed Block 两种文件渲染模式。
+//! 文件渲染：Full File、Managed Block 与 Structured Merge 的落盘语义。
 //!
 //! 本模块只做**纯计算**：输入是「目标文件现有字节 + 期望受管内容 + 资源策略」，
 //! 输出是「应当写入的完整文件字节」或「无需写入」。它不读文件系统、不取时钟、
 //! 不使用随机数，因此相同输入必然产生逐字节相同的输出，可以被计划阶段安全地
 //! 反复调用（预演与实际应用必须得到同一结果）。
+//!
+//! # Structured Merge 与本模块的分工
+//!
+//! [`FileMode::StructuredMerge`] 描述的是**跨设备协调时用哪种语义去比较和合并**，
+//! 而不是「写盘时怎么写」。真正的结构化合并发生在 [`crate::sync`] 的 merge 阶段：
+//! 那里同时拿得到 base / ours / theirs 三侧内容，按
+//! [`envsync_domain::StructuredFormat`] 选择 [`crate::merge`] 里的合并器，算出一份
+//! **权威字节**并写进新的 Blob。
+//!
+//! 等这份权威字节流到渲染阶段时，合并已经结束：此处只剩「把它整份写进目标文件」这
+//! 一件事。因此本模块对 `StructuredMerge` 采用与 [`FileMode::FullFile`] **完全相同**
+//! 的语义——期望内容即完整文件内容。
+//!
+//! ```text
+//! sync::merge_states   base + ours + theirs ──合并器──▶ 权威字节（新 Blob）
+//! planner::build_plan  权威字节 + 目标现状 ──render──▶ 待写入的完整文件
+//! ```
+//!
+//! 之所以**不**在渲染阶段再做一次结构化合并：渲染阶段只有 `existing` 与 `desired`，
+//! 没有 base。缺 base 的「合并」只能靠猜，而猜错的代价是把另一台设备的改动当成删除。
+//! 让权威性只在一个地方产生，是这条分工的全部意义。
 //!
 //! # Managed Block 的 marker 形状
 //!
@@ -43,9 +64,15 @@ pub struct RenderInput<'a> {
     pub resource: &'a ResourceId,
     /// 目标文件现有内容；`None` 表示文件不存在。
     pub existing: Option<&'a [u8]>,
-    /// 期望的受管内容（Full File 下即整个文件内容；Managed Block 下是块内内容）。
+    /// 期望的受管内容。
+    ///
+    /// Full File 与 Structured Merge 下即整个文件内容；Managed Block 下是块内内容。
     pub desired: &'a [u8],
-    /// 文件管理模式；M0 只支持 [`FileMode::FullFile`] 与 [`FileMode::ManagedBlock`]。
+    /// 文件管理模式。
+    ///
+    /// 支持 [`FileMode::FullFile`]、[`FileMode::ManagedBlock`] 与
+    /// [`FileMode::StructuredMerge`]（按 Full File 语义落盘，见模块级文档）；
+    /// [`FileMode::GeneratedInclude`] 不是渲染模式，会被拒绝。
     pub mode: FileMode,
     /// 资源策略，提供换行风格与字节上限。
     pub policy: &'a ResourcePolicy,
@@ -133,8 +160,11 @@ pub enum RenderError {
         /// 具体原因。
         detail: String,
     },
-    /// M0 只支持 Full File 与 Managed Block。
-    #[error("M0 不支持文件模式 {mode:?}")]
+    /// 该模式没有对应的落盘语义。
+    ///
+    /// 目前只有 [`FileMode::GeneratedInclude`] 会触发：它由适配器拆成 Full File +
+    /// Managed Block 两个资源实现，见 `docs/adapters.md`。
+    #[error("文件模式 {mode:?} 没有对应的落盘语义（Generated Include 由适配器拆成两个资源实现）")]
     UnsupportedMode {
         /// 不支持的模式。
         mode: FileMode,
@@ -171,7 +201,9 @@ impl RenderError {
 /// 因此本函数天然幂等：对已经处于期望状态的文件再次渲染不会产生写入。
 pub fn render(input: &RenderInput<'_>) -> Result<RenderedChange, RenderError> {
     let output = match input.mode {
-        FileMode::FullFile => render_full_file(input),
+        // Structured Merge 的合并已经在 `sync` 阶段完成，落到本地的就是合并后的
+        // 权威字节，因此写盘语义与 Full File 完全一致（见模块级文档）。
+        FileMode::FullFile | FileMode::StructuredMerge => render_full_file(input),
         FileMode::ManagedBlock => render_managed_block(input)?,
         mode => return Err(RenderError::UnsupportedMode { mode }),
     };

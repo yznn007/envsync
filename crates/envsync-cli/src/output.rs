@@ -65,6 +65,26 @@ impl DiagnosticOut {
         }
     }
 
+    /// 构造一条 `info` 级诊断（说明性信息，不代表任何问题）。
+    pub fn info(code: &str, message: String) -> Self {
+        DiagnosticOut {
+            severity: "info",
+            code: code.to_owned(),
+            resource: None,
+            message,
+        }
+    }
+
+    /// 构造一条 `warning` 级诊断（值得注意，但不阻塞本次命令）。
+    pub fn warning(code: &str, message: String) -> Self {
+        DiagnosticOut {
+            severity: "warning",
+            code: code.to_owned(),
+            resource: None,
+            message,
+        }
+    }
+
     /// 单行人类可读表示。
     pub fn render(&self) -> String {
         match &self.resource {
