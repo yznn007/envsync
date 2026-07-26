@@ -320,6 +320,27 @@ where
     store.save(candidate)
 }
 
+/// **只读**判定：远端头相对本机检查点是否合法，**不写入任何东西**。
+///
+/// 这是读路径的入口。[`advance`] 与它的区别只有一行——保不保存——但语义差别很大：
+///
+/// * 读路径（`vault get` / `vault list` / `device list` / `status`）必须**校验**，否则
+///   后端只要把头回退一格，这些命令就会安静地返回旧状态：已撤销的设备重新出现在名单里，
+///   新纪元里写的秘密凭空消失，而用户看不到任何异常；
+/// * 读路径又绝不能**推进**：读一眼远端不该改变本机的信任根。真要推进，也应该在一次
+///   成功的发布之后，由 [`advance`] 完成。
+///
+/// 另一个后果同样重要：CAS **之前**能调用的只有它。写路径先用它把「我正要在上面盖章的
+/// 这个头是不是回滚过的」问清楚，通过了才允许 CAS——而不是先把后端推进一格，再回头
+/// 发现自己被骗了。
+pub fn guard<S>(store: &S, candidate: &Checkpoint) -> Result<(), CheckpointError>
+where
+    S: CheckpointStore + ?Sized,
+{
+    let current = store.load(candidate.workspace)?;
+    check_advance(current.as_ref(), candidate)
+}
+
 /// 进程内的检查点实现，供测试与 dry-run 使用。
 ///
 /// **不要**在生产路径上使用：它随进程消失，等于每次启动都重置信任根。

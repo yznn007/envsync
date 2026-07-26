@@ -38,8 +38,26 @@
 //! 收件设备，换一台设备打开会得到 [`envsync_crypto::CryptoError::RecipientMismatch`]），
 //! 也无法伪造成员事件（它已经从成员链上消失，签名会被
 //! [`crate::membership::MembershipError::ActorUnknown`] 拒绝）。
+//!
+//! ## 撤销**不**重加密旧对象（lazy rewrap）
+//!
+//! `rewrapping` 阶段只做一件事：把「还停在旧纪元的秘密」列进
+//! [`RotationRecord::pending_rewrap`]。旧密封对象原样留在后端上，直到某台仍有权限的
+//! 设备**读到**它时，才用新纪元密钥重新密封（[`crate::vault::VaultService::get`]），
+//! 索引在下一次写操作或 [`crate::vault::VaultService::flush_rewraps`] 时更新。
+//!
+//! 为什么不在撤销时一次性重加密完：
+//!
+//! * **可恢复性。** eager 重加密要在一次操作里重写整个 Vault，中途失败会留下一半新、
+//!   一半旧的索引；lazy 的每一步都是幂等的单对象操作。
+//! * **撤销的延迟不该随 Vault 大小增长。** 一个装着上千条秘密的工作区，撤销一台设备
+//!   本该是一次链上事件加几份信封，而不是一轮全量重写。
+//! * **它换不来任何安全属性。** 被撤销的设备手里仍然留着旧纪元的数据密钥，后端上的旧
+//!   密封对象是不可变的、它本来就已经拿到过——重加密**追不回已经发出去的密文**。撤销
+//!   给的是前向保密（读不到**新**内容），不是追溯保密。rewrap 的价值只是让「当前有效
+//!   密钥集合」逐渐收敛到一把，与安全边界无关。详见
+//!   `docs/security/vault-format.md` §5.2。
 
-use envsync_crypto::sealed::SecretId;
 use envsync_crypto::suite::KeyEpoch;
 use envsync_domain::id::DeviceId;
 use envsync_domain::membership::MembershipAction;
@@ -83,6 +101,13 @@ pub enum RotationError {
         /// 进行中那次轮换的撤销目标。
         pending: DeviceId,
     },
+
+    /// 撤销目标是本设备自己。
+    ///
+    /// 这不是一条谨慎起见的限制，而是一条**必要**的限制，见
+    /// [`VaultService::revoke_device`] 的文档。
+    #[error("不能撤销本设备自己；请在另一台管理员设备上撤销它，本机随后用 `envsync device forget` 清理身份")]
+    CannotRevokeSelf,
 }
 
 impl RotationError {
@@ -93,6 +118,7 @@ impl RotationError {
             RotationError::NoRecipients => "rotation.no_recipients",
             RotationError::EpochMismatch { .. } => "rotation.epoch_mismatch",
             RotationError::AlreadyInProgress { .. } => "rotation.already_in_progress",
+            RotationError::CannotRevokeSelf => "rotation.cannot_revoke_self",
         }
     }
 }
@@ -110,8 +136,11 @@ pub struct RotationOutcome {
     pub stage: RotationStage,
     /// 收到新信封的设备数量。
     pub envelopes: usize,
-    /// 本次调用实际重加密的秘密条数。
-    pub rewrapped: usize,
+    /// 仍停留在旧纪元、等待 lazy rewrap 的秘密条数。
+    ///
+    /// 它**不是**待办事项清单上的一个警报：这些秘密现在就能正常读写，只是密封所用的
+    /// 数据密钥还是旧纪元的那一把，会在下一次被读到时顺手换掉（见模块文档）。
+    pub pending_rewrap: usize,
     /// 本次调用是不是在恢复一次先前被中断的轮换。
     pub resumed: bool,
 }
@@ -136,10 +165,10 @@ pub trait RotationSteps {
     fn publish_head(&mut self, record: &RotationRecord) -> CoreResult<()>;
 
     /// 计算「还有哪些秘密停留在旧纪元」。
+    ///
+    /// 结果只被**记录**下来，不会在轮换过程中被处理：重加密按 lazy 策略发生在读取时，
+    /// 见模块文档。
     fn stale_secrets(&self, record: &RotationRecord) -> CoreResult<Vec<String>>;
-
-    /// 把待重加密清单里的秘密逐条重新密封到新纪元，返回实际处理的条数。
-    fn rewrap(&mut self, record: &RotationRecord) -> CoreResult<usize>;
 }
 
 /// 驱动状态机直到 `stop_before` 指定的阶段之前，或直到 [`RotationStage::Complete`]。
@@ -167,8 +196,6 @@ pub fn drive<S>(
 where
     S: RotationSteps,
 {
-    let mut rewrapped = 0usize;
-
     while let Some(next) = record.stage.next() {
         if stop_before == Some(next) {
             break;
@@ -191,11 +218,12 @@ where
                 steps.publish_head(&record)?;
             }
             RotationStage::Rewrapping => {
+                // 只登记，不动手：旧对象按 lazy rewrap 在被读到时才重新密封。
                 record.pending_rewrap = steps.stale_secrets(&record)?;
             }
             RotationStage::Complete => {
-                rewrapped += steps.rewrap(&record)?;
-                record.pending_rewrap = steps.stale_secrets(&record)?;
+                // 轮换到此为止。清单在上一阶段已经算好，这里不重算——重算会把
+                // 「轮换期间别人恰好读了一条秘密」变成清单抖动，而清单是要落 journal 的。
             }
         }
         record.stage = next;
@@ -211,7 +239,7 @@ where
         to_epoch: record.to_epoch,
         stage: record.stage,
         envelopes: record.envelopes.len(),
-        rewrapped,
+        pending_rewrap: record.pending_rewrap.len(),
         resumed: resuming,
     })
 }
@@ -221,6 +249,17 @@ impl VaultService {
     ///
     /// 已有未完成的轮换时**自动接着做**，而不是重新开始：这让「撤销失败后重跑同一条
     /// 命令」成为正确的补救动作。
+    ///
+    /// # 为什么不能撤销本设备自己
+    ///
+    /// 成员链本身允许一个管理员撤销自己（只要工作区还剩至少一个管理员）。但那一步会
+    /// 产生一个**由非成员签出**的头快照：撤销事件把本设备从名单上抹掉，而这个头的
+    /// Vault 索引背书恰恰是本设备刚刚签的（见 [`crate::attestation`]）。读路径要求背书
+    /// 由**当前**成员签出，于是这个头对**所有人**都不可读——包括其余管理员，而他们
+    /// 又必须先读到头才能发布新头。工作区就此永久锁死，只能走灾难恢复。
+    ///
+    /// 因此这里直接拒绝。正确做法是在另一台管理员设备上撤销它，本机随后用
+    /// `envsync device forget` 清理身份。
     pub fn revoke_device(&mut self, subject: DeviceId) -> CoreResult<RotationOutcome> {
         self.revoke_device_until(subject, None)
     }
@@ -234,6 +273,9 @@ impl VaultService {
         subject: DeviceId,
         stop_before: Option<RotationStage>,
     ) -> CoreResult<RotationOutcome> {
+        if subject == self.device_id() {
+            return Err(RotationError::CannotRevokeSelf.into());
+        }
         let resuming = self.rotations().get_unfinished(self.workspace())?.is_some();
         let record = self.prepare_rotation(subject)?;
         let now = self.clock().now_unix_ms();
@@ -373,7 +415,7 @@ impl RotationSteps for VaultService {
         let genesis = self.genesis()?.clone();
         let mut events = self.events().to_vec();
         events.push(event.clone());
-        let next_state = membership::verify_membership_chain(&genesis, &events)?;
+        let next_state = membership::verify_membership_chain(&genesis, &events, self.workspace())?;
 
         let mut index = self.index_clone();
         index.membership.push(object);
@@ -406,20 +448,6 @@ impl RotationSteps for VaultService {
     fn stale_secrets(&self, record: &RotationRecord) -> CoreResult<Vec<String>> {
         Ok(self.stale_secret_ids(record.to_epoch))
     }
-
-    fn rewrap(&mut self, record: &RotationRecord) -> CoreResult<usize> {
-        let mut done = 0usize;
-        for raw in &record.pending_rewrap {
-            let Ok(id) = SecretId::parse(raw) else {
-                continue;
-            };
-            if self.rewrap_secret(&id)? {
-                done += 1;
-            }
-        }
-        self.flush_rewraps()?;
-        Ok(done)
-    }
 }
 
 #[cfg(test)]
@@ -432,6 +460,8 @@ mod tests {
     struct Recorder {
         calls: Vec<&'static str>,
         envelopes_on_backend: bool,
+        /// `stale_secrets` 拿的是 `&self`（它是纯查询），因此计数要用内部可变性。
+        stale_calls: std::cell::Cell<usize>,
     }
 
     impl RotationSteps for Recorder {
@@ -447,11 +477,8 @@ mod tests {
             Ok(())
         }
         fn stale_secrets(&self, _record: &RotationRecord) -> CoreResult<Vec<String>> {
-            Ok(Vec::new())
-        }
-        fn rewrap(&mut self, _record: &RotationRecord) -> CoreResult<usize> {
-            self.calls.push("rewrap");
-            Ok(0)
+            self.stale_calls.set(self.stale_calls.get() + 1);
+            Ok(vec!["ci/npm-token".to_owned()])
         }
     }
 
@@ -502,7 +529,13 @@ mod tests {
         let outcome = drive(&mut steps, &journal, 3, resumed, None, true).expect("恢复");
         assert_eq!(outcome.stage, RotationStage::Complete);
         assert!(outcome.resumed);
-        assert_eq!(steps.calls, ["envelopes", "head", "rewrap"]);
+        // 状态机**不**调用任何重加密步骤：`rewrapping` 只登记清单，`complete` 什么都不做。
+        assert_eq!(steps.calls, ["envelopes", "head"]);
+        assert_eq!(steps.stale_calls.get(), 1, "清单只该被算一次");
+        assert_eq!(
+            outcome.pending_rewrap, 1,
+            "停留在旧纪元的秘密必须被如实报出来"
+        );
     }
 
     #[test]

@@ -366,7 +366,8 @@ pub fn invite(
         let genesis = service.genesis()?.clone();
         let mut events = service.events().to_vec();
         events.push(event.clone());
-        let next_state = membership::verify_membership_chain(&genesis, &events)?;
+        let next_state =
+            membership::verify_membership_chain(&genesis, &events, service.workspace())?;
         service.record_event(event, next_state);
     }
 

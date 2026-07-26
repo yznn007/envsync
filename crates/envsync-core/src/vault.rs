@@ -75,12 +75,35 @@ use crate::ports::Clock;
 /// 索引对象的格式版本。字段增删都必须提升它。
 pub const VAULT_INDEX_FORMAT_VERSION: u32 = 1;
 
+/// **工作区级**快照元数据的键前缀。
+///
+/// 快照的 `metadata` 里混着两类东西：
+///
+/// * **本次 capture 自己的事实**——`device_name`、`format`、`merge`。它们描述「这一次
+///   发布是谁、用什么方式做的」，每次发布都应该重新写；
+/// * **工作区级的事实**——目前是 Vault 索引指针与它的背书。它们描述「这个工作区现在
+///   是什么样」，与「谁发布了这一版」无关。
+///
+/// 第二类必须被**继承**。M2 之前不继承，后果是 M0/M1 的发布路径（`capture` 自建头快照，
+/// `metadata` 只写 `device_name` / `format`）一跑完就把 Vault 索引指针弄丢了：`vault get`
+/// 报 `vault.secret_not_found`，`vault list` 却照常以 `status: ok` 返回一个空 Vault——
+/// 一次例行 `envsync sync` 就让整个 Vault 从用户视角消失。
+///
+/// 用前缀而不是一份硬编码名单：新增一个工作区级键时，只要名字带上前缀就自动被继承，
+/// 不必再去每一条发布路径上补一行。
+pub const WORKSPACE_METADATA_PREFIX: &str = "envsync.";
+
 /// 快照元数据中指向索引对象的键名。
 ///
 /// 这是持久化契约：改名会让所有已发布的快照「看起来没有 vault」。名字刻意避开
 /// `secret` / `token` 一类词根——CLI 的脱敏器按键名工作，叫 `vault_secrets` 会让这个
 /// 对象标识本身被脱敏掉，用户就再也看不到自己该去读哪个对象。
-pub const VAULT_INDEX_METADATA_KEY: &str = "vault_index";
+pub const VAULT_INDEX_METADATA_KEY: &str = "envsync.vault.index";
+
+/// 快照元数据中承载 Vault 索引背书的键名。
+///
+/// 值的形状与语义见 [`crate::attestation`]。
+pub const VAULT_ATTESTATION_METADATA_KEY: &str = "envsync.vault.attestation";
 
 /// 快照签名使用的用途标签。
 pub const SNAPSHOT_SIGNATURE_DOMAIN: &str = "snapshot";
@@ -536,6 +559,145 @@ fn object_list(value: &Value) -> Result<Vec<ObjectId>, CborError> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// 头快照上的工作区级元数据
+// ---------------------------------------------------------------------------
+
+/// 该元数据键是否属于**工作区级**（因而必须被继承）。
+///
+/// 见 [`WORKSPACE_METADATA_PREFIX`]。
+pub fn is_workspace_metadata_key(key: &str) -> bool {
+    key.starts_with(WORKSPACE_METADATA_PREFIX)
+}
+
+/// 从父快照的元数据里挑出应当被继承的工作区级键。
+///
+/// 每一条产出新快照的路径（M0 的 `capture`、M1 的合并、M2 的 Vault 发布）都必须以它为
+/// 起点，再覆盖本次真正要改的键。
+pub fn inherited_workspace_metadata(parent: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    parent
+        .iter()
+        .filter(|(key, _)| is_workspace_metadata_key(key))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+/// 一个头快照上**已验证**的 Vault 状态。
+///
+/// 「已验证」是三件事的合取：成员链从 genesis 完整回放且属于本工作区；索引与链的纪元
+/// 一致；索引带着一条由当前成员签出的背书。任何一条不成立都不会产出这个结构。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VaultHead {
+    /// 索引对象标识。
+    pub index_object: ObjectId,
+    /// 索引内容。
+    pub index: VaultIndex,
+    /// genesis 事件。
+    pub genesis: MembershipEvent,
+    /// genesis 之后的事件，按 sequence 升序。
+    pub events: Vec<MembershipEvent>,
+    /// 已验证的成员状态。
+    pub state: MembershipState,
+    /// 签出索引背书的设备。
+    pub attested_by: DeviceId,
+}
+
+impl VaultHead {
+    /// 由这份已验证状态推导反回滚检查点的**候选值**。
+    ///
+    /// `updated_at_unix_ms` 固定为 `0`：它只供审计，不参与
+    /// [`crate::checkpoint::check_advance`] 的任何判定，在候选值里填一个本机时钟读数
+    /// 只会让「同一份远端状态推导出的候选」变得不可复现。
+    pub fn checkpoint(&self, workspace: WorkspaceId, reference: &WorkspaceRef) -> Checkpoint {
+        Checkpoint {
+            workspace,
+            revision: reference.revision,
+            snapshot: reference.head.unwrap_or_else(|| SnapshotId::of(b"")),
+            membership_digest: self.state.head,
+            membership_sequence: self.state.sequence,
+            key_epoch: self.state.epoch,
+            updated_at_unix_ms: 0,
+        }
+    }
+}
+
+/// 从一个头快照解析并**完整验证**它承载的 Vault 状态。
+///
+/// 返回 `None` 表示这个头快照上没有 Vault 索引指针——工作区存在，但还没跑过
+/// `vault create`（或者跑过而指针丢了，那是
+/// [`VaultService::vault_index_missing`] 负责报的事）。
+///
+/// 校验顺序刻意是「结构 → 归属 → 链 → 背书」：
+///
+/// 1. 索引能解码，且 `workspace` 等于本地工作区；
+/// 2. 成员链从 genesis 完整回放，**并与本地工作区比对**（外来链在第一条事件就被拒）；
+/// 3. 索引纪元与链纪元一致；
+/// 4. 索引背书由当前成员链上的设备签出。
+///
+/// 第 4 步排在最后不是因为它最贵，而是因为它需要第 2 步的产物：「谁现在是成员」本身
+/// 就是被验证的对象之一。
+pub fn inspect_vault_head(
+    workspace: WorkspaceId,
+    body: &SnapshotBody,
+    read_object: &mut dyn FnMut(ObjectId) -> CoreResult<Vec<u8>>,
+) -> CoreResult<Option<VaultHead>> {
+    let Some(raw) = body.metadata.get(VAULT_INDEX_METADATA_KEY) else {
+        return Ok(None);
+    };
+    let index_object = raw.parse::<ObjectId>().map_err(|_| {
+        CoreError::from(VaultError::IndexInconsistent {
+            detail: "快照元数据里的索引对象标识无法解析",
+        })
+    })?;
+    let index = VaultIndex::from_canonical_slice(&read_object(index_object)?)?;
+    if index.workspace != workspace {
+        return Err(VaultError::IndexInconsistent {
+            detail: "索引属于另一个工作区",
+        }
+        .into());
+    }
+
+    let mut events = Vec::with_capacity(index.membership.len());
+    for object in &index.membership {
+        events.push(MembershipEvent::from_canonical_slice(&read_object(
+            *object,
+        )?)?);
+    }
+    let Some((genesis, rest)) = events.split_first() else {
+        return Err(VaultError::IndexInconsistent {
+            detail: "索引里没有 genesis 事件",
+        }
+        .into());
+    };
+    let state = membership::verify_membership_chain(genesis, rest, workspace)?;
+    if state.epoch != index.epoch {
+        return Err(VaultError::IndexInconsistent {
+            detail: "索引纪元与成员链纪元不一致",
+        }
+        .into());
+    }
+
+    let attested_by = crate::attestation::verify_index_attestation(
+        body.metadata
+            .get(VAULT_ATTESTATION_METADATA_KEY)
+            .map(String::as_str),
+        workspace,
+        index_object,
+        Some(&state),
+    )?
+    // `Some(&state)` 这条路径要么报错，要么一定给出签发者。
+    .ok_or_else(|| CoreError::Invariant("已验证的背书必须给出签发设备".to_owned()))?;
+
+    Ok(Some(VaultHead {
+        index_object,
+        index,
+        genesis: genesis.clone(),
+        events: rest.to_vec(),
+        state,
+        attested_by,
+    }))
+}
+
 /// 对外暴露的秘密元数据。
 ///
 /// [`VaultService::list`] **只**返回它：调用方拿到的是「有哪些秘密、多新、被谁引用」，
@@ -897,7 +1059,7 @@ impl VaultService {
         index.membership.push(genesis_object);
         index.envelopes.push(envelope);
 
-        let state = membership::verify_membership_chain(&genesis, &[])?;
+        let state = membership::verify_membership_chain(&genesis, &[], self.workspace)?;
         self.genesis = Some(genesis);
         self.events.clear();
         self.state = Some(state);
@@ -908,63 +1070,74 @@ impl VaultService {
     /// 重新从后端读取 Ref、索引与成员链，并重新验证。
     ///
     /// 任何依赖「后端现在是什么样」的判断都必须先调用它；服务不缓存跨命令的状态。
+    ///
+    /// # 读路径也查反回滚检查点
+    ///
+    /// M2 早期只在 [`VaultService::publish`] 里推进检查点，读路径一次都不查。后果是后端
+    /// 被回退之后 `vault get` / `vault list` / `device list` 会**安静地**返回旧状态——
+    /// 已撤销的设备重新出现在成员名单里，新纪元里写的秘密凭空消失，而用户看不到任何异常，
+    /// 只有下一次**写**才会撞上检查点。
+    ///
+    /// 现在这里做一次**只读**校验（[`crate::checkpoint::guard`]）：远端头相对本地检查点
+    /// 一旦倒退或分叉就立刻失败（`CoreError::is_rollback_attack()` 为真，CLI 退出码 14）。
+    /// **不推进**检查点——推进是发布成功之后的事，读一眼远端不该改变本机的信任根。
     pub fn reload(&mut self) -> CoreResult<()> {
         self.pending_rewrap.borrow_mut().clear();
         self.head = self.read_ref()?;
         let Some(head) = self.head.head else {
-            self.genesis = None;
-            self.events.clear();
-            self.state = None;
-            self.index = VaultIndex::empty(self.workspace, envsync_domain::GENESIS_EPOCH);
+            self.forget_vault();
             return Ok(());
         };
         let body = self.load_snapshot(head)?;
-        let Some(raw) = body.metadata.get(VAULT_INDEX_METADATA_KEY) else {
+        let observed = inspect_vault_head(self.workspace, &body, &mut |id| self.read_object(id))?;
+        let Some(observed) = observed else {
             // 头快照来自非 Vault 的发布路径（例如 M0 的 `sync`）：工作区存在，但还没有
-            // Vault。这不是错误，只是「还没创建」。
-            self.genesis = None;
-            self.events.clear();
-            self.state = None;
-            self.index = VaultIndex::empty(self.workspace, envsync_domain::GENESIS_EPOCH);
+            // Vault。这不是错误，只是「还没创建」——而「本来有、现在没了」由
+            // [`VaultService::vault_index_missing`] 单独识别并上报。
+            self.forget_vault();
             return Ok(());
         };
-        let index_id = raw.parse::<ObjectId>().map_err(|_| {
-            CoreError::from(VaultError::IndexInconsistent {
-                detail: "快照元数据里的索引对象标识无法解析",
-            })
-        })?;
-        let index = VaultIndex::from_canonical_slice(&self.read_object(index_id)?)?;
-        if index.workspace != self.workspace {
-            return Err(VaultError::IndexInconsistent {
-                detail: "索引属于另一个工作区",
-            }
-            .into());
-        }
+        crate::checkpoint::guard(
+            self.checkpoints.as_ref(),
+            &observed.checkpoint(self.workspace, &self.head),
+        )?;
 
-        let mut events = Vec::with_capacity(index.membership.len());
-        for object in &index.membership {
-            events.push(MembershipEvent::from_canonical_slice(
-                &self.read_object(*object)?,
-            )?);
-        }
-        let Some((genesis, rest)) = events.split_first() else {
-            return Err(VaultError::IndexInconsistent {
-                detail: "索引里没有 genesis 事件",
-            }
-            .into());
-        };
-        let state = membership::verify_membership_chain(genesis, rest)?;
-        if state.epoch != index.epoch {
-            return Err(VaultError::IndexInconsistent {
-                detail: "索引纪元与成员链纪元不一致",
-            }
-            .into());
-        }
-        self.genesis = Some(genesis.clone());
-        self.events = rest.to_vec();
-        self.state = Some(state);
-        self.index = index;
+        self.genesis = Some(observed.genesis);
+        self.events = observed.events;
+        self.state = Some(observed.state);
+        self.index = observed.index;
         Ok(())
+    }
+
+    /// 把本机缓存的 Vault 状态清空（工作区还没有 Vault，或头快照上没有指针）。
+    fn forget_vault(&mut self) {
+        self.genesis = None;
+        self.events.clear();
+        self.state = None;
+        self.index = VaultIndex::empty(self.workspace, envsync_domain::GENESIS_EPOCH);
+    }
+
+    /// 「本工作区本来有 Vault，当前头快照上却没有索引指针」。
+    ///
+    /// 判据是**本机**的两份证据，而不是后端说了什么：
+    ///
+    /// * 安全存储里有本工作区的密钥环——只有加入过 Vault 才会有；
+    /// * 或者本机已经建立过反回滚检查点——只有 `vault create` / `device join` 会建立。
+    ///
+    /// 两者都拿不到时返回 `false`：一个从来没建过 Vault 的工作区，头快照上当然没有指针，
+    /// 那不是异常。
+    ///
+    /// 存在的理由：普通同步继承工作区级元数据之前，一次 `envsync sync` 会把索引指针抹掉，
+    /// 而 `vault list` 只会安静地返回一个空清单。即便继承已经修好，后端仍然可以单独把
+    /// 指针拿掉——那时用户必须被告知，而不是看到一个空 Vault。
+    pub fn vault_index_missing(&self) -> CoreResult<bool> {
+        if self.is_initialized() {
+            return Ok(false);
+        }
+        if self.load_keyring().is_ok() {
+            return Ok(true);
+        }
+        Ok(self.checkpoints.load(self.workspace)?.is_some())
     }
 
     // -- 秘密 --------------------------------------------------------------
@@ -1232,9 +1405,19 @@ impl VaultService {
         )?)
     }
 
-    /// 发布一份新索引：写对象 → 写快照 → CAS → 推进检查点。
+    /// 发布一份新索引：写对象 → 只读反回滚校验 → 写快照 → CAS → 推进检查点。
     ///
     /// 幂等：若新快照与后端当前头完全相同，跳过 CAS 与检查点推进。
+    ///
+    /// # 校验在 CAS **之前**，推进在 CAS **之后**
+    ///
+    /// 这两句话不矛盾，它们说的是两件事：
+    ///
+    /// * **校验**（这个头是不是回滚过的）必须在 CAS 之前。M2 早期只在 CAS 之后推进检查点，
+    ///   于是被骗的客户端会**先**把新头 CAS 上去、再发现自己接受的是一个回滚过的头——
+    ///   后端的 revision 已经被推进了一格，攻击留下了既成事实。
+    /// * **推进**（把新高水位线写进安全存储）必须在 CAS 之后。反过来的话，进程崩在两步
+    ///   之间就会让本机拒绝自己刚刚试图发布的那个 revision，形成死结。
     pub(crate) fn publish(&mut self, index: VaultIndex) -> CoreResult<()> {
         let index_bytes = index.to_canonical_vec();
         let index_id = ObjectId::for_bytes(ObjectKind::Blob, &index_bytes);
@@ -1247,6 +1430,18 @@ impl VaultService {
             match current.head {
                 Some(head) => {
                     let body = self.load_snapshot(head)?;
+                    // CAS 之前的最后一道闸门：确认我们正要在上面盖章的这个头，相对本机
+                    // 检查点确实是前进而不是回退。用**后端当前头**重新推导，而不是用
+                    // `self.state`——`invite` / `revoke` 在调用本方法之前已经把内存里的
+                    // 成员状态推进了一格，拿它去比会把正常发布误判成分叉。
+                    if let Some(observed) =
+                        inspect_vault_head(self.workspace, &body, &mut |id| self.read_object(id))?
+                    {
+                        crate::checkpoint::guard(
+                            self.checkpoints.as_ref(),
+                            &observed.checkpoint(self.workspace, &current),
+                        )?;
+                    }
                     (body.state_root, vec![head], body.metadata)
                 }
                 None => {
@@ -1258,6 +1453,10 @@ impl VaultService {
                 }
             };
         metadata.insert(VAULT_INDEX_METADATA_KEY.to_owned(), index_id.to_string());
+        metadata.insert(
+            VAULT_ATTESTATION_METADATA_KEY.to_owned(),
+            crate::attestation::sign_index_attestation(&self.device, self.workspace, index_id)?,
+        );
 
         let body = SnapshotBody::new(
             self.workspace,
@@ -1285,8 +1484,6 @@ impl VaultService {
         self.backend
             .compare_and_swap_ref(self.workspace, current.revision, &next)?;
 
-        // 检查点必须在 CAS 之后：反过来的话，进程崩在两步之间就会让本机拒绝自己刚刚
-        // 试图发布的那个 revision。
         let state = self.membership()?;
         advance_checkpoint(
             self.checkpoints.as_ref(),
@@ -1307,6 +1504,15 @@ impl VaultService {
     }
 
     /// 用本设备的 Ed25519 私钥给快照签名并发布签名对象。
+    ///
+    /// # 这是**审计对象**，不是读路径上的凭据
+    ///
+    /// 它覆盖快照标识，因此能证明「某台设备确实发布过这个快照」，适合事后取证与 GC 判断
+    /// 归属。但它在读路径上**不可定位**：对象是内容寻址的，标识等于签名字节的摘要，而
+    /// 读者手里没有签名字节；把标识写回快照元数据又会改变快照标识本身，形成循环。
+    ///
+    /// 读路径真正校验的是 [`VAULT_ATTESTATION_METADATA_KEY`] 上的索引背书，理由见
+    /// [`crate::attestation`] 的模块文档。
     fn publish_snapshot_signature(&self, snapshot: SnapshotId) -> CoreResult<()> {
         let signature = self.device.sign(
             SNAPSHOT_SIGNATURE_DOMAIN,
@@ -1416,20 +1622,6 @@ impl VaultService {
             .filter(|entry| entry.epoch < epoch)
             .map(|entry| entry.id.as_str().to_owned())
             .collect()
-    }
-
-    /// 内部：把一条秘密强制重加密到当前纪元，返回是否发生了改变。
-    pub(crate) fn rewrap_secret(&mut self, id: &SecretId) -> CoreResult<bool> {
-        let Some(entry) = self.index.find(id) else {
-            return Ok(false);
-        };
-        let ring = self.load_keyring()?;
-        if entry.epoch >= ring.current_epoch().get() {
-            return Ok(false);
-        }
-        // `get` 内部已经做了 lazy rewrap 并登记到 `pending_rewrap`。
-        let _ = self.get(id)?;
-        Ok(true)
     }
 
     /// 内部：安全存储。

@@ -56,6 +56,13 @@ pub enum CoreError {
     #[error(transparent)]
     Vault(#[from] crate::vault::VaultError),
 
+    /// 头快照的 Vault 索引背书缺失或验证失败（M2）。
+    ///
+    /// 它意味着**后端交给我们的这份索引来路不明**：不是本工作区任何一台当前成员设备
+    /// 签出来的。唯一正确的反应是中止，而不是重试。
+    #[error(transparent)]
+    Attestation(#[from] crate::attestation::AttestationError),
+
     /// 密钥轮换编排失败（M2）。
     #[error(transparent)]
     Rotation(#[from] crate::rotation::RotationError),
@@ -163,6 +170,7 @@ impl CoreError {
             CoreError::Membership(err) => err.code(),
             CoreError::Checkpoint(err) => err.code(),
             CoreError::Vault(err) => err.code(),
+            CoreError::Attestation(err) => err.code(),
             CoreError::Rotation(err) => err.code(),
             CoreError::Merge(err) => err.code(),
             CoreError::Projection(err) => err.code(),
@@ -210,6 +218,11 @@ impl CoreError {
     /// 是否为未解决的合并冲突（CLI 退出码 13）。
     pub fn is_conflicted(&self) -> bool {
         matches!(self, CoreError::Conflicted { .. })
+    }
+
+    /// 是否为「头快照背书不可信」（错误码 `snapshot.signature_invalid`）。
+    pub fn is_attestation_failure(&self) -> bool {
+        matches!(self, CoreError::Attestation(_))
     }
 
     /// 是否为「检测到后端回滚/分叉」这一类必须中止的安全事件（CLI 退出码 14）。

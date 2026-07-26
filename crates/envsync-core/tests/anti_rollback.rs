@@ -7,7 +7,16 @@
 //!
 //! * 新设备通过**管理员签名的 invitation** 建立初始检查点；
 //! * 恢复身份建立新纪元之后，旧设备一律要求重新授权。
+//!
+//! 最后一组（[`a_rollback_between_open_and_publish_is_caught_before_the_cas`]）走的是真实
+//! 的 [`envsync_core::vault::VaultService`]：它验的不是判定规则本身，而是**判定发生在
+//! 时间轴上的哪个位置**——必须在 CAS 之前。
 
+mod vault_support;
+
+use std::path::Path;
+
+use envsync_backend::{Backend, LocalBackend};
 use envsync_core::checkpoint::{
     advance, check_advance, Checkpoint, CheckpointError, CheckpointStore, InMemoryCheckpointStore,
     SqliteCheckpointStore,
@@ -287,7 +296,7 @@ fn a_new_device_bootstraps_its_checkpoint_from_an_admin_signed_invitation() {
 
     // 管理员建链，并签发一条把新设备加进来的 invitation 事件。
     let genesis = create_genesis(&admin, workspace, 1_000).expect("genesis");
-    let admin_state = verify_membership_chain(&genesis, &[]).expect("链有效");
+    let admin_state = verify_membership_chain(&genesis, &[], workspace).expect("链有效");
     let invitation = append(
         &admin_state,
         &admin,
@@ -309,7 +318,7 @@ fn a_new_device_bootstraps_its_checkpoint_from_an_admin_signed_invitation() {
         "新设备没有信任根"
     );
 
-    let state = verify_membership_chain(&genesis, std::slice::from_ref(&invitation))
+    let state = verify_membership_chain(&genesis, std::slice::from_ref(&invitation), workspace)
         .expect("invitation 必须由管理员签名且延伸自 genesis");
     assert!(state.contains(&newcomer.device_id()));
 
@@ -341,7 +350,7 @@ fn a_new_device_bootstraps_its_checkpoint_from_an_admin_signed_invitation() {
         .as_bytes()
         .to_vec();
     assert!(matches!(
-        verify_membership_chain(&genesis, &[forged]),
+        verify_membership_chain(&genesis, &[forged], workspace),
         Err(MembershipError::ActorUnknown { .. })
     ));
 }
@@ -357,7 +366,7 @@ fn recovery_starts_a_new_epoch_and_forces_old_devices_to_re_authorise() {
     let mut chain: Vec<MembershipEvent> = Vec::new();
 
     // 旧设备原本是工作区成员。
-    let state = verify_membership_chain(&genesis, &chain).expect("链有效");
+    let state = verify_membership_chain(&genesis, &chain, workspace).expect("链有效");
     chain.push(
         append(
             &state,
@@ -374,13 +383,13 @@ fn recovery_starts_a_new_epoch_and_forces_old_devices_to_re_authorise() {
     );
 
     let store = InMemoryCheckpointStore::new();
-    let state = verify_membership_chain(&genesis, &chain).expect("链有效");
+    let state = verify_membership_chain(&genesis, &chain, workspace).expect("链有效");
     let before = checkpoint_from(&state, workspace, 10, SnapshotId::of(b"head-10"), 1_150);
     advance(&store, &before).expect("建立信任根");
     assert_eq!(before.key_epoch, 1);
 
     // 恢复流程：用恢复身份重建一台管理员设备，并撤销全部旧设备。
-    let state = verify_membership_chain(&genesis, &chain).expect("链有效");
+    let state = verify_membership_chain(&genesis, &chain, workspace).expect("链有效");
     chain.push(
         append(
             &state,
@@ -395,7 +404,7 @@ fn recovery_starts_a_new_epoch_and_forces_old_devices_to_re_authorise() {
         )
         .expect("登记恢复身份"),
     );
-    let state = verify_membership_chain(&genesis, &chain).expect("链有效");
+    let state = verify_membership_chain(&genesis, &chain, workspace).expect("链有效");
     chain.push(
         append(
             &state,
@@ -409,7 +418,7 @@ fn recovery_starts_a_new_epoch_and_forces_old_devices_to_re_authorise() {
         .expect("撤销旧设备"),
     );
 
-    let after = verify_membership_chain(&genesis, &chain).expect("链有效");
+    let after = verify_membership_chain(&genesis, &chain, workspace).expect("链有效");
     assert!(
         !after.contains(&old_device.device_id()),
         "旧设备必须失去成员资格"
@@ -440,4 +449,116 @@ fn recovery_starts_a_new_epoch_and_forces_old_devices_to_re_authorise() {
         }
         other => panic!("期望旧设备失去签发权，实际：{other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// 判定必须发生在 CAS 之前
+// ---------------------------------------------------------------------------
+
+/// 把整棵目录树复制一份（攻击者留存的「旧后端」）。
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("创建目标目录");
+    for entry in std::fs::read_dir(from).expect("可读目录").flatten() {
+        let target = to.join(entry.file_name());
+        if entry.path().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).expect("复制文件");
+        }
+    }
+}
+
+/// 用一份旧副本**整体覆盖**后端目录，模拟「后端被回退到旧 revision」。
+fn restore_tree(backup: &Path, target: &Path) {
+    std::fs::remove_dir_all(target).expect("清空后端目录");
+    copy_tree(backup, target);
+}
+
+/// **服务已经打开、校验已经通过，随后后端才被回退：CAS 仍然一次都不能发生。**
+///
+/// 这条测试补的是一个时间窗口。`reload` 时的只读校验挡住的是「打开服务时后端就已经被
+/// 回退了」；但攻击者完全可以等到那之后再动手——而 `publish` 会**重新读一次 Ref** 并在
+/// 它上面做 CAS。如果判定只在 `reload` 里做，这个窗口就是敞开的。
+///
+/// 因此 `publish` 在 `compare_and_swap_ref` **之前**还会再判定一次。断言的不是错误码
+/// （那由上面的纯函数矩阵覆盖），而是**后端 revision 一格都没动**：被骗的客户端绝不能
+/// 先把新头推上去、再回头发现自己接受的是一个回滚过的头。
+#[test]
+fn a_rollback_between_open_and_publish_is_caught_before_the_cas() {
+    let fixture = vault_support::Fixture::new();
+    let laptop = fixture.device("laptop");
+    laptop.init_device().expect("建立设备身份");
+
+    let mut vault = laptop.open().expect("打开服务");
+    vault.create().expect("创建工作区");
+    vault
+        .set(&vault_support::sid("ci/first"), input(b"one"))
+        .expect("写入第一条");
+
+    // 攻击者在这一刻留下后端的完整副本。
+    let backup = fixture
+        .backend_dir()
+        .parent()
+        .expect("有父目录")
+        .join("backup");
+    copy_tree(&fixture.backend_dir(), &backup);
+    let rolled_back_revision = backend_revision(&fixture);
+
+    // 服务照常继续工作，检查点随之前进。
+    vault
+        .set(&vault_support::sid("ci/second"), input(b"two"))
+        .expect("写入第二条");
+    let advanced_revision = backend_revision(&fixture);
+    assert!(advanced_revision > rolled_back_revision);
+    assert_eq!(
+        laptop
+            .checkpoints
+            .load(fixture.workspace)
+            .expect("检查点可读")
+            .expect("已建立")
+            .revision,
+        advanced_revision
+    );
+
+    // --- 攻击：服务**已经打开**之后，后端才被换回旧副本 ------------------------
+    restore_tree(&backup, &fixture.backend_dir());
+    assert_eq!(backend_revision(&fixture), rolled_back_revision);
+
+    let error = vault_support::err(vault.set(&vault_support::sid("ci/third"), input(b"three")));
+    assert!(
+        error.is_rollback_attack(),
+        "必须被判定为回滚攻击（CLI 退出码 14），实际错误码 `{}`：{error}",
+        error.code()
+    );
+    assert_eq!(error.code(), "checkpoint.revision_rollback");
+    assert_eq!(
+        backend_revision(&fixture),
+        rolled_back_revision,
+        "判定发生在 CAS 之前：后端 revision 不得被这次失败的写动过"
+    );
+
+    // 检查点自身也没有被降下来。
+    assert_eq!(
+        laptop
+            .checkpoints
+            .load(fixture.workspace)
+            .expect("检查点可读")
+            .expect("仍在")
+            .revision,
+        advanced_revision
+    );
+}
+
+/// 后端当前 revision。
+fn backend_revision(fixture: &vault_support::Fixture) -> u64 {
+    LocalBackend::open(fixture.backend_dir())
+        .expect("打开后端")
+        .get_ref(fixture.workspace)
+        .expect("Ref 可读")
+        .revision
+}
+
+/// 构造一次秘密输入（走真实的 stdin 路径）。
+fn input(value: &[u8]) -> envsync_core::vault::SecretInput {
+    envsync_core::vault::SecretInput::from_reader(&mut &value[..]).expect("构造秘密输入")
 }

@@ -205,7 +205,7 @@ fn put_object_rejects_bytes_that_do_not_match_id() {
     let err = backend
         .put_object(id, b"a different content")
         .expect_err("摘要不符必须失败");
-    assert_eq!(err.code(), "corruption");
+    assert_eq!(err.code(), "backend.corruption");
     assert!(matches!(err, BackendError::Corruption { .. }));
     // 失败的写入不得在远端留下任何提交。
     assert!(remote.branch_head().is_none());
@@ -223,7 +223,7 @@ fn get_object_rejects_tampered_remote_content() {
 
     let backend = remote.open("cache").expect("打开后端");
     let err = backend.get_object(id).expect_err("损坏对象不得返回内容");
-    assert_eq!(err.code(), "corruption");
+    assert_eq!(err.code(), "backend.corruption");
 }
 
 #[test]
@@ -233,7 +233,7 @@ fn get_object_reports_missing_objects() {
     let err = backend
         .get_object(blob(b"never written"))
         .expect_err("对象不存在");
-    assert_eq!(err.code(), "object_not_found");
+    assert_eq!(err.code(), "backend.object_not_found");
     assert_eq!(backend.list_objects("ab").expect("列举空后端"), Vec::new());
 }
 
@@ -248,7 +248,7 @@ fn get_ref_on_empty_backend_reports_ref_not_found() {
     let workspace = WorkspaceId::generate();
 
     let err = backend.get_ref(workspace).expect_err("尚未发布过快照");
-    assert_eq!(err.code(), "ref_not_found");
+    assert_eq!(err.code(), "backend.ref_not_found");
     assert!(matches!(err, BackendError::RefNotFound(id) if id == workspace));
 }
 
@@ -331,7 +331,7 @@ fn revision_must_strictly_increase() {
     let err = backend
         .compare_and_swap_ref(workspace, 1, &sideways)
         .expect_err("revision 未递增");
-    assert_eq!(err.code(), "invalid_ref");
+    assert_eq!(err.code(), "backend.invalid_ref");
 }
 
 #[test]
@@ -345,7 +345,7 @@ fn rejects_a_ref_belonging_to_another_workspace() {
     let err = backend
         .compare_and_swap_ref(workspace, 0, &next)
         .expect_err("工作区不匹配");
-    assert_eq!(err.code(), "invalid_ref");
+    assert_eq!(err.code(), "backend.invalid_ref");
 }
 
 #[test]
@@ -363,7 +363,7 @@ fn rejects_non_canonical_ref_bytes_on_the_remote() {
         .get_ref(workspace)
         .expect_err("非 canonical Ref 必须被拒");
     assert!(
-        matches!(err.code(), "codec" | "invalid_ref"),
+        matches!(err.code(), "backend.codec" | "backend.invalid_ref"),
         "意外的错误码：{}",
         err.code()
     );
@@ -408,7 +408,7 @@ fn open_fails_when_the_format_marker_does_not_match() {
     remote.seed(&[(".envsync/format", b"envsync-git-format=99\n")]);
 
     let err = remote.open("cache").expect_err("格式标记不匹配");
-    assert_eq!(err.code(), "format_mismatch");
+    assert_eq!(err.code(), "backend.format_mismatch");
     assert!(matches!(err, BackendError::FormatMismatch { .. }));
 }
 
@@ -418,7 +418,7 @@ fn open_fails_when_the_branch_is_not_an_envsync_layout() {
     remote.seed(&[("README.md", b"someone else's branch\n")]);
 
     let err = remote.open("cache").expect_err("分支不是 EnvSync 布局");
-    assert_eq!(err.code(), "format_mismatch");
+    assert_eq!(err.code(), "backend.format_mismatch");
 }
 
 #[test]
@@ -432,7 +432,7 @@ fn rejects_directory_traversal_in_tree_paths() {
         ".envsync/refs/./x.cbor",
     ] {
         let err = validate_tree_path(path).expect_err(path);
-        assert_eq!(err.code(), "invalid_prefix", "{path}");
+        assert_eq!(err.code(), "backend.invalid_prefix", "{path}");
     }
     validate_tree_path(&object_tree_path(blob(b"ok"))).expect("正常对象路径");
     validate_tree_path(&ref_tree_path(WorkspaceId::generate())).expect("正常 Ref 路径");
@@ -448,7 +448,7 @@ fn open_rejects_a_branch_name_that_is_not_a_valid_ref() {
     )
     .with_branch("../evil");
     let err = GitBackend::open(config).expect_err("非法分支名");
-    assert_eq!(err.code(), "unsupported");
+    assert_eq!(err.code(), "backend.unsupported");
 }
 
 // ---------------------------------------------------------------------------

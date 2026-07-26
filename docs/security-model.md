@@ -39,7 +39,7 @@ M2 专题（规范级细节）：
 | 本机已解锁的用户账户 | **完全信任**（M0 的边界即在此） | 见 §3.6 |
 | **后端存储** | **部分信任**：完整性由内容寻址自校验，**机密性不设防** | 见下 |
 | 网络与传输通道 | M0 **不适用**（本地目录后端无网络 I/O）；M1 起由 Git 传输层负责 | — |
-| 其他设备 | **不做密码学验证** | M0 的 `SnapshotSignature.algorithm` 恒为 `"none"` |
+| 其他设备 | M0 **不做密码学验证**；**M2 起做** | M0 的 `SnapshotSignature.algorithm` 恒为 `"none"`；M2 起头快照的 Vault 索引带**成员签出的背书**，读路径强制校验（§5.2.2） |
 | 插件 | **不适用** | M0 无插件机制（M4） |
 | Agent Bundle | **不适用** | M0 无 Agent Bundle（M3） |
 
@@ -346,8 +346,16 @@ CI 在 `ubuntu-latest`、`macos-latest`、`windows-latest` 三平台运行
 
 真正的 Ed25519 签名与强制校验在 **M2** —— **已交付**，见 §5.2.2（设备身份 + 成员签名
 链）。M2 之后，后端目录的写权限**不再**等价于对工作区的完全控制权：伪造的成员事件会被
-链验证器拒绝。但 M1 时代已发布的快照仍然只是自述值（`SnapshotSignature::unsigned`），
-对它们的信任不会被追认。
+链验证器拒绝，伪造的 Vault 索引会被**索引背书**拒绝。但 M1 时代已发布的快照仍然只是
+自述值（`SnapshotSignature::unsigned`），对它们的信任不会被追认。
+
+需要说明清楚的一点：M2 强制校验的是**头快照上的 Vault 索引背书**，而不是快照标识本身的
+签名。原因是内容寻址造成的循环（签名要放进快照，而签名又覆盖快照标识），以及一条硬性的
+产品约束——**一次普通 `envsync sync` 必须不能让 Vault 失效**，而 M0/M1 的发布路径手里
+没有成员链上的签名密钥。背书因此覆盖 `(用途标签, 工作区, 索引对象标识)`，并作为**工作区级
+元数据**被普通同步原样继承。完整推理见
+[`security/vault-format.md` §5.4](security/vault-format.md)。它的直接后果是：
+`SnapshotBody.state_root`（也就是普通同步的**文件内容**）在 M2 仍然只是自述值，见 §5.3.8。
 
 ### 3.2 没有加密：后端持有明文配置内容
 
@@ -580,7 +588,7 @@ nonce 六项）。数据密钥本身只经 HPKE 信封分发给在册设备。
 | 每次密封使用全新随机 nonce | `nonce_is_fresh_for_every_seal`、`production_api_never_produces_the_fixed_nonce_vector` |
 | 线格式冻结 | `sealed_secret_wire_vector_is_frozen` |
 
-#### 5.2.2 设备身份可验证，成员关系不可伪造
+#### 5.2.2 设备身份可验证，成员关系不可伪造，Vault 索引不可伪造
 
 **保证：一台设备只接受从它已信任的 genesis 合法延伸出来的成员链；后端即使被完全控制，
 也只能「不给数据」，无法伪造成员变更。**
@@ -601,6 +609,9 @@ nonce 六项）。数据密钥本身只经 HPKE 信封分发给在册设备。
 | 越权 / 已撤销 actor / 陌生 actor 全部拒绝 | `a_plain_member_cannot_add_promote_or_revoke`、`a_revoked_actor_cannot_sign_further_events`、`an_unknown_actor_is_rejected` |
 | 撤销最后一个管理员被拒 | `the_last_admin_cannot_be_revoked` |
 | 跨 workspace 事件混入被拒 | `cross_workspace_events_are_rejected` |
+| **整条外来链在第一条事件就被拒**（链的 `workspace` 与本地工作区比对） | `an_entire_foreign_chain_is_rejected_at_its_very_first_event` |
+| **Vault 索引背书必须由当前成员签出** | `an_index_without_a_valid_attestation_is_refused`（e2e）、`envsync_core::attestation` 的单元测试 |
+| **尚未建链的工作区仍接受未签名的头**（M0 兼容分界） | `a_workspace_without_a_membership_chain_still_accepts_an_unsigned_head`（e2e） |
 | 超长链在任何曲线运算前被拒 | `oversized_chains_are_rejected_before_any_crypto` |
 | 生成侧不会产出验证器会拒绝的事件 | `append_never_produces_an_event_the_verifier_would_reject` |
 | 错误码稳定且唯一 | `error_codes_are_stable_and_unique_per_variant` |
@@ -643,6 +654,21 @@ nonce 六项）。数据密钥本身只经 HPKE 信封分发给在册设备。
 纪元；任何一个维度回退，同步都会被阻塞而不是静默收敛。**
 
 这直接修补了 §3.3 记录的 M0 缺口。
+
+**读路径同样校验，而且校验发生在 CAS 之前。** 两件事各自都很要紧：
+
+* **读也校验。** `vault get` / `vault list` / `device list` / `status` 在读到远端头的那
+  一刻就做一次**只读**判定（`checkpoint::guard`，不推进检查点）。否则后端只要把头回退
+  一格，这些命令就会安静地返回旧状态——已撤销的设备重新出现在成员名单里，新纪元里写的
+  秘密凭空消失，而用户看不到任何异常，只有下一次**写**才会撞上检查点。
+* **校验在 CAS 之前。** 写路径先判定「我正要在上面盖章的这个头是不是回滚过的」，通过了
+  才允许 `compare_and_swap_ref`；推进检查点仍在 CAS 成功之后。反过来的话，被骗的客户端
+  会先把后端推进一格、再回头发现自己接受的是一个回滚过的头，攻击留下了既成事实。
+
+| 实现依据 | 锁定测试 |
+|---|---|
+| 读路径以退出码 14 失败，且本地文件零变更 | `rolling_the_backend_back_to_an_old_head`（e2e） |
+| 回滚被拦下时后端 revision **一格都不动** | 同上（同一条测试断言 CAS 从未发生） |
 
 | 实现依据 | 锁定测试 |
 |---|---|

@@ -208,16 +208,24 @@ canonical CBOR 解码出来**（测试 `decoding_enforces_the_structural_invaria
 
 ## 3. 验证器拒绝的全部攻击路径
 
-`verify_membership_chain(genesis, events) -> Result<MembershipState, MembershipError>`
-是**纯函数**：不读网络、不读数据库、不看时钟。输入是「我已经信任的 genesis」加上
-「后端声称的后续事件」，输出要么是可信状态，要么是一个说明**哪一条事件、因为什么原因**
-被拒绝的错误。做成纯函数的意义是：它可以被完整地做成攻击路径测试矩阵，而不需要搭出
-后端和数据库。
+`verify_membership_chain(genesis, events, expected_workspace)
+-> Result<MembershipState, MembershipError>`
+是**纯函数**：不读网络、不读数据库、不看时钟。输入是「我已经信任的 genesis」、
+「后端声称的后续事件」和**本地工作区标识**，输出要么是可信状态，要么是一个说明
+**哪一条事件、因为什么原因**被拒绝的错误。做成纯函数的意义是：它可以被完整地做成攻击
+路径测试矩阵，而不需要搭出后端和数据库。
+
+`expected_workspace` 是必填参数，不是从链上推出来的。早期版本只保证「链内各事件的
+workspace 与 genesis 一致」——那条不变量是**自洽**的，不是**正确**的：把工作区 A 的整条
+链原样搬进工作区 B 的后端，它照样自洽，于是会被完整读进来，只剩「本设备不在这条链上」
+这一层兜底。兜底能挡住写操作，却挡不住读操作把一份外来的成员名单、纪元和信封当成本
+工作区的事实。现在任何一条事件（**含 genesis**）的 `workspace` 不等于期望值都立即拒绝，
+外来链在 `sequence 0` 上就被拦住。
 
 **检查顺序（便宜的先做）：**
 
 ```text
-1. 结构限制：事件总数上限 → genesis 形状 → 格式版本
+1. 结构限制：事件总数上限 → genesis 的 workspace 比对 → genesis 形状 → 格式版本
 2. 逐事件：workspace → sequence（分叉/重复/回退/跳号）→ previous 链接
            → epoch 单调性与「只有撤销能推进纪元」
            → actor 解析（未知 / 已撤销）→ 验签 → 角色授权
@@ -379,6 +387,13 @@ Credential Manager / Linux Secret Service）。
     │                            │    open_envelope → DataKey'
     │                            │    新写入用 DataKey'；旧对象按 lazy rewrap
 ```
+
+**撤销本身不重加密任何旧对象。** `rewrapping` 阶段只把「还停在旧纪元的秘密」登记进
+journal 的 `pending_rewrap`（`device revoke` 的 JSON 契约里同名字段报的就是它的条数）；
+重新密封发生在某台仍有权限的设备**读到**那条秘密的时候。理由见
+[`vault-format.md` §5.2](vault-format.md)：eager 重写换不来任何安全属性（旧密文早已发
+出去，收不回来），却会让撤销的延迟随 Vault 大小增长，而且中途失败会留下一半新一半旧的
+索引。
 
 **第 ⑤ 步必须先于第 ⑥ 步。** 新链头一旦发布，所有设备都会开始期待新纪元的信封；如果
 信封还没上传，剩余设备会陷入「链说 epoch 是 n+1，但我没有 n+1 的密钥」的状态，而这是

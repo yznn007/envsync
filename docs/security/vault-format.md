@@ -156,6 +156,7 @@ AAD = canonical_cbor([version, suite, workspace_id, secret_id, key_epoch, nonce]
 | `envsync:recovery-phrase:v1` | 恢复短语校验位的摘要域 | `envsync_crypto::recovery::RECOVERY_PHRASE_DOMAIN` |
 | `envsync:recovery-kek:v1` | 恢复 KEK 第二级 HKDF 的 **salt**（不是哈希域） | `envsync_crypto::recovery::RECOVERY_KEK_DOMAIN` |
 | `envsync:snapshot-signature:v1` | 快照签名对象的内容寻址域 | `ObjectKind::domain` |
+| `vault-index` | Vault 索引背书的**用途标签**（进设备签名待签结构，非哈希域） | `envsync_core::attestation::VAULT_ATTESTATION_DOMAIN` |
 | `envsync:config:device-seed:v1` | M0 遗留：由配置里的设备种子派生 `DeviceId` | `envsync_core::config` |
 
 M0/M1 已有的 `envsync:blob:v1`、`envsync:state:v1`、`envsync:snapshot:v1`、
@@ -431,6 +432,66 @@ journal 里，因此每次重放都签出**字节完全相同**的事件，摘�
 | 连续两次轮换后旧对象仍可读 | `two_consecutive_rotations_keep_every_older_object_readable` |
 
 命令入口见 [`../cli.md`](../cli.md)。
+
+### 5.4 头快照上的工作区级元数据与 Vault 索引背书
+
+Vault 与 M0/M1 的普通文件同步**共用同一条工作区 Ref**。头快照的 `metadata` 因此混着
+两类事实：
+
+| 类别 | 例子 | 归属 |
+|---|---|---|
+| 本次发布自己的事实 | `device_name`、`format`、`merge` | 谁发布了这一版 |
+| **工作区级**事实 | `envsync.vault.index`、`envsync.vault.attestation` | 这个工作区现在是什么样 |
+
+第二类以 `envsync.` 为前缀（`envsync_core::vault::WORKSPACE_METADATA_PREFIX`），并且
+**必须被每一条产出新快照的路径从父快照原样继承**：M0 的 `capture`、M1 的三方合并、M2 的
+Vault 发布，一条都不能漏。
+
+不继承的后果不是「少一条元数据」，而是**一次例行 `envsync sync` 静默抹掉整个 Vault**：
+索引指针没了，`vault get` 报 `vault.secret_not_found`，而 `vault list` 照常以
+`status: ok` 返回一个空清单。密封对象本身还在后端上（内容寻址、不可变），丢的只是那个
+指针——但从用户视角看，Vault 就是消失了。作为第二道防线，`vault list` 在「本机确实加入过
+这个 Vault、当前头却没有索引指针」时给出一条 `blocking` 级诊断 `vault.index_missing`。
+
+#### 背书为什么覆盖索引对象标识，而不是快照标识
+
+`envsync.vault.attestation` 的值是一段 ASCII：
+
+```text
+ed25519:<设备标识 64 位小写十六进制>:<签名 128 位小写十六进制>
+```
+
+签名覆盖 `(用途标签 "vault-index", 工作区, 索引对象标识的规范文本)`，签发者必须是**当前
+成员链上的设备**。读路径在 `VaultService::reload` 里强制校验，缺失或验不过一律返回错误码
+`snapshot.signature_invalid`。
+
+直觉上应该签快照标识，但那条路走不通，原因有两条：
+
+1. **内容寻址造成循环。** 签名要么存成独立对象（标识 = 签名字节的摘要，读者算不出来），
+   要么存进快照元数据（元数据进快照标识，而签名又覆盖快照标识）。两条都是循环。
+2. **普通同步必须不能让 Vault 失效。** M0/M1 的发布路径手里没有成员链上的签名密钥——
+   它用的是配置里种子派生的 `DeviceId`，与成员链上的密码学设备标识是**两套身份**
+   （ADR-0002）。绑定快照标识意味着每一次普通同步都会打断背书，读路径只能二选一：
+   拒绝（`sync` 之后 Vault 不可用），或放行（背书形同虚设）。
+
+覆盖索引对象标识同时满足两者：索引是内容寻址的，覆盖它的标识等于覆盖它的**全部内容**
+（成员链、信封、每一条 `SecretRef`）；而索引对象标识是工作区级元数据，普通同步只是把它
+原样搬过去，背书跟着一起继承，仍然有效。
+
+#### 它挡得住什么、挡不住什么
+
+**挡得住：** 伪造索引——改成员名单、把某条秘密指向攻击者自己的密封对象、篡改纪元。
+攻击者没有任何成员的私钥。
+
+**挡不住（残留风险）：** 把一份**旧的、真实签过的**索引重新挂到一个新 revision 上。
+第一道防线是反回滚检查点（revision / 成员链 sequence / 密钥纪元三条线单调），但检查点
+**不覆盖索引里的秘密条目**：同一个纪元、同一个成员链 sequence 下的秘密条目回退不会被
+检出。堵住它需要给索引本身加一条单调计数，而那会让普通同步重新需要签名密钥——留待后续
+里程碑权衡。
+
+**同样挡不住：** `SnapshotBody.state_root`，也就是普通同步的**文件内容**。M2 只把 Vault
+秘密纳入了密码学保护，普通资源在后端上仍然是明文 Blob 且无签名（见
+[`../security-model.md` §5.3.8](../security-model.md)）。
 
 ---
 

@@ -75,6 +75,19 @@ impl DiagnosticOut {
         }
     }
 
+    /// 构造一条 `blocking` 级诊断（命令本身可能成功，但结果**不可采信**）。
+    ///
+    /// 与 [`DiagnosticOut::from_error`] 的区别：那条来自一个真正的失败，`data` 会是
+    /// `null`；这条允许命令继续给出数据，同时明确告诉调用方「别把这份数据当真」。
+    pub fn blocking(code: &str, message: String) -> Self {
+        DiagnosticOut {
+            severity: "blocking",
+            code: code.to_owned(),
+            resource: None,
+            message,
+        }
+    }
+
     /// 构造一条 `warning` 级诊断（值得注意，但不阻塞本次命令）。
     pub fn warning(code: &str, message: String) -> Self {
         DiagnosticOut {

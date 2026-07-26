@@ -60,7 +60,7 @@ impl Fixture {
     }
 
     fn state(&self, events: &[MembershipEvent]) -> MembershipState {
-        verify_membership_chain(&self.genesis, events).expect("链应当有效")
+        verify_membership_chain(&self.genesis, events, self.workspace).expect("链应当有效")
     }
 
     /// 由管理员签发一条「添加成员」事件。
@@ -178,7 +178,7 @@ fn broken_chain_link_is_rejected() {
     let add = forge(add, &fixture.admin);
 
     assert!(matches!(
-        verify_membership_chain(&fixture.genesis, &[add]),
+        verify_membership_chain(&fixture.genesis, &[add], fixture.workspace),
         Err(MembershipError::ChainBroken { sequence: 1 })
     ));
 }
@@ -193,7 +193,7 @@ fn fork_at_the_same_sequence_is_rejected() {
     assert_ne!(first.digest(), second.digest());
 
     assert!(matches!(
-        verify_membership_chain(&fixture.genesis, &[first, second]),
+        verify_membership_chain(&fixture.genesis, &[first, second], fixture.workspace),
         Err(MembershipError::ForkDetected { sequence: 1 })
     ));
 }
@@ -204,7 +204,7 @@ fn duplicated_event_at_the_same_sequence_is_rejected() {
     let add = fixture.add(&[], &fixture.laptop, MemberRole::Member);
 
     assert!(matches!(
-        verify_membership_chain(&fixture.genesis, &[add.clone(), add]),
+        verify_membership_chain(&fixture.genesis, &[add.clone(), add], fixture.workspace),
         Err(MembershipError::DuplicateSequence { sequence: 1 })
     ));
 }
@@ -222,7 +222,7 @@ fn replaying_an_old_event_is_rejected() {
     // 后端在最新事件之后又塞回一条更旧的事件。
     let chain = vec![first.clone(), second, first];
     assert!(matches!(
-        verify_membership_chain(&fixture.genesis, &chain),
+        verify_membership_chain(&fixture.genesis, &chain, fixture.workspace),
         Err(MembershipError::SequenceRollback { head: 2, found: 1 })
     ));
 }
@@ -235,7 +235,7 @@ fn sequence_gaps_are_rejected() {
     let add = forge(add, &fixture.admin);
 
     assert!(matches!(
-        verify_membership_chain(&fixture.genesis, &[add]),
+        verify_membership_chain(&fixture.genesis, &[add], fixture.workspace),
         Err(MembershipError::SequenceGap {
             expected: 1,
             found: 5
@@ -256,7 +256,7 @@ fn a_second_genesis_is_rejected() {
     let second = forge(second, &fixture.admin);
 
     assert!(matches!(
-        verify_membership_chain(&fixture.genesis, &[second]),
+        verify_membership_chain(&fixture.genesis, &[second], fixture.workspace),
         Err(MembershipError::DuplicateGenesis { sequence: 1 })
     ));
 }
@@ -271,8 +271,38 @@ fn cross_workspace_events_are_rejected() {
     let add = forge(add, &fixture.admin);
 
     assert!(matches!(
-        verify_membership_chain(&fixture.genesis, &[add]),
+        verify_membership_chain(&fixture.genesis, &[add], fixture.workspace),
         Err(MembershipError::WorkspaceMismatch { sequence: 1 })
+    ));
+}
+
+/// 把工作区 A 的**整条链**（含 genesis）原样塞进工作区 B。
+///
+/// 与 [`cross_workspace_events_are_rejected`] 的区别是它没有任何「拼接痕迹」：链自身
+/// 完全自洽，genesis 也是真的。挡住它的只能是「链的 workspace 必须等于本地工作区」这一条
+/// 显式比对——因此这里断言拒绝发生在 **sequence 0**，而不是链中间的某处。
+#[test]
+fn an_entire_foreign_chain_is_rejected_at_its_very_first_event() {
+    let foreign = Fixture::new();
+    let local = Fixture::new();
+    assert_ne!(foreign.workspace, local.workspace);
+
+    let add = foreign.add(&[], &foreign.laptop, MemberRole::Member);
+    // 正向对照：这条链在**它自己的**工作区里完全合法。
+    assert_eq!(
+        verify_membership_chain(
+            &foreign.genesis,
+            std::slice::from_ref(&add),
+            foreign.workspace
+        )
+        .expect("外来链在自己的工作区里有效")
+        .len(),
+        2
+    );
+
+    assert!(matches!(
+        verify_membership_chain(&foreign.genesis, &[add], local.workspace),
+        Err(MembershipError::WorkspaceMismatch { sequence: 0 })
     ));
 }
 
@@ -284,7 +314,7 @@ fn oversized_chains_are_rejected_before_any_crypto() {
     let flood = vec![add; MAX_MEMBERSHIP_EVENTS];
 
     assert!(matches!(
-        verify_membership_chain(&fixture.genesis, &flood),
+        verify_membership_chain(&fixture.genesis, &flood, fixture.workspace),
         Err(MembershipError::TooManyEvents {
             limit: MAX_MEMBERSHIP_EVENTS,
             ..
@@ -317,7 +347,7 @@ fn future_epoch_jump_is_rejected() {
     let revoke = forge(revoke, &fixture.admin);
 
     assert!(matches!(
-        verify_membership_chain(&fixture.genesis, &[revoke]),
+        verify_membership_chain(&fixture.genesis, &[revoke], fixture.workspace),
         Err(MembershipError::EpochJump {
             sequence: 1,
             current: 1,
@@ -334,7 +364,7 @@ fn advancing_the_epoch_without_a_revocation_is_rejected() {
     let add = forge(add, &fixture.admin);
 
     assert!(matches!(
-        verify_membership_chain(&fixture.genesis, &[add]),
+        verify_membership_chain(&fixture.genesis, &[add], fixture.workspace),
         Err(MembershipError::EpochAdvancedWithoutRevocation {
             sequence: 1,
             action: "add_member"
@@ -362,7 +392,7 @@ fn revoking_without_rotating_the_epoch_is_rejected() {
     let revoke = forge(revoke, &fixture.admin);
 
     assert!(matches!(
-        verify_membership_chain(&fixture.genesis, &[add, revoke]),
+        verify_membership_chain(&fixture.genesis, &[add, revoke], fixture.workspace),
         Err(MembershipError::RevocationMustRotateEpoch {
             sequence: 2,
             expected: 2
@@ -404,7 +434,7 @@ fn rolling_the_epoch_back_is_rejected() {
     let later = forge(later, &fixture.admin);
 
     assert!(matches!(
-        verify_membership_chain(&fixture.genesis, &[add, revoke, later]),
+        verify_membership_chain(&fixture.genesis, &[add, revoke, later], fixture.workspace),
         Err(MembershipError::EpochRollback {
             sequence: 3,
             current: 2,
@@ -424,7 +454,7 @@ fn a_tampered_signature_is_rejected() {
     add.signature[0] ^= 0x01;
 
     assert!(matches!(
-        verify_membership_chain(&fixture.genesis, &[add]),
+        verify_membership_chain(&fixture.genesis, &[add], fixture.workspace),
         Err(MembershipError::SignatureInvalid { sequence: 1 })
     ));
 }
@@ -438,7 +468,7 @@ fn signing_with_another_device_key_is_rejected() {
     let add = forge(add, &attacker);
 
     assert!(matches!(
-        verify_membership_chain(&fixture.genesis, &[add]),
+        verify_membership_chain(&fixture.genesis, &[add], fixture.workspace),
         Err(MembershipError::SignatureInvalid { sequence: 1 })
     ));
 }
@@ -478,7 +508,7 @@ fn a_revoked_actor_cannot_sign_further_events() {
     forged.actor = fixture.laptop.device_id();
     let forged = forge(forged, &fixture.laptop);
 
-    match verify_membership_chain(&fixture.genesis, &[add, revoke, forged]) {
+    match verify_membership_chain(&fixture.genesis, &[add, revoke, forged], fixture.workspace) {
         Err(MembershipError::ActorRevoked { sequence, device }) => {
             assert_eq!(sequence, 3);
             assert_eq!(device, fixture.laptop.device_id());
@@ -495,7 +525,7 @@ fn an_unknown_actor_is_rejected() {
     add.actor = stranger.device_id();
     let add = forge(add, &stranger);
 
-    match verify_membership_chain(&fixture.genesis, &[add]) {
+    match verify_membership_chain(&fixture.genesis, &[add], fixture.workspace) {
         Err(MembershipError::ActorUnknown { sequence, device }) => {
             assert_eq!(sequence, 1);
             assert_eq!(device, stranger.device_id());
@@ -555,7 +585,7 @@ fn a_plain_member_cannot_add_promote_or_revoke() {
     forged.actor = fixture.laptop.device_id();
     let forged = forge(forged, &fixture.laptop);
     assert!(matches!(
-        verify_membership_chain(&fixture.genesis, &[add, forged]),
+        verify_membership_chain(&fixture.genesis, &[add, forged], fixture.workspace),
         Err(MembershipError::ActorNotAdmin { sequence: 2, .. })
     ));
 }
@@ -599,7 +629,7 @@ fn the_last_admin_cannot_be_revoked() {
     };
     let forged = forge(forged, &fixture.admin);
     assert!(matches!(
-        verify_membership_chain(&fixture.genesis, &[add, forged]),
+        verify_membership_chain(&fixture.genesis, &[add, forged], fixture.workspace),
         Err(MembershipError::LastAdminRevoked { sequence: 2 })
     ));
 }
@@ -617,7 +647,7 @@ fn genesis_must_be_self_signed_by_the_admin_it_registers() {
     let genesis = forge(genesis, &fixture.laptop);
 
     assert!(matches!(
-        verify_membership_chain(&genesis, &[]),
+        verify_membership_chain(&genesis, &[], fixture.workspace),
         Err(MembershipError::GenesisActorMismatch)
     ));
 }
@@ -630,7 +660,7 @@ fn genesis_must_use_the_initial_epoch() {
     let genesis = forge(genesis, &fixture.admin);
 
     assert!(matches!(
-        verify_membership_chain(&genesis, &[]),
+        verify_membership_chain(&genesis, &[], fixture.workspace),
         Err(MembershipError::GenesisEpoch {
             expected: 1,
             found: 7
@@ -644,7 +674,7 @@ fn a_non_genesis_first_event_is_rejected() {
     let add = fixture.add(&[], &fixture.laptop, MemberRole::Member);
     // 把一条普通事件当作 genesis 传进去。
     assert!(matches!(
-        verify_membership_chain(&add, &[]),
+        verify_membership_chain(&add, &[], fixture.workspace),
         Err(MembershipError::Event { sequence: 1, .. }) | Err(MembershipError::GenesisMissing)
     ));
 }
@@ -656,7 +686,7 @@ fn a_tampered_genesis_signature_is_rejected() {
     genesis.signature[63] ^= 0x80;
 
     assert!(matches!(
-        verify_membership_chain(&genesis, &[]),
+        verify_membership_chain(&genesis, &[], fixture.workspace),
         Err(MembershipError::SignatureInvalid { sequence: 0 })
     ));
 }
@@ -673,7 +703,8 @@ fn append_never_produces_an_event_the_verifier_would_reject() {
         let event = fixture.add(&chain, device, MemberRole::Member);
         // 每一步都必须能被独立验证。
         chain.push(event);
-        let state = verify_membership_chain(&fixture.genesis, &chain).expect("链有效");
+        let state =
+            verify_membership_chain(&fixture.genesis, &chain, fixture.workspace).expect("链有效");
         assert_eq!(state.sequence as usize, index + 1);
         assert_eq!(state.len(), index + 2);
     }
@@ -741,7 +772,8 @@ fn error_codes_are_stable_and_unique_per_variant() {
     let fixture = Fixture::new();
     let mut add = fixture.add(&[], &fixture.laptop, MemberRole::Member);
     add.signature[0] ^= 0xff;
-    let error = verify_membership_chain(&fixture.genesis, &[add]).expect_err("应当失败");
+    let error =
+        verify_membership_chain(&fixture.genesis, &[add], fixture.workspace).expect_err("应当失败");
     assert_eq!(error.code(), "membership.signature_invalid");
     // 错误信息里不得出现签名或公钥字节。
     let rendered = error.to_string();

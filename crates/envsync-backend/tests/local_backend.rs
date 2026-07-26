@@ -56,7 +56,7 @@ fn put_object_rejects_bytes_that_do_not_match_id() {
     let err = backend
         .put_object(id, b"a different content")
         .expect_err("同一标识写入不同内容必须失败");
-    assert_eq!(err.code(), "corruption");
+    assert_eq!(err.code(), "backend.corruption");
     assert!(matches!(err, BackendError::Corruption { .. }));
     // 失败的写入不得留下任何对象。
     assert!(!backend.has_object(id).expect("存在性检查"));
@@ -75,7 +75,7 @@ fn put_object_detects_existing_object_with_different_content() {
     let err = backend
         .put_object(id, bytes)
         .expect_err("已存在的对象内容不同必须报损坏");
-    assert_eq!(err.code(), "corruption");
+    assert_eq!(err.code(), "backend.corruption");
     // 后端绝不覆盖：磁盘上仍然是被篡改的内容，交由维护流程处理。
     assert_eq!(
         fs::read(object_file(dir.path(), id)).expect("读取对象文件"),
@@ -93,7 +93,7 @@ fn get_object_verifies_digest_and_never_returns_corrupt_bytes() {
     fs::write(object_file(dir.path(), id), b"evil payload").expect("篡改对象文件");
 
     let err = backend.get_object(id).expect_err("损坏对象不能返回内容");
-    assert_eq!(err.code(), "corruption");
+    assert_eq!(err.code(), "backend.corruption");
     assert!(matches!(err, BackendError::Corruption { id: got, .. } if got == id));
 }
 
@@ -103,7 +103,7 @@ fn get_object_missing_returns_object_not_found() {
     let id = blob(b"never stored");
 
     let err = backend.get_object(id).expect_err("不存在的对象");
-    assert_eq!(err.code(), "object_not_found");
+    assert_eq!(err.code(), "backend.object_not_found");
     assert!(matches!(err, BackendError::ObjectNotFound(got) if got == id));
     assert!(!backend.has_object(id).expect("存在性检查"));
 }
@@ -157,7 +157,7 @@ fn list_objects_rejects_escaping_prefix() {
             .list_objects(bad)
             .err()
             .unwrap_or_else(|| panic!("前缀 `{bad}` 必须被拒绝"));
-        assert_eq!(err.code(), "invalid_prefix", "前缀 `{bad}`");
+        assert_eq!(err.code(), "backend.invalid_prefix", "前缀 `{bad}`");
         assert!(matches!(err, BackendError::InvalidPrefix { .. }));
     }
 
@@ -165,7 +165,7 @@ fn list_objects_rejects_escaping_prefix() {
     let err = backend
         .list_objects(&"a".repeat(65))
         .expect_err("超长前缀必须被拒绝");
-    assert_eq!(err.code(), "invalid_prefix");
+    assert_eq!(err.code(), "backend.invalid_prefix");
 }
 
 // ---------------------------------------------------------------------------
@@ -178,7 +178,7 @@ fn get_ref_before_first_publish_reports_ref_not_found() {
     let workspace = WorkspaceId::generate();
 
     let err = backend.get_ref(workspace).expect_err("尚未发布");
-    assert_eq!(err.code(), "ref_not_found");
+    assert_eq!(err.code(), "backend.ref_not_found");
     assert!(matches!(err, BackendError::RefNotFound(got) if got == workspace));
 }
 
@@ -191,7 +191,7 @@ fn first_cas_only_accepts_expected_revision_zero() {
     let err = backend
         .compare_and_swap_ref(workspace, 1, &next)
         .expect_err("首次发布不接受非 0 的期望 revision");
-    assert_eq!(err.code(), "cas_conflict");
+    assert_eq!(err.code(), "backend.cas_conflict");
     assert!(matches!(
         err,
         BackendError::CasConflict {
@@ -202,7 +202,7 @@ fn first_cas_only_accepts_expected_revision_zero() {
     // 失败的 CAS 不得留下任何 Ref。
     assert_eq!(
         backend.get_ref(workspace).unwrap_err().code(),
-        "ref_not_found"
+        "backend.ref_not_found"
     );
 
     backend
@@ -252,7 +252,7 @@ fn non_monotonic_or_foreign_ref_is_rejected() {
     let err = backend
         .compare_and_swap_ref(workspace, 1, &first)
         .expect_err("revision 必须严格递增");
-    assert_eq!(err.code(), "invalid_ref");
+    assert_eq!(err.code(), "backend.invalid_ref");
     assert!(matches!(err, BackendError::InvalidRef { .. }));
 
     // 另一个工作区的 Ref 不能写进本工作区。
@@ -261,7 +261,7 @@ fn non_monotonic_or_foreign_ref_is_rejected() {
     let err = backend
         .compare_and_swap_ref(workspace, 1, &foreign)
         .expect_err("工作区不匹配必须被拒绝");
-    assert_eq!(err.code(), "invalid_ref");
+    assert_eq!(err.code(), "backend.invalid_ref");
 
     // 两次失败都不改变后端状态。
     assert_eq!(backend.get_ref(workspace).expect("读回 Ref"), first);
@@ -341,7 +341,7 @@ fn open_rejects_directory_with_wrong_format_marker() {
     fs::write(dir.path().join("format"), "envsync-backend-format=2\n").expect("写入错误的格式标记");
 
     let err = LocalBackend::open(dir.path()).expect_err("格式版本不对必须失败");
-    assert_eq!(err.code(), "format_mismatch");
+    assert_eq!(err.code(), "backend.format_mismatch");
     assert!(matches!(err, BackendError::FormatMismatch { .. }));
 }
 

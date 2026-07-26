@@ -15,6 +15,14 @@
 //! | 8 日志 canary | [`the_real_binary_never_echoes_the_canary_on_any_subcommand`]、[`the_real_binary_full_flow_never_surfaces_the_vault_canary`]、[`no_in_process_command_channel_ever_carries_the_canary`]、[`the_only_deliberate_outlet_is_vault_get_stdout`] |
 //! | 9 跨 workspace 重放 | [`cross_workspace_replay_of_every_object_kind_is_rejected`] |
 //!
+//! M2 补上的读路径校验另有三条测试，它们不属于原矩阵，但矩阵里好几项都建立在它们之上：
+//!
+//! | 性质 | 测试函数 |
+//! |---|---|
+//! | 头快照的 Vault 索引背书必须有效 | [`an_index_without_a_valid_attestation_is_refused`] |
+//! | 没有成员链的工作区仍接受未签名的头 | [`a_workspace_without_a_membership_chain_still_accepts_an_unsigned_head`] |
+//! | 索引指针丢失要报警而不是返回空清单 | [`a_missing_vault_index_pointer_is_reported_instead_of_an_empty_list`] |
+//!
 //! # 为什么这一套是「真进程 + 库级」的混合体，而 `git_multi_device.rs` 不是
 //!
 //! M0/M1 的两套 E2E 全程只用 `std::process::Command` 驱动真二进制。M2 做不到，原因是
@@ -54,40 +62,59 @@
 //! * 真进程断言到退出码整数；
 //! * 「本地文件零变更」断言的是整棵目录树的**逐字节指纹**，不是文件数量。
 //!
-//! # 本套件钉住的「当前行为」（与计划文档措辞有出入的地方）
+//! # M2 攻击矩阵暴露的 7 个安全缺口（**全部已修复**）
 //!
-//! 下面几条不是断言写松了，而是**实现现在就是这样**。测试按实际行为写，并在这里
-//! 逐条记下来，免得日后有人把它们当成测试 bug 顺手「修」掉：
+//! 下面这份清单原本记录的是「实现现在就是这样」——测试按当时的实际行为写，以免有人把
+//! 它们当成测试 bug 顺手「修」掉。**七条现已全部修复**，对应的测试也从「钉住当前行为」
+//! 改成了「断言期望行为」。清单保留下来，是为了让每一条修复都有一个可回溯的出处，
+//! 也为了让回归一眼可见：任何一条重新变红，都说明对应的缺口回来了。
 //!
-//! 1. **读路径完全不查反回滚检查点。** [`envsync_core::vault::VaultService::reload`]
-//!    只验成员链，不调 `check_advance`；检查点只在
-//!    `VaultService::publish` 里推进。因此后端被回退之后，`vault get` / `vault list` /
-//!    `device list` 会安静地返回旧状态（已撤销设备重新出现在成员名单里），只有下一次
-//!    **写**才会撞上检查点。见 [`rolling_the_backend_back_to_an_old_head`]。
-//! 2. **检查点判定在 CAS 之后。** 同一条路径上，被骗的客户端会先把新头 CAS 上去、
-//!    再发现自己被回滚了，于是后端的 revision 已经被推进了一格。
-//! 3. **快照签名从不被验证。** `publish_snapshot_signature` 会写一个
-//!    `ObjectKind::SnapshotSignature` 对象，但全仓库没有任何地方读它——
-//!    `SNAPSHOT_SIGNATURE_DOMAIN` 只出现在签名侧。因此本文件里的 [`republish_head`]
-//!    连伪造签名都不需要。
-//! 4. **成员链自身的 `workspace` 字段不与本地工作区比对。**
-//!    `verify_membership_chain` 只保证「链内各事件的 workspace 与 genesis 一致」，
-//!    `reload` 只检查*索引*的 workspace。于是一整条外来链可以被读进来，
-//!    见 [`cross_workspace_replay_of_every_object_kind_is_rejected`] 的第 3b 段。
-//! 5. **`device revoke` 的最后一步是主动重加密，不是 lazy rewrap。** 撤销一结束，
-//!    索引里已经没有任何旧纪元条目，见
-//!    [`revocation_advances_the_epoch_and_locks_the_revoked_device_out`]。
-//! 6. **后端层错误码没有层前缀**：是 `corruption` / `cas_conflict`，而不是
-//!    `backend.corruption`；其余每一层都有前缀。
-//! 7. **一次普通 `envsync sync` 会静默抹掉整个 Vault。** 普通同步与 Vault 共用同一条
-//!    工作区 Ref，而 M0/M1 的发布路径自己构造头快照，`metadata` 里只写
-//!    `device_name` / `format`，**不会把上一个头的
-//!    [`VAULT_INDEX_METADATA_KEY`] 带过来**。于是 `sync` 一跑完，头快照上的 Vault
-//!    索引指针就没了：`vault get` 变成 `vault.secret_not_found`，而 `vault list`
-//!    **照常以 `status: ok` 返回一个空 Vault，一条诊断都不给**。密封对象本身还在后端
-//!    上（内容寻址、不可变），丢的只是那个指针——但从用户视角看，跑一条例行 `sync`
-//!    就让整个 Vault 消失了。见
-//!    [`the_real_binary_full_flow_never_surfaces_the_vault_canary`] 的最后一段。
+//! 1. ~~**读路径完全不查反回滚检查点。**~~ **已修复。**
+//!    [`envsync_core::vault::VaultService::reload`] 现在会做一次
+//!    [`envsync_core::checkpoint::guard`]（**只读**校验，不推进），
+//!    [`envsync_core::EnvSyncService`] 的读 Ref 路径同样如此。后端被回退之后
+//!    `vault get` / `vault list` / `device list` / `status` 全部以
+//!    `checkpoint.revision_rollback` 失败（CLI 退出码 14），而不再安静地返回旧状态。
+//!    见 [`rolling_the_backend_back_to_an_old_head`]。
+//! 2. ~~**检查点判定在 CAS 之后。**~~ **已修复。** 校验移到了 CAS **之前**
+//!    （`VaultService::publish` 在 `compare_and_swap_ref` 之前先 `guard` 一次），
+//!    推进仍在 CAS 之后。被骗的客户端不再「先把后端推进一格再发现自己被回滚了」——
+//!    同一条测试断言后端 revision **一格都没动**。
+//! 3. ~~**快照签名从不被验证。**~~ **已修复。** 读取远端头快照时会校验
+//!    [`envsync_core::vault::VAULT_ATTESTATION_METADATA_KEY`] 上的**索引背书**：必须由
+//!    当前成员链上的设备签出，且覆盖工作区与索引对象标识（背书覆盖索引而不是快照标识，
+//!    理由见 [`envsync_core::attestation`] 的模块文档）。缺失或验不过一律
+//!    `snapshot.signature_invalid`。因此本文件里的 [`republish_head`] 现在**必须**拿一把
+//!    真实成员密钥来签，见 [`an_index_without_a_valid_attestation_is_refused`] 与
+//!    [`a_workspace_without_a_membership_chain_still_accepts_an_unsigned_head`]。
+//! 4. ~~**成员链自身的 `workspace` 字段不与本地工作区比对。**~~ **已修复。**
+//!    `verify_membership_chain` 增加了 `expected_workspace` 参数，任何一条事件（含
+//!    genesis）的 `workspace` 不等于本地工作区都立即拒绝。整条外来链现在在**第一条
+//!    事件**上就被拦下，见
+//!    [`cross_workspace_replay_of_every_object_kind_is_rejected`] 的第 3b 段。
+//! 5. ~~**`device revoke` 的最后一步是主动重加密，不是 lazy rewrap。**~~ **已修复。**
+//!    撤销只做「纪元 +1 + 新信封 + 新头」，旧密封对象原样留在后端上，等读取时才重新
+//!    密封。`device revoke` 的 JSON 契约相应地把 `rewrapped` 换成了 `pending_rewrap`。
+//!    见 [`revocation_advances_the_epoch_and_locks_the_revoked_device_out`]。
+//! 6. ~~**后端层错误码没有层前缀。**~~ **已修复。** 统一加上 `backend.` 前缀
+//!    （`backend.corruption` / `backend.cas_conflict` / …），与
+//!    `platform.*` / `storage.*` / `config.*` / `vault.*` 一致。
+//! 7. ~~**一次普通 `envsync sync` 会静默抹掉整个 Vault。**~~ **已修复（这一条最严重）。**
+//!    快照元数据里 `envsync.` 前缀的键属于**工作区级**，由每一条发布路径从父快照
+//!    原样继承（[`envsync_core::vault::WORKSPACE_METADATA_PREFIX`]），
+//!    [`VAULT_INDEX_METADATA_KEY`] 与背书都在其中。另外 `vault list` 现在会在
+//!    「本机确实加入过这个 Vault、当前头却没有索引指针」时给出一条 `blocking` 级诊断
+//!    `vault.index_missing`，而不是安静地返回一个空清单。见
+//!    [`the_real_binary_full_flow_never_surfaces_the_vault_canary`] 的最后一段与
+//!    [`a_missing_vault_index_pointer_is_reported_instead_of_an_empty_list`]。
+//!
+//! ## 仍然存在的残留风险（不是缺口，是已知边界）
+//!
+//! 索引背书 + 反回滚检查点合起来挡住了「伪造索引」和「整体回退」，但**挡不住**把一份
+//! 旧的、真实签过的索引挂到同一个成员链 sequence、同一个纪元的新 revision 上——检查点
+//! 的四个维度都不覆盖「索引里的秘密条目」。堵住它需要给索引本身加一条单调计数，而那会
+//! 让普通同步重新需要签名密钥（M0/M1 的设备身份与成员链上的密码学身份是两套）。留待
+//! 后续里程碑权衡。
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
@@ -103,8 +130,10 @@ use envsync_cli::vault_cli::{self, OutputTarget, ValueSource, VaultContext};
 use envsync_core::checkpoint::{CheckpointStore, InMemoryCheckpointStore};
 use envsync_core::device_admin;
 use envsync_core::ports::Clock;
-use envsync_core::vault::{SecretInput, VaultIndex, VaultService, VAULT_INDEX_METADATA_KEY};
-use envsync_core::{CoreError, CoreResult, WorkspaceConfig};
+use envsync_core::vault::{
+    SecretInput, VaultIndex, VaultService, VAULT_ATTESTATION_METADATA_KEY, VAULT_INDEX_METADATA_KEY,
+};
+use envsync_core::{CoreError, CoreResult, EnvSyncService, WorkspaceConfig};
 use envsync_crypto::device::{DeviceKeypair, DevicePublic};
 use envsync_crypto::envelope::KeyEnvelope;
 use envsync_crypto::recovery::{Argon2Params, RecoveryPackage, RecoveryPhrase};
@@ -632,13 +661,34 @@ fn head_index(backend: &LocalBackend, workspace: WorkspaceId) -> VaultIndex {
 
 /// **攻击者**用一份自己构造的索引重写工作区的头：写索引对象 → 写新快照 → CAS 推进 Ref。
 ///
-/// 刻意**不**发布快照签名对象：EnvSync 在读路径上从不校验它（见本文件末尾的实现缺陷
-/// 记录），因此攻击者也没有伪造它的动机。
+/// `signer` 是给新索引签背书的设备密钥。M2 起读路径会校验
+/// [`VAULT_ATTESTATION_METADATA_KEY`] 上的索引背书（见
+/// [`envsync_core::attestation`]），因此**不带背书的伪造索引在第一步就会被拒**——那条
+/// 性质由 [`an_index_without_a_valid_attestation_is_refused`] 单独覆盖。
+///
+/// 这里给攻击者一把**真实成员**的密钥，等价于「某台成员设备被攻陷了，或者它自己就是
+/// 攻击者」。这是刻意的：只有把背书这一层让过去，后面几层（AEAD 的 AAD 绑定、成员链的
+/// 工作区比对、信封的收件人绑定）才会被真正执行到，而不是被最外层挡下来变成空转。
 fn republish_head(
     backend: &LocalBackend,
     workspace: WorkspaceId,
-    author: DeviceId,
+    signer: &DeviceKeypair,
     index: &VaultIndex,
+) {
+    republish_head_inner(backend, workspace, index, |index_id| {
+        Some(
+            envsync_core::attestation::sign_index_attestation(signer, workspace, index_id)
+                .expect("攻击者应当能用手里的成员密钥签名"),
+        )
+    });
+}
+
+/// 同 [`republish_head`]，但由调用方决定背书写成什么（`None` 表示干脆不写）。
+fn republish_head_inner(
+    backend: &LocalBackend,
+    workspace: WorkspaceId,
+    index: &VaultIndex,
+    attestation: impl FnOnce(ObjectId) -> Option<String>,
 ) {
     let index_bytes = index.to_canonical_vec();
     let index_id = ObjectId::for_bytes(ObjectKind::Blob, &index_bytes);
@@ -648,8 +698,17 @@ fn republish_head(
 
     let current = head_ref(backend, workspace);
     let previous = head_snapshot(backend, workspace);
+    let author = previous.author_device;
     let mut metadata = previous.metadata.clone();
     metadata.insert(VAULT_INDEX_METADATA_KEY.to_owned(), index_id.to_string());
+    match attestation(index_id) {
+        Some(raw) => {
+            metadata.insert(VAULT_ATTESTATION_METADATA_KEY.to_owned(), raw);
+        }
+        None => {
+            metadata.remove(VAULT_ATTESTATION_METADATA_KEY);
+        }
+    }
 
     let body = SnapshotBody::new(
         workspace,
@@ -1077,11 +1136,10 @@ fn flipping_one_ciphertext_byte_is_caught_by_content_addressing() {
     let envelope = channels.envelope();
     assert_eq!(envelope["status"], "error");
     assert_eq!(envelope["data"], Value::Null, "失败时 data 必须是 null");
-    // 注意错误码是不带层前缀的 `corruption`：后端层的码没有 `backend.` 前缀，
-    // 而其余每一层（`vault.` / `checkpoint.` / `membership.` / `platform.` /
-    // `rotation.` / `crypto.`）都有。这条断言把当前契约钉住，见最终报告。
+    // 错误码带 `backend.` 层前缀，与其余每一层（`vault.` / `checkpoint.` /
+    // `membership.` / `platform.` / `rotation.` / `crypto.`）一致。
     assert_eq!(
-        envelope["diagnostics"][0]["code"], "corruption",
+        envelope["diagnostics"][0]["code"], "backend.corruption",
         "整份信封：{}",
         channels.json
     );
@@ -1090,7 +1148,7 @@ fn flipping_one_ciphertext_byte_is_caught_by_content_addressing() {
     // 直接调用一次核心层，把错误码钉死。
     expect_code(
         beta.read_secret(SECRET),
-        "corruption",
+        "backend.corruption",
         "翻转一个字节之后的读取",
     );
 }
@@ -1134,7 +1192,7 @@ fn a_consistent_forgery_is_caught_by_aead_authentication() {
         .put_object(forged_id, &forged_bytes)
         .expect("应当能写伪造对象");
     index.secrets[position].object = forged_id;
-    republish_head(&backend, workspace, alpha.device_id(), &index);
+    republish_head(&backend, workspace, &alpha.keypair(), &index);
 
     // 伪造对象本身是「合法」的：内容寻址层放行了它。
     assert!(
@@ -1218,7 +1276,7 @@ fn substituting_another_devices_envelope_fails_authentication_without_panicking(
     // --- 粗暴替换：索引里把 gamma 的信封换成 beta 的 ---------------------------
     let mut swapped = index.clone();
     swapped.envelopes.retain(|id| *id != gamma_envelope);
-    republish_head(&backend, workspace, alpha.device_id(), &swapped);
+    republish_head(&backend, workspace, &alpha.keypair(), &swapped);
 
     expect_code(
         vault_cli::device_join(&gamma.ctx(), &invitation),
@@ -1243,7 +1301,7 @@ fn substituting_another_devices_envelope_fails_authentication_without_panicking(
         .expect("应当能写伪造信封");
     let mut spoofed = head_index(&backend, workspace);
     spoofed.envelopes.push(forged_id);
-    republish_head(&backend, workspace, alpha.device_id(), &spoofed);
+    republish_head(&backend, workspace, &alpha.keypair(), &spoofed);
 
     let channels = capture("device.join", || {
         vault_cli::device_join(&gamma.ctx(), &invitation)
@@ -1279,14 +1337,18 @@ fn substituting_another_devices_envelope_fails_authentication_without_panicking(
 
 /// **攻击矩阵第 4 项：alpha 撤销 beta → 纪元 +1 → alpha 能读新秘密、beta 不能。**
 ///
-/// 与计划文档措辞的一处**实际差异**（已在最终报告中记录）：计划设想「beta 仍能通过
-/// `vault get` 读到撤销前的旧对象，直到 lazy rewrap 发生」。实现里 `device revoke` 的
-/// 最后一个阶段会**主动**把全部旧纪元秘密重加密到新纪元并更新索引，因此撤销一结束，
-/// 索引里就已经没有任何 beta 解得开的条目了。
+/// 撤销按 **lazy rewrap** 收尾（计划文档 Task 5 步骤 3）：只做「纪元 +1 + 新信封 + 新头」，
+/// 旧密封对象原样留在后端上，直到某台仍有权限的设备读到它时才重新密封。因此撤销刚结束
+/// 时索引里那条秘密仍然指向纪元 1 的对象。
 ///
-/// 旧密封对象本身仍然躺在后端上（内容寻址、不可变），beta 手里也还留着旧纪元的密钥，
-/// 所以它**仍然能解开那个旧对象**——撤销给的是前向保密，不是追溯保密。这一点这里
-/// 逐字节断言出来，免得被「beta 读不到了」这句话糊过去。
+/// 由此得到的边界必须被说清楚，而不是被「beta 读不到了」这句话糊过去：
+///
+/// * beta **仍然读得到**撤销前就已经存在的那条秘密——它手里还留着纪元 1 的数据密钥，
+///   而那个密文是不可变的、它早就拿到过。撤销给的是**前向**保密，不是追溯保密；
+/// * beta **读不到**撤销之后写入的任何内容（那些用纪元 2 加密），也拿不到纪元 2 的信封；
+/// * beta **写不了**任何东西——它已经不在成员链上。
+///
+/// 最后一条同时说明了「主动重加密」为什么换不来安全属性：已经发出去的密文收不回来。
 #[test]
 fn revocation_advances_the_epoch_and_locks_the_revoked_device_out() {
     let world = World::new();
@@ -1367,20 +1429,32 @@ fn revocation_advances_the_epoch_and_locks_the_revoked_device_out() {
         "被撤销的 beta 索要新纪元信封",
     );
 
-    // --- 实际语义：索引已被主动重加密，但旧对象仍可被旧密钥解开 -----------------
-    let rewrapped = head_index(&backend, workspace)
+    // --- lazy rewrap：撤销**没有**碰过任何旧密封对象 ---------------------------
+    let entry = head_index(&backend, workspace)
         .find(&secret_id(SECRET))
         .expect("索引里仍应有这条秘密")
         .clone();
-    assert_eq!(rewrapped.epoch, 2, "revoke 的最后一步已经把旧秘密重加密了");
-    assert_ne!(rewrapped.object, old_object);
-    expect_code(
-        beta.read_secret(SECRET),
-        "vault.data_key_missing",
-        "撤销之后 beta 通过索引读旧秘密",
+    assert_eq!(
+        entry.epoch, 1,
+        "撤销只推进纪元，旧秘密必须原样停在纪元 1（lazy rewrap）"
+    );
+    assert_eq!(
+        entry.object, old_object,
+        "撤销不得产生新的密封对象——重加密发生在读取时"
+    );
+    assert_eq!(
+        envelope["data"]["pending_rewrap"], 1,
+        "待 lazy rewrap 的条数必须被如实报出来"
     );
 
-    // 但后端上那个旧对象还在，beta 手里的旧纪元密钥仍然能解开它。
+    // beta 仍然解得开那条旧秘密：它手里还有纪元 1 的密钥，而密文早就发出去了。
+    assert_eq!(
+        beta.read_secret(SECRET)
+            .expect("beta 仍读得到撤销前的旧对象"),
+        CANARY.as_bytes(),
+        "撤销是前向保密，不是追溯保密：已经发出去的密文收不回来"
+    );
+    // 直接用密码学层再验一遍同一件事，绕开索引这一层，免得上面那条断言依赖索引形状。
     let old_bytes = backend.get_object(old_object).expect("旧对象仍在后端上");
     let old_sealed = SealedSecret::from_canonical_slice(&old_bytes).expect("可解码");
     let ring = beta.service().load_keyring().expect("beta 仍持有密钥环");
@@ -1389,10 +1463,29 @@ fn revocation_advances_the_epoch_and_locks_the_revoked_device_out() {
         &old_sealed,
     )
     .expect("旧对象仍可被旧密钥解开");
+    assert_eq!(plaintext.expose(), CANARY.as_bytes());
+
+    // --- 而 alpha 读一次就触发 lazy rewrap，索引随之收敛到新纪元 ----------------
+    let mut alpha_service = alpha.service();
     assert_eq!(
-        plaintext.expose(),
-        CANARY.as_bytes(),
-        "撤销是前向保密，不是追溯保密：已经发出去的密文收不回来"
+        alpha_service
+            .get(&secret_id(SECRET))
+            .expect("alpha 可读")
+            .expose(),
+        CANARY.as_bytes()
+    );
+    assert_eq!(alpha_service.flush_rewraps().expect("落盘"), 1);
+    let rewrapped = head_index(&backend, workspace)
+        .find(&secret_id(SECRET))
+        .expect("索引里仍应有这条秘密")
+        .clone();
+    assert_eq!(rewrapped.epoch, 2, "读取之后才轮到重加密");
+    assert_ne!(rewrapped.object, old_object);
+    // 重加密之后 beta 才真正被挡在索引之外。
+    expect_code(
+        beta.read_secret(SECRET),
+        "vault.data_key_missing",
+        "lazy rewrap 之后 beta 通过索引读旧秘密",
     );
 }
 
@@ -1405,13 +1498,15 @@ fn revocation_advances_the_epoch_and_locks_the_revoked_device_out() {
 /// 攻击构造是最彻底的一种：把整个后端目录换成撤销**之前**的一份副本，于是 revision、
 /// 成员链头与密钥纪元三条线同时倒退。
 ///
-/// 断言的是**实际行为**，与计划文档的措辞有出入（见最终报告）：
+/// 断言的是**期望行为**：
 ///
-/// * 写路径确实会被拦下，错误是 `checkpoint.*` 系列且
-///   [`CoreError::is_rollback_attack`] 为真（CLI 映射到退出码 14）；
-/// * 但拦截发生在 **CAS 之后**，后端的 Ref 已经被推进了一格；
-/// * 读路径（`vault get` / `vault list` / `device list`）**完全不查检查点**，会安静地
-///   返回回滚后的旧状态；
+/// * **读路径**（`vault get` / `vault list` / `device list` / `status`）在读到远端头的那
+///   一刻就失败，错误是 `checkpoint.*` 系列且 [`CoreError::is_rollback_attack`] 为真
+///   （CLI 映射到退出码 14）。安静地返回旧状态是不可接受的：那会让已撤销的设备重新出现
+///   在成员名单里，而用户看不到任何异常；
+/// * **写路径**在 **CAS 之前**就被拦下——后端的 revision **一格都不许动**。被骗的客户端
+///   绝不能先把新头推上去、再回头发现自己接受的是一个回滚过的头；
+/// * 检查点自身不被降下来；
 /// * 本地文件（授权根 + 配置文件）逐字节零变更。
 #[test]
 fn rolling_the_backend_back_to_an_old_head() {
@@ -1463,40 +1558,76 @@ fn rolling_the_backend_back_to_an_old_head() {
         "后端确实被回退了"
     );
 
-    // --- 读路径：**没有**被拦下（实现缺陷，见报告） ----------------------------
-    let stale = alpha.service();
-    assert_eq!(
-        stale.membership().expect("成员状态").epoch,
-        old.2,
-        "回滚后的读路径直接采信了旧纪元"
-    );
+    // --- 读路径：每一条都必须以「检测到回滚」失败 ------------------------------
+    //
+    // 读路径**只校验、不推进**：它回答的是「后端现在给我的这个头，相对我记住的高水位线
+    // 是不是倒退了」，而不是「把高水位线挪一挪」。
+    let error = err(alpha.try_service());
     assert!(
-        stale
-            .membership()
-            .expect("成员状态")
-            .contains(&beta.device_id()),
-        "回滚后的读路径把已撤销的 beta 又当成了成员"
+        error.is_rollback_attack(),
+        "回滚之后连打开服务都必须失败，实际错误码 `{}`：{error}",
+        error.code()
     );
-    assert_eq!(
-        alpha.read_secret(SECRET).expect("旧秘密仍可读"),
-        CANARY.as_bytes()
-    );
-    // 新纪元里写的那条秘密凭空消失了，而且没有任何回滚告警。
-    expect_code(
-        alpha.read_secret(SECRET_AFTER_ROTATION),
-        "vault.secret_not_found",
-        "回滚之后读新纪元的秘密",
-    );
-    let listed = capture("vault.list", || vault_cli::vault_list(&alpha.ctx()));
+    assert_eq!(error.code(), "checkpoint.revision_rollback");
+
+    // `vault get` / `vault list` / `device list` 三条真命令函数逐个过一遍。
+    for (label, run) in [
+        (
+            "vault.get",
+            Box::new(|| alpha.get_secret_to_file(SECRET, &world.path().join("never-written.out")))
+                as Box<dyn Fn() -> CoreResult<CommandOutput>>,
+        ),
+        (
+            "vault.list",
+            Box::new(|| vault_cli::vault_list(&alpha.ctx())),
+        ),
+        (
+            "device.list",
+            Box::new(|| vault_cli::device_list(&alpha.ctx())),
+        ),
+    ] {
+        let channels = capture(label, run.as_ref());
+        channels.assert_no_canary(label);
+        let envelope = channels.envelope();
+        assert_eq!(
+            envelope["status"], "error",
+            "{label} 在回滚之后必须失败：{}",
+            channels.json
+        );
+        assert_eq!(
+            envelope["diagnostics"][0]["code"], "checkpoint.revision_rollback",
+            "{label} 的错误码：{}",
+            channels.json
+        );
+    }
+    // 已撤销的 beta 绝不能重新出现在任何一份成员名单里——读路径根本没有产出名单。
     assert!(
-        !listed.json.contains(SECRET_AFTER_ROTATION),
-        "回滚后的 vault list 安静地少了一条秘密：{}",
-        listed.json
+        !capture("device.list", || vault_cli::device_list(&alpha.ctx()))
+            .json
+            .contains(&beta.device_id().to_hex())
     );
 
-    // --- 写路径：被检查点拦下 -------------------------------------------------
-    let mut service = alpha.service();
-    let error = err(service.set(&secret_id("ci/after-rollback"), input(b"blocked")));
+    // 普通 `status` 走的是 M0/M1 的服务，同样必须撞上检查点。
+    let mut plain = EnvSyncService::open_with(
+        alpha.config(),
+        Arc::clone(&alpha.clock) as Arc<dyn Clock>,
+        Some(Arc::clone(&alpha.checkpoints) as Arc<dyn CheckpointStore>),
+    )
+    .expect("应当能打开 M0/M1 服务");
+    let error = err(plain.status());
+    assert!(
+        error.is_rollback_attack(),
+        "`status` 在回滚之后必须失败，实际错误码 `{}`：{error}",
+        error.code()
+    );
+    assert_eq!(error.code(), "checkpoint.revision_rollback");
+    drop(plain);
+
+    // --- 写路径：在 CAS **之前**被拦下 ----------------------------------------
+    let revision_before_write = head_ref(&world.backend(), alpha.workspace()).revision;
+    let error = err(alpha
+        .try_service()
+        .and_then(|mut service| service.set(&secret_id("ci/after-rollback"), input(b"blocked"))));
     assert!(
         error.is_rollback_attack(),
         "回滚必须被判定为攻击（CLI 退出码 14），实际错误码 `{}`：{error}",
@@ -1508,6 +1639,11 @@ fn rolling_the_backend_back_to_an_old_head() {
         error.code()
     );
     assert_eq!(error.code(), "checkpoint.revision_rollback");
+    assert_eq!(
+        head_ref(&world.backend(), alpha.workspace()).revision,
+        revision_before_write,
+        "CAS 绝不能发生：被骗的客户端不得先把后端推进一格再发现自己被回滚了"
+    );
 
     // --- 退出码必须是 14 -------------------------------------------------------
     //
@@ -1541,20 +1677,24 @@ fn rolling_the_backend_back_to_an_old_head() {
     );
 
     // 检查点自身没有被降下来。
+    //
+    // 这里直接读检查点存储而不是走 `VaultService::checkpoint()`：打开服务本身现在就会
+    // 撞上回滚判定（上面刚断言过），拿它来读检查点等于绕不过去。检查点存储跨「命令」
+    // 存活，正是真实凭据库的形状。
     let after = alpha
-        .service()
-        .checkpoint()
+        .checkpoints
+        .load(alpha.workspace())
         .expect("检查点可读")
         .expect("检查点仍在");
     assert_eq!(after.revision, checkpoint.revision);
     assert_eq!(after.key_epoch, checkpoint.key_epoch);
     assert_eq!(after.membership_sequence, checkpoint.membership_sequence);
 
-    // 拦截发生在 CAS **之后**：后端的 Ref 已经被这次失败的写推进了一格。
+    // 整个攻击期间后端的 Ref 停在攻击者放回去的那个 revision：我们一次 CAS 都没做过。
     assert_eq!(
         head_ref(&world.backend(), alpha.workspace()).revision,
-        old.0 + 1,
-        "反回滚检查点在 CAS 之后才判定，被骗的客户端已经先改写了后端"
+        old.0,
+        "校验发生在 CAS 之前，后端 revision 不该被这次失败的写动过"
     );
 
     // --- 本地文件零变更 -------------------------------------------------------
@@ -1793,21 +1933,23 @@ fn interrupting_a_rotation_at_every_stage_recovers_idempotently() {
             2,
             "{label}：alpha 与 beta 各一份"
         );
+        // **lazy rewrap**：撤销只推进纪元，旧密封对象原样留在旧纪元，直到被读到。
         assert!(
-            final_index.secrets.iter().all(|entry| entry.epoch == 2),
-            "{label}：轮换完成后不该再有停留在旧纪元的秘密"
+            final_index.secrets.iter().all(|entry| entry.epoch == 1),
+            "{label}：撤销不做主动重加密，旧秘密必须仍停在纪元 1"
+        );
+        assert_eq!(
+            envelope["data"]["pending_rewrap"], 1,
+            "{label}：待 lazy rewrap 的条数必须被如实报出来"
         );
         assert_eq!(
             alpha.read_secret(SECRET).expect("alpha 可读"),
             CANARY.as_bytes(),
             "{label}"
         );
-        // 被撤销的设备读不到；剩下的成员在取回新信封之后照常工作。
-        expect_code(
-            doomed.read_secret(SECRET),
-            "vault.data_key_missing",
-            &format!("{label}：被撤销设备读秘密"),
-        );
+        // 剩下的成员在取回新信封之后照常工作。
+        // （被撤销设备仍能解开**撤销前**的那个旧对象——撤销给的是前向保密，不是追溯
+        // 保密。这一条由攻击矩阵第 4 项逐字节断言。）
         beta.service()
             .adopt_envelope()
             .expect("beta 取回新纪元密钥");
@@ -2199,51 +2341,53 @@ fn the_real_binary_full_flow_never_surfaces_the_vault_canary() {
     // 各自构造快照，于是问题来了：普通同步会不会把头快照上的 Vault 索引元数据顺手
     // 抹掉？
     //
-    // 会。这是一个实现缺陷；按约定**不改实现**，测试钉住当前行为，详见最终报告与
-    // 文件头「本套件钉住的当前行为」第 7 条。
-    //
-    // 成因：M0/M1 的发布路径自己构造头快照，`metadata` 只放 `device_name` / `format`，
-    // 不会把上一个头的 `envsync.vault.index` 带过来。于是一次普通 `sync` 之后：
-    //
-    // * 头快照上的 Vault 索引指针没了；
-    // * `vault get` 变成 `vault.secret_not_found`；
-    // * `vault list` **照常成功**，只是报告一个空 Vault——没有任何错误或诊断。
-    //
-    // 数据本身没丢（密封对象是内容寻址的，还在后端上），丢的是那个指针。但从用户视角
-    // 看，跑一条例行 `envsync sync` 会让整个 Vault 静默消失。
+    // **不会。** 工作区级元数据（`envsync.` 前缀）由 `capture` 从父快照原样继承；索引
+    // 背书只覆盖索引对象标识，因此跟着一起继承之后仍然有效。这条断言是缺陷 1 的回归护栏：
+    // 它一旦变红，就说明「一次例行 `envsync sync` 静默抹掉整个 Vault」那个 bug 回来了。
     let head_meta = head_snapshot(&backend, alpha.workspace()).metadata;
     assert!(
-        !head_meta.contains_key(VAULT_INDEX_METADATA_KEY),
-        "当前行为：普通同步会丢掉 Vault 索引元数据；实际 metadata = {:?}",
+        head_meta.contains_key(VAULT_INDEX_METADATA_KEY),
+        "普通同步必须继承 Vault 索引指针；实际 metadata = {:?}",
         head_meta.keys().collect::<Vec<_>>()
     );
-    expect_code(
-        alpha.read_secret(SECRET),
-        "vault.secret_not_found",
-        "普通同步抹掉 Vault 索引之后读秘密",
+    assert!(
+        head_meta.contains_key(VAULT_ATTESTATION_METADATA_KEY),
+        "索引背书同样是工作区级元数据，必须一起继承；实际 metadata = {:?}",
+        head_meta.keys().collect::<Vec<_>>()
     );
-    // 而 `vault list` 连一句警告都没有，只是报告一个空 Vault。
-    let listed = capture("vault.list", || vault_cli::vault_list(&alpha.ctx()));
+    // 非空转对照：本次同步确实换掉了 State Root（否则「继承」只是因为什么都没发生）。
     assert_eq!(
-        listed.envelope()["status"],
-        "ok",
-        "当前行为：Vault 被抹掉之后 list 仍然成功：{}",
+        head_meta.get("format").map(String::as_str),
+        Some("envsync/m0"),
+        "头快照确实来自 M0/M1 的发布路径"
+    );
+    // 秘密照常取得回来，值逐字节不变。
+    assert_eq!(
+        alpha.read_secret(SECRET).expect("同步之后仍读得到"),
+        CANARY.as_bytes()
+    );
+    let listed = capture("vault.list", || vault_cli::vault_list(&alpha.ctx()));
+    assert_eq!(listed.envelope()["status"], "ok", "{}", listed.json);
+    assert_eq!(
+        listed.envelope()["data"]["entries"][0]["id"],
+        SECRET,
+        "同步之后清单仍然完整：{}",
         listed.json
     );
     assert_eq!(
-        listed.envelope()["data"]["entries"],
-        Value::Array(vec![]),
-        "当前行为：list 报告一个空 Vault：{}",
+        listed.envelope()["data"]["index_missing"],
+        false,
+        "{}",
         listed.json
     );
     assert_eq!(
         listed.envelope()["diagnostics"],
         Value::Array(vec![]),
-        "当前行为：连一条诊断都没有——用户看不出 Vault 刚刚被自己的 sync 抹掉了：{}",
+        "一切正常时不该有任何诊断：{}",
         listed.json
     );
 
-    // 数据本身没有被销毁：那个密封对象还在后端上，而且仍然只有密文。
+    // 密封对象当然也还在后端上，而且仍然只有密文。
     assert!(
         backend.has_object(sealed).expect("后端可查"),
         "密封对象是内容寻址的，不该被这次同步删掉"
@@ -2482,15 +2626,214 @@ fn the_only_deliberate_outlet_is_vault_get_stdout() {
 }
 
 // ===========================================================================
+// 头快照的 Vault 索引背书（M2 新增的读路径校验）
+// ===========================================================================
+
+/// **伪造一份索引却签不出背书：读路径必须拒绝。**
+///
+/// 这是攻击矩阵第 2、3、9 项共同依赖的最外层防线。上面几条测试刻意给攻击者一把**真实
+/// 成员**的密钥（见 [`republish_head`]），好让更里面的几层被真正执行到；这一条补上被
+/// 让过去的那一层本身。
+///
+/// 三种构造都要试，它们对应攻击者手里可能有的三种东西：
+///
+/// * **什么都没有**——干脆不写背书；
+/// * **一把不属于本工作区的密钥**——用一台从未加入的设备签；
+/// * **一条真背书，但配的是另一份索引**——把旧索引的背书原样搬到新索引上。
+///
+/// 反面对照：同一份伪造索引配上**真实成员**签出的背书就能被读进来（那正是上面几条测试
+/// 的前提），否则这条测试证明的只是「什么都读不了」。
+#[test]
+fn an_index_without_a_valid_attestation_is_refused() {
+    let world = World::new();
+    let alpha = world.primary("alpha");
+    alpha.device_init();
+    alpha.vault_create();
+    alpha.put_secret(SECRET, CANARY.as_bytes());
+
+    let backend = world.backend();
+    let workspace = alpha.workspace();
+    let genuine_attestation = head_snapshot(&backend, workspace)
+        .metadata
+        .get(VAULT_ATTESTATION_METADATA_KEY)
+        .expect("Vault 发布必须留下索引背书")
+        .clone();
+
+    // 攻击者想做的事：把这条秘密从索引里摘掉（或换成自己的对象）。
+    let mut forged = head_index(&backend, workspace);
+    forged.secrets.clear();
+
+    // 1) 不写背书。
+    republish_head_inner(&backend, workspace, &forged, |_| None);
+    std::fs::remove_dir_all(alpha.vault_dir()).expect("清掉本地缓存，强制回后端读");
+    expect_code(alpha.try_service(), "snapshot.signature_invalid", "无背书");
+
+    // 2) 用一台从未加入本工作区的设备签。
+    let outsider = DeviceKeypair::generate().expect("生成设备");
+    republish_head_inner(&backend, workspace, &forged, |index_id| {
+        Some(
+            envsync_core::attestation::sign_index_attestation(&outsider, workspace, index_id)
+                .expect("签名"),
+        )
+    });
+    std::fs::remove_dir_all(alpha.vault_dir()).expect("清掉本地缓存");
+    expect_code(
+        alpha.try_service(),
+        "snapshot.signature_invalid",
+        "非成员签出的背书",
+    );
+
+    // 3) 把上一版索引的**真**背书原样搬过来配这份新索引。
+    republish_head_inner(&backend, workspace, &forged, |_| {
+        Some(genuine_attestation.clone())
+    });
+    std::fs::remove_dir_all(alpha.vault_dir()).expect("清掉本地缓存");
+    expect_code(
+        alpha.try_service(),
+        "snapshot.signature_invalid",
+        "张冠李戴的背书",
+    );
+
+    // 反面对照：换成真实成员签的背书，同一份伪造索引就读得进来了。
+    republish_head(&backend, workspace, &alpha.keypair(), &forged);
+    std::fs::remove_dir_all(alpha.vault_dir()).expect("清掉本地缓存");
+    assert!(
+        alpha.service().index().secrets.is_empty(),
+        "有效背书下这份（被清空的）索引应当被接受，否则上面三条断言是空转"
+    );
+}
+
+/// **尚未 `vault create` 的工作区仍然接受没有背书的头快照。**
+///
+/// 这是背书机制的兼容分界：没有成员链就没有任何一把可以用来签名的密钥，要求签名等于
+/// 要求一件不可能的事。M0/M1 的纯文件同步工作区因此完全不受影响。
+#[test]
+fn a_workspace_without_a_membership_chain_still_accepts_an_unsigned_head() {
+    let world = World::new();
+    let alpha = world.primary("alpha");
+    alpha.device_init();
+    // 刻意**不**跑 `vault create`：只走 M0/M1 的发布路径。
+    alpha.publish_public_resource();
+
+    let backend = world.backend();
+    let head = head_snapshot(&backend, alpha.workspace());
+    assert!(
+        !head.metadata.contains_key(VAULT_INDEX_METADATA_KEY),
+        "没有 Vault 的工作区，头快照上不该有索引指针"
+    );
+    assert!(
+        !head.metadata.contains_key(VAULT_ATTESTATION_METADATA_KEY),
+        "没有成员链就没有背书"
+    );
+
+    // 服务照常打开，只是「还没有 Vault」。
+    let service = alpha.service();
+    assert!(!service.is_initialized());
+    assert!(
+        !service.vault_index_missing().expect("可判定"),
+        "从来没建过 Vault 不该被报成「Vault 不见了」"
+    );
+
+    // `vault list` 正常返回空清单，且**不**报 `vault.index_missing`。
+    let listed = capture("vault.list", || vault_cli::vault_list(&alpha.ctx()));
+    assert_eq!(listed.envelope()["status"], "ok", "{}", listed.json);
+    assert_eq!(
+        listed.envelope()["diagnostics"],
+        Value::Array(vec![]),
+        "{}",
+        listed.json
+    );
+}
+
+/// **索引指针不见了时，`vault list` 必须报警，而不是安静地返回空清单。**
+///
+/// 「空 Vault」和「Vault 读不到」在 JSON 契约上必须是两件事。历史上一次普通
+/// `envsync sync` 就会造成后者（缺陷 1），而 `vault list` 照常以 `status: ok` 返回一个
+/// 空数组，一条诊断都不给——用户完全看不出自己的秘密刚刚「消失」了。
+///
+/// 继承修好之后普通同步不再制造这个状态，但**后端仍然可以单独把指针拿掉**，因此这条
+/// 诊断必须留着。这里就用后端直接构造那个状态。
+#[test]
+fn a_missing_vault_index_pointer_is_reported_instead_of_an_empty_list() {
+    let world = World::new();
+    let alpha = world.primary("alpha");
+    alpha.device_init();
+    alpha.vault_create();
+    alpha.put_secret(SECRET, CANARY.as_bytes());
+
+    // 正向对照：正常状态下 list 有内容、没有诊断。
+    let healthy = capture("vault.list", || vault_cli::vault_list(&alpha.ctx()));
+    assert_eq!(healthy.envelope()["data"]["entries"][0]["id"], SECRET);
+    assert_eq!(healthy.envelope()["diagnostics"], Value::Array(vec![]));
+
+    // 攻击者（或一次有缺陷的发布路径）把索引指针从头快照上摘掉。
+    let backend = world.backend();
+    let workspace = alpha.workspace();
+    let current = head_ref(&backend, workspace);
+    let previous = head_snapshot(&backend, workspace);
+    let mut metadata = previous.metadata.clone();
+    metadata.remove(VAULT_INDEX_METADATA_KEY);
+    metadata.remove(VAULT_ATTESTATION_METADATA_KEY);
+    let body = SnapshotBody::new(
+        workspace,
+        current.head.into_iter().collect(),
+        previous.state_root,
+        previous.author_device,
+        previous.created_at_unix_ms + 1,
+        metadata,
+    )
+    .expect("应当能构造快照");
+    let snapshot = body.id();
+    backend
+        .put_object(ObjectId::from(snapshot), &body.to_canonical_vec())
+        .expect("应当能写快照对象");
+    backend
+        .compare_and_swap_ref(workspace, current.revision, &current.advance(snapshot))
+        .expect("应当能推进 Ref");
+    std::fs::remove_dir_all(alpha.vault_dir()).expect("清掉本地缓存，强制回后端读");
+
+    let listed = capture("vault.list", || vault_cli::vault_list(&alpha.ctx()));
+    let envelope = listed.envelope();
+    assert_eq!(
+        envelope["data"]["entries"],
+        Value::Array(vec![]),
+        "指针没了，清单当然是空的：{}",
+        listed.json
+    );
+    assert_eq!(
+        envelope["data"]["index_missing"], true,
+        "契约里必须有一个显式字段：{}",
+        listed.json
+    );
+    assert_eq!(
+        envelope["diagnostics"][0]["code"], "vault.index_missing",
+        "必须给出一条诊断，而不是安静地返回空清单：{}",
+        listed.json
+    );
+    assert_eq!(
+        envelope["diagnostics"][0]["severity"], "blocking",
+        "这不是一条「顺便提一下」：{}",
+        listed.json
+    );
+    // 人类可读输出同样不能说「里面还没有任何秘密」。
+    assert!(
+        !listed.stdout.contains("还没有任何秘密"),
+        "人类可读输出不得把「读不到」说成「是空的」：{}",
+        listed.stdout
+    );
+    listed.assert_no_canary("索引指针丢失后的 vault list");
+}
+
+// ===========================================================================
 // 攻击矩阵 9：跨 workspace 重放
 // ===========================================================================
 
 /// **攻击矩阵第 9 项：把工作区 A 的成员事件 / 信封 / 密封对象 / 邀请塞进工作区 B。**
 ///
-/// 四种对象各一段，全部必须被拒绝。其中「成员事件」一段记录的是**实际行为**，与
-/// 直觉有出入：`reload` 并不校验成员链自身的 `workspace` 字段是否等于本地工作区，
-/// 因此一条完整的外来链会被当成合法链读进来（详见最终报告）。真正把它挡住的是
-/// 「本设备不在那条链上」这一层——所有写操作都被拒绝。
+/// 四种对象各一段，全部必须被拒绝。其中「成员事件」分两段：把外来事件**追加**到本地链
+/// 后面，以及把整条链**整体换成**外来链。后者尤其重要——那条链自身完全自洽，只有
+/// 「链的 workspace 必须等于本地工作区」这一条显式比对能挡住它，而且必须挡在**第一条
+/// 事件**上，不能靠「本设备不在那条链上」兜底。
 #[test]
 fn cross_workspace_replay_of_every_object_kind_is_rejected() {
     // 工作区 A：受害者。
@@ -2534,7 +2877,7 @@ fn cross_workspace_replay_of_every_object_kind_is_rejected() {
         .expect("受害者索引里有这条秘密");
     let genuine_sealed_id = spliced.secrets[position].object;
     spliced.secrets[position].object = foreign_sealed_id;
-    republish_head(&victim_backend, victim_ws, victim.device_id(), &spliced);
+    republish_head(&victim_backend, victim_ws, &victim.keypair(), &spliced);
     std::fs::remove_dir_all(victim.vault_dir()).expect("清掉本地缓存，强制回后端读");
 
     expect_code(
@@ -2558,7 +2901,7 @@ fn cross_workspace_replay_of_every_object_kind_is_rejected() {
     // 把索引指回受害者自己那个对象，后面几段各测各的。
     let mut repaired = head_index(&victim_backend, victim_ws);
     repaired.secrets[position].object = genuine_sealed_id;
-    republish_head(&victim_backend, victim_ws, victim.device_id(), &repaired);
+    republish_head(&victim_backend, victim_ws, &victim.keypair(), &repaired);
     assert_eq!(
         victim.read_secret(SECRET).expect("修好之后照常可读"),
         CANARY.as_bytes()
@@ -2580,7 +2923,7 @@ fn cross_workspace_replay_of_every_object_kind_is_rejected() {
     republish_head(
         &victim_backend,
         victim_ws,
-        victim.device_id(),
+        &victim.keypair(),
         &with_foreign_envelope,
     );
 
@@ -2607,7 +2950,7 @@ fn cross_workspace_replay_of_every_object_kind_is_rejected() {
     // 3a. 把外来事件**追加**到受害者自己的链后面：链校验必须拒绝。
     let mut appended = head_index(&victim_backend, victim_ws);
     appended.membership.extend(foreign_index.membership.clone());
-    republish_head(&victim_backend, victim_ws, victim.device_id(), &appended);
+    republish_head(&victim_backend, victim_ws, &victim.keypair(), &appended);
     let error = err(victim.try_service());
     assert!(
         error.code().starts_with("membership."),
@@ -2616,39 +2959,52 @@ fn cross_workspace_replay_of_every_object_kind_is_rejected() {
     );
     assert_eq!(error.code(), "membership.workspace_mismatch");
 
-    // 3b. 把整条链**整体换成**外来链：链本身自洽，于是被读了进来（实现缺陷，见报告），
-    //     但本设备不在那条链上，任何写操作都被拒绝。
+    // 3b. 把整条链**整体换成**外来链：链自身完全自洽、genesis 也是真的，没有任何拼接
+    //     痕迹。挡住它的只能是「链的 workspace 必须等于本地工作区」这条显式比对，而且
+    //     必须挡在**第一条事件**（genesis，sequence 0）上——绝不能一路读进来再靠
+    //     「本设备不在那条链上」兜底。
     let mut replaced = head_index(&victim_backend, victim_ws);
     replaced.membership = foreign_index.membership.clone();
     replaced.epoch = foreign_index.epoch;
     replaced.envelopes = foreign_index.envelopes.clone();
     replaced.secrets.clear();
-    republish_head(&victim_backend, victim_ws, victim.device_id(), &replaced);
+    republish_head(&victim_backend, victim_ws, &victim.keypair(), &replaced);
+    std::fs::remove_dir_all(victim.vault_dir()).expect("清掉本地缓存，强制回后端读");
 
-    let hijacked = victim.service();
+    let error = expect_code(
+        victim.try_service(),
+        "membership.workspace_mismatch",
+        "整条外来链被塞进本工作区",
+    );
     assert!(
-        !hijacked
-            .membership()
-            .expect("成员状态")
-            .contains(&victim.device_id()),
-        "整条链被换掉之后，本设备当然不在成员里"
+        error.to_string().contains("sequence 0"),
+        "必须在第一条事件就被拒绝，实际：{error}"
     );
-    let mut hijacked = victim.service();
-    expect_code(
-        hijacked.set(&secret_id("ci/anything"), input(b"nope")),
-        "vault.not_a_member",
-        "外来成员链上写秘密",
-    );
-    expect_code(
-        vault_cli::device_invite(
-            &victim.ctx(),
-            &vault_cli::encode_public(&newcomer.device_public()),
-            MemberRole::Member,
-            &victim_world.path().join("hijacked.invitation"),
+    // 后续每一条命令都停在同一个地方——不存在「读得进来但写不了」的中间状态。
+    for (label, run) in [
+        (
+            "vault.list",
+            Box::new(|| vault_cli::vault_list(&victim.ctx()))
+                as Box<dyn Fn() -> CoreResult<CommandOutput>>,
         ),
-        "vault.admin_required",
-        "外来成员链上发邀请",
-    );
+        (
+            "device.list",
+            Box::new(|| vault_cli::device_list(&victim.ctx())),
+        ),
+        (
+            "device.invite",
+            Box::new(|| {
+                vault_cli::device_invite(
+                    &victim.ctx(),
+                    &vault_cli::encode_public(&newcomer.device_public()),
+                    MemberRole::Member,
+                    &victim_world.path().join("hijacked.invitation"),
+                )
+            }),
+        ),
+    ] {
+        expect_code(run(), "membership.workspace_mismatch", label);
+    }
 
     // --- 4. 邀请对象 -----------------------------------------------------------
     let stranger = victim_world.secondary(&victim, "stranger");

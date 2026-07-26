@@ -291,14 +291,27 @@ fn rotation_resumes_idempotently_from_every_stage() {
         assert_eq!(state.epoch, 2, "stop_before={stop_before}");
         assert_eq!(state.len(), 2);
         assert!(!state.contains(&doomed));
+        // **撤销不重加密旧对象**：lazy rewrap 只在读取时发生（计划文档 Task 5 步骤 3）。
+        // 因此这里断言的是「还停在旧纪元」，而不是「已经重加密」。
         assert_eq!(
             vault.list().expect("列出")[0].epoch,
-            2,
-            "stop_before={stop_before}：旧对象应当已重加密"
+            1,
+            "stop_before={stop_before}：撤销只推进纪元，旧对象必须原样留在旧纪元"
         );
+        assert_eq!(
+            resumed.pending_rewrap, 1,
+            "stop_before={stop_before}：待 lazy rewrap 的条数必须被如实报出来"
+        );
+        // 读一次就触发 lazy rewrap；索引更新推迟到下一次写操作或显式 flush。
         assert_eq!(
             vault.get(&sid("ci/npm-token")).expect("读取").expose(),
             CANARY
+        );
+        assert_eq!(vault.flush_rewraps().expect("落盘"), 1);
+        assert_eq!(
+            vault.list().expect("列出")[0].epoch,
+            2,
+            "stop_before={stop_before}：读取之后才轮到重加密"
         );
 
         // 再恢复一次是零成本的空转。
@@ -353,17 +366,59 @@ fn a_second_rotation_for_a_different_device_is_refused_while_one_is_pending() {
 }
 
 #[test]
-fn revoking_the_only_admin_is_refused_by_the_membership_rules() {
+fn a_device_can_never_revoke_itself() {
     let fixture = Fixture::new();
     let admin = fixture.device("admin");
     let admin_key = admin.init_device().expect("建立设备身份");
     let mut vault = admin.open().expect("打开服务");
     vault.create().expect("创建工作区");
 
-    // 只有一台设备时，撤销它会让工作区失去最后一个管理员——这一步在 `prepare` 阶段就
-    // 被「没有剩余收件人」拦下，根本不会生成新密钥。
+    // 撤销自己会产生一个**由非成员签出**的头：撤销事件把本设备从名单上抹掉，而这个头的
+    // Vault 索引背书恰恰是本设备刚签的。读路径要求背书由当前成员签出，于是那个头对所有
+    // 人都不可读——包括其余管理员，而他们又必须先读到头才能发布新头。工作区就此锁死。
     let error = err(vault.revoke_device(admin_key.device_id()));
-    assert_eq!(error.code(), "rotation.no_recipients");
+    assert_eq!(error.code(), "rotation.cannot_revoke_self");
+    assert_eq!(vault.membership().expect("成员状态").epoch, 1);
+    // 一步副作用都不能留下：既没有生成新纪元密钥，也没有写 journal。
+    assert!(vault
+        .rotations()
+        .get_unfinished(fixture.workspace)
+        .expect("journal 可读")
+        .is_none());
+
+    // 工作区里再多一台设备也一样——限制与「还剩几个管理员」无关。
+    let laptop = fixture.device("laptop");
+    let laptop_key = laptop.init_device().expect("建立设备身份");
+    device_admin::invite(
+        &mut vault,
+        laptop_key.public(),
+        MemberRole::Admin,
+        INVITATION_DEFAULT_TTL_MS,
+    )
+    .expect("邀请设备");
+    let error = err(vault.revoke_device(admin_key.device_id()));
+    assert_eq!(error.code(), "rotation.cannot_revoke_self");
+
+    // 反面对照：撤销**别人**照常可行，否则上面几条断言可能只是「什么都撤不了」。
+    let outcome = vault
+        .revoke_device(laptop_key.device_id())
+        .expect("撤销另一台设备");
+    assert_eq!(outcome.to_epoch, 2);
+}
+
+#[test]
+fn revoking_the_last_remaining_device_is_refused_by_the_membership_rules() {
+    let fixture = Fixture::new();
+    let admin = fixture.device("admin");
+    admin.init_device().expect("建立设备身份");
+    let stranger = fixture.device("stranger");
+    let stranger_key = stranger.init_device().expect("建立设备身份");
+    let mut vault = admin.open().expect("打开服务");
+    vault.create().expect("创建工作区");
+
+    // `stranger` 根本不是成员：撤销它在 `prepare` 阶段就被拦下，不会生成任何新密钥。
+    let error = err(vault.revoke_device(stranger_key.device_id()));
+    assert_eq!(error.code(), "vault.not_a_member_device");
     assert_eq!(vault.membership().expect("成员状态").epoch, 1);
 }
 
@@ -395,7 +450,18 @@ fn two_consecutive_rotations_keep_every_older_object_readable() {
     assert_eq!(outcome.from_epoch, 2);
     assert_eq!(outcome.to_epoch, 3);
 
-    // 三个纪元写下的内容全部仍然可读。
+    // 两次撤销都没有碰过任何旧密封对象：两条秘密仍停在各自写入时的纪元。
+    // 清单按逻辑标识升序，因此这里按标识取值而不是按位置，免得断言依赖排序细节。
+    let epochs: std::collections::BTreeMap<String, u64> = vault
+        .list()
+        .expect("列出")
+        .iter()
+        .map(|item| (item.id.as_str().to_owned(), item.epoch))
+        .collect();
+    assert_eq!(epochs["ci/npm-token"], 1, "撤销不做重加密，纪元原样保留");
+    assert_eq!(epochs["ci/epoch2"], 2, "撤销不做重加密，纪元原样保留");
+
+    // 三个纪元写下的内容全部仍然可读——密钥环保留了每一代密钥。
     assert_eq!(
         vault.get(&sid("ci/npm-token")).expect("读取").expose(),
         CANARY
@@ -404,6 +470,8 @@ fn two_consecutive_rotations_keep_every_older_object_readable() {
         vault.get(&sid("ci/epoch2")).expect("读取").expose(),
         b"written-at-epoch-2"
     );
+    // 读过之后才发生 lazy rewrap，两条都收敛到当前纪元。
+    assert_eq!(vault.flush_rewraps().expect("落盘"), 2);
     assert!(vault
         .list()
         .expect("列出")

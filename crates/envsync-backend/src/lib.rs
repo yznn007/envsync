@@ -42,7 +42,7 @@
 //!
 //! // 重放同一次发布会被 CAS 拦下。
 //! let err = backend.compare_and_swap_ref(workspace, 0, &next).unwrap_err();
-//! assert_eq!(err.code(), "cas_conflict");
+//! assert_eq!(err.code(), "backend.cas_conflict");
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
@@ -164,19 +164,29 @@ impl BackendError {
     /// 稳定的机器可读错误码。
     ///
     /// 该字符串会写入 journal、CLI 的 JSON 输出和遥测，**不得**随展示文本一起改动。
+    ///
+    /// # 层前缀
+    ///
+    /// 每一个错误码都带 `backend.` 前缀，与 `platform.*` / `storage.*` / `config.*` /
+    /// `vault.*` / `checkpoint.*` 保持一致。前缀不是装饰：调用方（CLI 的 JSON 契约、
+    /// 日志检索、告警规则）经常只拿到一个字符串，`corruption` 这种裸名字既看不出是哪
+    /// 一层报的，也随时可能和别的层撞名——`unsupported` 就同时是
+    /// [`envsync_domain::ObservedState`] 的一个状态名。
+    ///
+    /// M2 起统一加上前缀，这是一次**对外契约变更**：断言旧码的调用方需要同步更新。
     pub fn code(&self) -> &'static str {
         match self {
-            BackendError::CasConflict { .. } => "cas_conflict",
-            BackendError::ObjectNotFound(_) => "object_not_found",
-            BackendError::Corruption { .. } => "corruption",
-            BackendError::RefNotFound(_) => "ref_not_found",
-            BackendError::InvalidRef { .. } => "invalid_ref",
-            BackendError::Io { .. } => "io",
-            BackendError::Codec(_) => "codec",
-            BackendError::Locked { .. } => "locked",
-            BackendError::Unsupported(_) => "unsupported",
-            BackendError::InvalidPrefix { .. } => "invalid_prefix",
-            BackendError::FormatMismatch { .. } => "format_mismatch",
+            BackendError::CasConflict { .. } => "backend.cas_conflict",
+            BackendError::ObjectNotFound(_) => "backend.object_not_found",
+            BackendError::Corruption { .. } => "backend.corruption",
+            BackendError::RefNotFound(_) => "backend.ref_not_found",
+            BackendError::InvalidRef { .. } => "backend.invalid_ref",
+            BackendError::Io { .. } => "backend.io",
+            BackendError::Codec(_) => "backend.codec",
+            BackendError::Locked { .. } => "backend.locked",
+            BackendError::Unsupported(_) => "backend.unsupported",
+            BackendError::InvalidPrefix { .. } => "backend.invalid_prefix",
+            BackendError::FormatMismatch { .. } => "backend.format_mismatch",
         }
     }
 

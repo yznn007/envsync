@@ -333,8 +333,21 @@ struct ChainReplay {
 
 impl ChainReplay {
     /// 校验 genesis 并建立初始状态。
-    fn start(genesis: &MembershipEvent) -> Result<Self, MembershipError> {
+    ///
+    /// `expected_workspace` 是**本地**工作区标识。genesis 的 `workspace` 必须与它相等：
+    /// 否则整条链是从别处搬来的，即便它自身完全自洽也不该被读进来。
+    fn start(
+        genesis: &MembershipEvent,
+        expected_workspace: WorkspaceId,
+    ) -> Result<Self, MembershipError> {
         structural_check(genesis)?;
+        // 工作区比对排在最前面：一条外来链在做任何曲线运算之前就该被拒绝，而且报出来的
+        // 位置就是第一条事件（sequence 0），不会因为「链自身自洽」而一路读到尾。
+        if genesis.workspace != expected_workspace {
+            return Err(MembershipError::WorkspaceMismatch {
+                sequence: genesis.sequence,
+            });
+        }
         if !genesis.is_genesis() {
             return Err(MembershipError::GenesisMissing);
         }
@@ -605,11 +618,21 @@ fn verify_event_signature(
 /// 这是纯函数：不做任何 I/O，不看时钟。`events` 必须是 genesis 之后的后继事件，按链上
 /// 顺序排列；`genesis` 本身**不要**重复放进 `events`。
 ///
+/// # `expected_workspace` 为什么是必填参数
+///
+/// M2 早期的版本只保证「链内各事件的 workspace 与 genesis 一致」。那条不变量是**自洽**
+/// 的，不是**正确**的：把工作区 A 的整条链原样搬进工作区 B 的后端，它照样自洽，于是会被
+/// 完整读进来，只剩「本设备不在这条链上」这一层兜底。兜底能挡住写操作，却挡不住读操作
+/// 把一份外来的成员名单、纪元和信封当成本工作区的事实。
+///
+/// 因此工作区标识现在是**输入**而不是从链上推出来的：任何一条事件的 `workspace` 不等于
+/// 期望值都立即拒绝，genesis 也不例外——外来链在第一条事件上就被拦住。
+///
 /// # 安全性
 ///
 /// 调用方必须保证 `genesis` 确实是本设备信任的那一个（首次加入工作区时由管理员签名的
 /// invitation 建立，之后由本地安全存储固定下来）。本函数只能证明「这条链从给定的
-/// genesis 合法延伸而来」，无法证明「这个 genesis 是对的」。
+/// genesis 合法延伸而来、且属于期望的工作区」，无法证明「这个 genesis 是对的」。
 ///
 /// # 示例
 ///
@@ -624,7 +647,7 @@ fn verify_event_signature(
 /// let laptop = DeviceKeypair::generate()?;
 ///
 /// let genesis = create_genesis(&admin, workspace, 1_700_000_000_000)?;
-/// let state = verify_membership_chain(&genesis, &[])?;
+/// let state = verify_membership_chain(&genesis, &[], workspace)?;
 /// assert_eq!(state.len(), 1);
 ///
 /// let public = envsync_domain::membership::DevicePublicBytes::from_parts(
@@ -642,13 +665,18 @@ fn verify_event_signature(
 ///     workspace,
 ///     1_700_000_000_001,
 /// )?;
-/// let state = verify_membership_chain(&genesis, std::slice::from_ref(&add))?;
+/// let state = verify_membership_chain(&genesis, std::slice::from_ref(&add), workspace)?;
 /// assert!(state.contains(&laptop.device_id()));
+///
+/// // 换一个工作区标识去验同一条链：第一条事件就被拒绝。
+/// let elsewhere = WorkspaceId::generate();
+/// assert!(verify_membership_chain(&genesis, &[], elsewhere).is_err());
 /// # Ok::<(), envsync_core::membership::MembershipError>(())
 /// ```
 pub fn verify_membership_chain(
     genesis: &MembershipEvent,
     events: &[MembershipEvent],
+    expected_workspace: WorkspaceId,
 ) -> Result<MembershipState, MembershipError> {
     // 结构限制先行：超长输入在做任何曲线运算之前就被拒绝。
     let total = events.len().saturating_add(1);
@@ -658,7 +686,7 @@ pub fn verify_membership_chain(
             found: total,
         });
     }
-    let mut replay = ChainReplay::start(genesis)?;
+    let mut replay = ChainReplay::start(genesis, expected_workspace)?;
     for event in events {
         replay.apply(event)?;
     }
@@ -695,7 +723,7 @@ pub fn create_genesis(
     )?;
     // 自检：刚生成的 genesis 必须能通过验证器。这条断言把「构造」和「验证」两条
     // 代码路径钉在一起，任何一侧漂移都会立刻暴露。
-    ChainReplay::start(&event)?;
+    ChainReplay::start(&event, workspace)?;
     Ok(event)
 }
 

@@ -143,7 +143,7 @@ envsync adapters  discover --config <path>
 （`capture` / `plan` / `sync` / `fetch` / `merge`）仍然以退出码 1 失败：拿一份缓存的
 revision 去做 CAS，等于把反回滚保护交给一个可能已经过期好几天的数字。
 
-「够得着但内容坏了」的错误（`corruption`、`format_mismatch`、`invalid_ref`）照常失败——
+「够得着但内容坏了」的错误（`backend.corruption`、`backend.format_mismatch`、`backend.invalid_ref`）照常失败——
 用一份旧缓存把事故盖住，比直接报错糟得多。
 
 上次已知 Ref 存在 `<state_dir>/last-known-ref.cbor`（canonical CBOR，临时文件 + rename
@@ -751,7 +751,7 @@ envsync fetch --config "$CFG" --schema-version 1 --json
 |---|---|---|
 | 冲突在哪一层 | 后端 Ref 的 revision | 资源**内容** |
 | 谁能解决 | 机器：重新 `fetch`/`merge`/`plan`/`sync` | **只能由人**裁决 |
-| 错误码 | `cas_conflict` | `sync.conflicted` |
+| 错误码 | `backend.cas_conflict` | `sync.conflicted` |
 | 保证 | 本地一个字节都没被写过 | 本地文件与远端 Ref **都没有被改动** |
 
 ---

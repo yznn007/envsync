@@ -537,8 +537,11 @@ pub struct DeviceRevokeData {
     pub stage: &'static str,
     /// 收到新信封的设备数量。
     pub envelopes: usize,
-    /// 本次重加密的秘密条数。
-    pub rewrapped: usize,
+    /// 仍停留在旧纪元、等待 lazy rewrap 的秘密条数。
+    ///
+    /// 撤销**不**重加密旧对象：它们会在下一次被读到时用新纪元密钥重新密封。这个数字
+    /// 因此是一份进度提示，不是待办事项——这些秘密现在就能正常读写。
+    pub pending_rewrap: usize,
     /// 本次是否在恢复一次先前被中断的轮换。
     pub resumed: bool,
 }
@@ -552,12 +555,12 @@ impl DeviceRevokeData {
         };
         format!(
             "{head}\n  被撤销设备：{revoked}\n  密钥纪元：{from} → {to}\n  新信封：{envelopes} 份\n  \
-             已重加密：{rewrapped} 条\n  轮换阶段：{stage}",
+             待 lazy rewrap：{pending} 条（读取时自动重加密，无需处理）\n  轮换阶段：{stage}",
             revoked = self.revoked,
             from = self.from_epoch,
             to = self.to_epoch,
             envelopes = self.envelopes,
-            rewrapped = self.rewrapped,
+            pending = self.pending_rewrap,
             stage = self.stage,
         )
     }
@@ -582,7 +585,7 @@ pub fn device_revoke(ctx: &VaultContext, device: DeviceId) -> CoreResult<Command
             to_epoch: outcome.to_epoch,
             stage: outcome.stage.as_str(),
             envelopes: outcome.envelopes,
-            rewrapped: outcome.rewrapped,
+            pending_rewrap: outcome.pending_rewrap,
             resumed: outcome.resumed,
         }),
         diagnostics,
@@ -815,10 +818,25 @@ pub struct VaultListData {
     pub key_epoch: u64,
     /// 条目清单（**只有元数据**）。
     pub entries: Vec<VaultEntryData>,
+    /// 头快照上的 Vault 索引指针是否不见了。
+    ///
+    /// 为 `true` 时 `entries` 一定是空的，但那是「读不到」而不是「没有」。见
+    /// [`envsync_core::vault::VaultService::vault_index_missing`]。
+    pub index_missing: bool,
 }
 
 impl VaultListData {
     fn render(&self) -> String {
+        if self.index_missing {
+            return format!(
+                "工作区 {} 的头快照上**没有** Vault 索引指针，但本机确实加入过这个 Vault。\n  \
+                 这不是「Vault 是空的」——是那个指针不见了。密封对象本身是内容寻址的，\
+                 多半仍在后端上。\n  \
+                 请先用 `envsync security checkpoint` 确认信任根，再从另一台仍然正常的设备\
+                 重新发布一次 Vault（任意一条 `vault set` / `vault delete` 都会重建指针）。",
+                self.workspace
+            );
+        }
         if self.entries.is_empty() {
             return format!("工作区 {} 里还没有任何秘密。", self.workspace);
         }
@@ -846,11 +864,32 @@ impl VaultListData {
 }
 
 /// 列出全部秘密的元数据。
+///
+/// # 「空 Vault」与「Vault 不见了」必须区分开
+///
+/// 头快照上的 Vault 索引指针一旦丢失（历史上一次普通 `envsync sync` 就会造成，见
+/// [`envsync_core::vault::WORKSPACE_METADATA_PREFIX`]；后端也可以单独把它拿掉），本命令
+/// 读到的就是一个空索引。安静地返回 `status: ok` + 空清单是最坏的做法：用户会以为自己
+/// 的秘密从来没写进去过。
+///
+/// 因此这里加一条 `blocking` 级诊断 `vault.index_missing`——本机的密钥环或反回滚检查点
+/// 证明这台设备**确实加入过**这个 Vault，那么「一条秘密都没有」就不是一个可信的答案。
 pub fn vault_list(ctx: &VaultContext) -> CoreResult<CommandOutput> {
     let service = ctx.service()?;
     let entries = service.list()?;
-    Ok(CommandOutput::plain(CommandData::VaultList(
-        VaultListData {
+    let index_missing = service.vault_index_missing()?;
+    let mut diagnostics = Vec::new();
+    if index_missing {
+        diagnostics.push(DiagnosticOut::blocking(
+            "vault.index_missing",
+            "当前头快照上没有 Vault 索引指针，但本机确实加入过这个 Vault：这是「读不到」\
+             而不是「里面是空的」。请勿据此认为秘密已丢失——密封对象是内容寻址的，多半\
+             仍在后端上。从另一台正常设备重新发布一次 Vault 即可重建指针。"
+                .to_owned(),
+        ));
+    }
+    Ok(CommandOutput {
+        data: CommandData::VaultList(VaultListData {
             workspace: ctx.config().workspace_id.to_string(),
             key_epoch: service.index().epoch,
             entries: entries
@@ -866,8 +905,10 @@ pub fn vault_list(ctx: &VaultContext) -> CoreResult<CommandOutput> {
                         .collect(),
                 })
                 .collect(),
-        },
-    )))
+            index_missing,
+        }),
+        diagnostics,
+    })
 }
 
 /// `vault delete` 的数据。

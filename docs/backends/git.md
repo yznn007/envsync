@@ -94,7 +94,7 @@ EnvSync 写入的路径全部由已校验的标识拼出来，正常情况下不
 | 总长 ≤ 512 字节 | 超长路径 |
 | 必须指向 `.envsync/` 下的一个文件 | `.envsync` |
 
-违规返回 `BackendError::InvalidPrefix`（错误码 `invalid_prefix`）。
+违规返回 `BackendError::InvalidPrefix`（错误码 `backend.invalid_prefix`）。
 
 ---
 
@@ -452,7 +452,7 @@ Git 后端的每次读写都要联网，因此离线时的行为需要明确：
 
 | 命令 | 离线时 | 说明 |
 |---|---|---|
-| `envsync fetch` | **失败**（`io`，退出码 1） | fetch 是显式的联网动作 |
+| `envsync fetch` | **失败**（`backend.io`，退出码 1） | fetch 是显式的联网动作 |
 | `envsync status` | **失败** | `status` 要读 `get_ref`，即先 fetch |
 | `envsync plan` | **失败** | 计划要绑定后端 revision |
 | `envsync sync` | **失败** | 发布必须联网 |
@@ -565,22 +565,22 @@ envsync status --config "$CFG"
 
 | 现象 | 典型错误码 / 信息 | 原因 | 处理 |
 |---|---|---|---|
-| **认证失败** | `io`，`git fetch（host=git.example.com, branch=envsync）` | agent 里没有可用私钥；helper 没存过凭据；远端要求的凭据类型不受所配方式支持 | `ssh-add -l` 确认 agent；用系统 `git ls-remote <url>` 单独验证；HTTPS 换 `credential-helper` |
+| **认证失败** | `backend.io`，`git fetch（host=git.example.com, branch=envsync）` | agent 里没有可用私钥；helper 没存过凭据；远端要求的凭据类型不受所配方式支持 | `ssh-add -l` 确认 agent；用系统 `git ls-remote <url>` 单独验证；HTTPS 换 `credential-helper` |
 | 配置一保存就报错 | `config.invalid_backend`，「远端 URL 不能包含 userinfo」 | URL 里写了 `user:pass@` 或 `user@`（非 ssh） | 去掉 userinfo，凭据交给 agent / helper |
 | 配置报错且提到查询串 | `config.invalid_backend`，「远端 URL 不能携带查询串」 | URL 带了 `?access_token=…` | 去掉查询串；M2 起用 `token-secret-ref` |
-| 用了 `token-secret-ref` 就连不上 | `unsupported`，「token secret 引用要到 M2 的 Vault 才会被解析」 | 该方式在 M1 尚不可用 | 改用 `ssh-agent` 或 `credential-helper` |
-| **非 fast-forward 被拒** | `cas_conflict`，退出码 **10** | 别的设备在你 fetch 之后先发布了 | 这是**正常**竞争：`envsync fetch` → `envsync merge` → `envsync plan` → `envsync sync`。**本地一个字节都没被写过** |
-| 反复 `cas_conflict` | 同上 | 多台设备在同一秒发布，或某台设备在循环里重试 | 错开发布；检查是否有脚本在无退避地重试 |
-| push 被接受但报 `unsupported` | 「远端接受 push 后把受信分支指向了不含本次提交的历史」 | 远端允许非 fast-forward 更新，或有人 force push 了受信分支 | 在服务端设 `receive.denyNonFastForwards=true`；查谁 force push 了 |
+| 用了 `token-secret-ref` 就连不上 | `backend.unsupported`，「token secret 引用要到 M2 的 Vault 才会被解析」 | 该方式在 M1 尚不可用 | 改用 `ssh-agent` 或 `credential-helper` |
+| **非 fast-forward 被拒** | `backend.cas_conflict`，退出码 **10** | 别的设备在你 fetch 之后先发布了 | 这是**正常**竞争：`envsync fetch` → `envsync merge` → `envsync plan` → `envsync sync`。**本地一个字节都没被写过** |
+| 反复 `backend.cas_conflict` | 同上 | 多台设备在同一秒发布，或某台设备在循环里重试 | 错开发布；检查是否有脚本在无退避地重试 |
+| push 被接受但报 `backend.unsupported` | 「远端接受 push 后把受信分支指向了不含本次提交的历史」 | 远端允许非 fast-forward 更新，或有人 force push 了受信分支 | 在服务端设 `receive.denyNonFastForwards=true`；查谁 force push 了 |
 | push 被接受但分支不存在 | 「远端接受 push 后受信分支却不存在」 | 远端有钩子删除/改写了引用 | 检查服务端钩子；换一个干净的仓库 |
-| 对象 push 一直失败 | `io`，「连续 8 次被并发写入抢先」 | 分支竞争过于激烈 | 稍后重试；减少同时发布的设备数 |
-| **cache 损坏** | `io`，「打开 cache 仓库」/「初始化 cache 仓库」 | cache 目录被外部删了一半、磁盘写满、权限被改 | 直接 `rm -rf <cache_dir>`，再跑一次命令即可（见第 5 节）。cache 不含只存在于本地的事实 |
-| cache 目录权限异常 | `io`，「cache 目录权限」 | Unix 上无法设为 `0700` | 检查文件系统是否支持权限位（例如挂载的 FAT/exFAT）；把 cache 换到本地磁盘 |
-| **format 标记不匹配** | `format_mismatch`，`expected` 是 `envsync-git-format=1\n` | 受信分支上的 `.envsync/format` 内容不同 | 说明这个分支是**别的东西**：可能指向了普通代码分支，或来自未来版本的 EnvSync。**绝不在上面追加提交**——换一个空分支，或升级 EnvSync |
-| format 标记为空 | `format_mismatch`，`found` 是空串 | 分支存在但根本没有 `.envsync/format` | 你把 `branch` 指到了一个普通分支上。改 `branch` |
-| 布局被破坏 | `unsupported`，「EnvSync 路径下出现了非文件对象」 | 有人在 `.envsync/` 下放了目录或 submodule | 检查是谁往受信分支推了东西；受信分支只应由 EnvSync 写 |
-| 对象读出来摘要不符 | `corruption` | 远端对象被改写 | 严重问题：远端不可信。换后端并从备份恢复 |
-| 远端已有同标识不同内容的对象 | `corruption`，「远端已存在同标识但内容不同的对象」 | 内容寻址被破坏（几乎只可能是人为构造） | 同上 |
+| 对象 push 一直失败 | `backend.io`，「连续 8 次被并发写入抢先」 | 分支竞争过于激烈 | 稍后重试；减少同时发布的设备数 |
+| **cache 损坏** | `backend.io`，「打开 cache 仓库」/「初始化 cache 仓库」 | cache 目录被外部删了一半、磁盘写满、权限被改 | 直接 `rm -rf <cache_dir>`，再跑一次命令即可（见第 5 节）。cache 不含只存在于本地的事实 |
+| cache 目录权限异常 | `backend.io`，「cache 目录权限」 | Unix 上无法设为 `0700` | 检查文件系统是否支持权限位（例如挂载的 FAT/exFAT）；把 cache 换到本地磁盘 |
+| **format 标记不匹配** | `backend.format_mismatch`，`expected` 是 `envsync-git-format=1\n` | 受信分支上的 `.envsync/format` 内容不同 | 说明这个分支是**别的东西**：可能指向了普通代码分支，或来自未来版本的 EnvSync。**绝不在上面追加提交**——换一个空分支，或升级 EnvSync |
+| format 标记为空 | `backend.format_mismatch`，`found` 是空串 | 分支存在但根本没有 `.envsync/format` | 你把 `branch` 指到了一个普通分支上。改 `branch` |
+| 布局被破坏 | `backend.unsupported`，「EnvSync 路径下出现了非文件对象」 | 有人在 `.envsync/` 下放了目录或 submodule | 检查是谁往受信分支推了东西；受信分支只应由 EnvSync 写 |
+| 对象读出来摘要不符 | `backend.corruption` | 远端对象被改写 | 严重问题：远端不可信。换后端并从备份恢复 |
+| 远端已有同标识不同内容的对象 | `backend.corruption`，「远端已存在同标识但内容不同的对象」 | 内容寻址被破坏（几乎只可能是人为构造） | 同上 |
 
 排查时的通用第一步：
 

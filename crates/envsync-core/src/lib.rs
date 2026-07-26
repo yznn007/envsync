@@ -16,6 +16,7 @@
 //! | [`planner`] | 由配置 + 目标状态 + 观察结果生成不可变计划 |
 //! | [`apply`] | 事务化应用引擎（preflight → publish → apply → verify → journal） |
 //! | [`membership`] | 设备成员签名链的纯函数验证器与编排 API（M2） |
+//! | [`attestation`] | Vault 索引背书的签发与校验（M2） |
 //! | [`checkpoint`] | 反回滚检查点：单调性判定与信任根（M2） |
 //! | [`vault`] | Vault application service：端到端加密的秘密存取（M2） |
 //! | [`device_admin`] | 设备身份、邀请、加入、清单与工作区恢复（M2） |
@@ -37,6 +38,7 @@
 //! 这一竞态可以被摘要比对完整捕获，而不需要在写入路径上再放一份业务逻辑。
 
 pub mod apply;
+pub mod attestation;
 pub mod checkpoint;
 pub mod config;
 pub mod device_admin;
@@ -56,6 +58,10 @@ pub mod sync;
 pub mod vault;
 
 pub use apply::{ApplyEngine, ApplyOutcome};
+pub use attestation::{
+    sign_index_attestation, verify_index_attestation, AttestationError, ATTESTATION_ALGORITHM,
+    ATTESTATION_ALGORITHM_NONE, VAULT_ATTESTATION_DOMAIN,
+};
 pub use checkpoint::{
     advance as advance_checkpoint, check_advance, Checkpoint, CheckpointError, CheckpointStore,
     InMemoryCheckpointStore, SecureCheckpointStore, SqliteCheckpointStore,
@@ -101,6 +107,8 @@ pub use service::{
 };
 pub use sync::{ConflictDetail, FetchOutcome, MergeContext, MergeKind, MergeOutcome};
 pub use vault::{
-    HiddenPrompt, KeyRing, SecretInput, SecretMetadata, SecretRef, VaultDeps, VaultError,
-    VaultIndex, VaultService, VAULT_INDEX_METADATA_KEY,
+    inherited_workspace_metadata, inspect_vault_head, is_workspace_metadata_key, HiddenPrompt,
+    KeyRing, SecretInput, SecretMetadata, SecretRef, VaultDeps, VaultError, VaultHead, VaultIndex,
+    VaultService, VAULT_ATTESTATION_METADATA_KEY, VAULT_INDEX_METADATA_KEY,
+    WORKSPACE_METADATA_PREFIX,
 };

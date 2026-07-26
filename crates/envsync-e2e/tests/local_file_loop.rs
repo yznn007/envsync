@@ -571,7 +571,7 @@ fn cas_race_loser_exits_10_with_zero_local_changes() {
         (&second_run, &first_run, &first_before, &first)
     };
 
-    loser.expect_diagnostic("cas_conflict");
+    loser.expect_diagnostic("backend.cas_conflict");
     assert_eq!(
         loser.json()["status"],
         "error",
