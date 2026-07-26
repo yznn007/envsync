@@ -186,6 +186,29 @@ pub enum PlatformError {
 }
 
 impl PlatformError {
+    /// 稳定的机器可读错误码，用于 CLI 的 JSON 契约与退出码判定。
+    ///
+    /// 这些字符串属于对外契约的一部分，只能新增、不能重命名。
+    pub fn code(&self) -> &'static str {
+        match self {
+            PlatformError::UnknownRoot { .. } => "platform.unknown_root",
+            PlatformError::RootUnavailable { .. } => "platform.root_unavailable",
+            PlatformError::RootNotDirectory { .. } => "platform.root_not_directory",
+            PlatformError::InvalidTarget { .. } => "platform.invalid_target",
+            PlatformError::SymlinkRejected { .. } => "platform.symlink_rejected",
+            PlatformError::NotADirectory { .. } => "platform.not_a_directory",
+            PlatformError::NotAFile { .. } => "platform.not_a_file",
+            PlatformError::TooLarge { .. } => "platform.too_large",
+            PlatformError::Io { .. } => "platform.io",
+            PlatformError::StaleObservation { .. } => "platform.stale_observation",
+            PlatformError::VerificationFailed { .. } => "platform.verification_failed",
+            PlatformError::RollbackRefused { .. } => "platform.rollback_refused",
+            PlatformError::FaultInjected { .. } => "platform.fault_injected",
+        }
+    }
+}
+
+impl PlatformError {
     /// 由 [`std::io::Error`] 构造，只保留不泄露路径的信息。
     ///
     /// 故意**不**使用 `io::Error` 的 `Display`：某些来源会把路径拼进消息里。

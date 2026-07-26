@@ -63,6 +63,22 @@ pub enum DraftError {
     Corrupt(String),
 }
 
+impl DraftError {
+    /// 稳定的机器可读错误码，用于 CLI 的 JSON 契约与退出码判定。
+    ///
+    /// 这些字符串属于对外契约的一部分，只能新增、不能重命名。
+    pub fn code(&self) -> &'static str {
+        match self {
+            DraftError::Sqlite { .. } => "draft.sqlite",
+            DraftError::Storage { .. } => "draft.storage",
+            DraftError::Cbor { .. } => "draft.cbor",
+            DraftError::DigestMismatch { .. } => "draft.digest_mismatch",
+            DraftError::Corruption { .. } => "draft.corruption",
+            DraftError::Corrupt { .. } => "draft.corrupt",
+        }
+    }
+}
+
 /// 本地草稿对象存储。
 ///
 /// 与 [`crate::journal::Journal`] 共用同一套 schema，因此可以指向同一个数据库文件；

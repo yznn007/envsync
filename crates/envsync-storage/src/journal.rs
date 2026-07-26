@@ -117,6 +117,29 @@ pub enum JournalError {
     Corrupt(String),
 }
 
+impl JournalError {
+    /// 稳定的机器可读错误码，用于 CLI 的 JSON 契约与退出码判定。
+    ///
+    /// 这些字符串属于对外契约的一部分，只能新增、不能重命名。
+    pub fn code(&self) -> &'static str {
+        match self {
+            JournalError::Sqlite { .. } => "storage.sqlite",
+            JournalError::Io { .. } => "storage.io",
+            JournalError::Json { .. } => "storage.json",
+            JournalError::SchemaTooNew { .. } => "storage.schema_too_new",
+            JournalError::PragmaRejected { .. } => "storage.pragma_rejected",
+            JournalError::IllegalTransition { .. } => "storage.illegal_transition",
+            JournalError::UnknownOperation { .. } => "storage.unknown_operation",
+            JournalError::UnknownAction { .. } => "storage.unknown_action",
+            JournalError::DuplicateAction { .. } => "storage.duplicate_action",
+            JournalError::ReceiptResourceMismatch { .. } => "storage.receipt_resource_mismatch",
+            JournalError::ConcurrentModification { .. } => "storage.concurrent_modification",
+            JournalError::RevisionOutOfRange { .. } => "storage.revision_out_of_range",
+            JournalError::Corrupt { .. } => "storage.corrupt",
+        }
+    }
+}
+
 /// 操作状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -207,7 +230,20 @@ impl OperationState {
                 | (Verified, Completed)
                 | (Planned | Preflighted, Aborted)
                 | (Applying | PublishedNotConverged, RollingBack)
+                // 显式回滚一个已完成的操作：CLI 的 `envsync rollback --operation <id>`
+                // 走这条边。计划文档的状态机只考虑了失败路径上的回滚，但「反悔一次
+                // 成功的同步」同样必须留下完整审计记录，而不是绕过日志直接改文件。
+                | (Completed, RollingBack)
                 | (RollingBack, RolledBack)
+                // 恢复流程重新收敛：从「已发布未收敛」回到逐动作应用。
+                | (PublishedNotConverged, Applying)
+                // 应用途中发现人工冲突（目标既不等于原摘要也不等于应用后摘要）时，
+                // 停在 published_not_converged 等待人工处理。
+                | (Applying, PublishedNotConverged)
+                // 回滚本身失败时，操作必须停在 published_not_converged：后端已经
+                // 声称该快照是当前头，而本地既没收敛也没回滚干净，只能等恢复流程
+                // 或人工处理。绝不允许降级成普通失败终态。
+                | (RollingBack, PublishedNotConverged)
         )
     }
 
