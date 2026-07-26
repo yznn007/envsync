@@ -581,12 +581,17 @@ name = "envsync-e2e"
 version = "0.1.0"
 dependencies = [
  "envsync-backend",
+ "envsync-cli",
  "envsync-core",
+ "envsync-crypto",
  "envsync-domain",
+ "envsync-platform",
  "envsync-storage",
  "git2",
  "serde_json",
  "tempfile",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -602,6 +607,18 @@ dependencies = [
  "tracing",
  "uuid",
  "zeroize",
+]
+
+[[package]]
+name = "envsync-policy"
+version = "0.1.0"
+dependencies = [
+ "envsync-domain",
+ "proptest",
+ "serde",
+ "serde_yaml_ng",
+ "thiserror",
+ "tracing",
 ]
 
 [[package]]
