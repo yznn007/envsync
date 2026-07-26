@@ -637,6 +637,53 @@ macro_rules! cbor_struct {
     };
 }
 
+/// 与 [`cbor_struct!`] 相同，但强制第一个字段是格式版本，并在解码时校验它。
+///
+/// 设计文档 §3.3 要求「未知格式版本必须拒绝，不能静默降级」。手写 `from_value` 的
+/// 类型各自实现了这条检查，而用 `cbor_struct!` 生成的类型不会——这个宏就是为了让
+/// 「带版本号的对象」不可能忘记检查：版本常量是宏的必填参数。
+#[macro_export]
+macro_rules! cbor_struct_versioned {
+    ($name:ty, $version:expr, { $version_field:ident, $($field:ident : $ty:ty),+ $(,)? }) => {
+        impl $crate::cbor::CborCodec for $name {
+            fn to_value(&self) -> $crate::cbor::Value {
+                $crate::cbor::Value::Array(vec![
+                    $crate::cbor::Value::Uint(self.$version_field as u64),
+                    $( $crate::cbor::CborCodec::to_value(&self.$field) ),+
+                ])
+            }
+
+            fn from_value(
+                value: &$crate::cbor::Value,
+            ) -> ::core::result::Result<Self, $crate::cbor::CborError> {
+                let items = value.as_array()?;
+                let mut iter = items.iter();
+                let raw_version = iter.next().ok_or($crate::cbor::CborError::ArityMismatch)?;
+                let found = <u32 as $crate::cbor::CborCodec>::from_value(raw_version)?;
+                if found != $version {
+                    return ::core::result::Result::Err(
+                        $crate::cbor::CborError::UnsupportedFormatVersion {
+                            found,
+                            supported: $version,
+                        },
+                    );
+                }
+                let decoded = Self {
+                    $version_field: found,
+                    $( $field: {
+                        let item = iter.next().ok_or($crate::cbor::CborError::ArityMismatch)?;
+                        <$ty as $crate::cbor::CborCodec>::from_value(item)?
+                    } ),+
+                };
+                if iter.next().is_some() {
+                    return ::core::result::Result::Err($crate::cbor::CborError::ArityMismatch);
+                }
+                ::core::result::Result::Ok(decoded)
+            }
+        }
+    };
+}
+
 /// 为“仅含无载荷变体”的枚举生成 [`CborCodec`] 实现，编码为稳定的文本判别式。
 #[macro_export]
 macro_rules! cbor_unit_enum {

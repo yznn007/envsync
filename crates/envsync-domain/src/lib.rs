@@ -80,7 +80,7 @@ pub use resource::{
 };
 pub use snapshot::{
     SnapshotBody, SnapshotError, SnapshotSignature, WorkspaceRef, REF_FORMAT_VERSION,
-    SNAPSHOT_FORMAT_VERSION,
+    SIGNATURE_FORMAT_VERSION, SNAPSHOT_FORMAT_VERSION,
 };
 
 /// 返回当前 Unix 毫秒时间戳。

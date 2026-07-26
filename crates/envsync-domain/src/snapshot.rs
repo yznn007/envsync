@@ -10,13 +10,17 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::cbor::{CborCodec, CborError, Value};
-use crate::cbor_struct;
 use crate::id::{DeviceId, SnapshotId, StateRootId, WorkspaceId};
 
 /// 快照主体的当前格式版本。
 pub const SNAPSHOT_FORMAT_VERSION: u32 = 1;
 /// 工作区引用的当前格式版本。
 pub const REF_FORMAT_VERSION: u32 = 1;
+/// 快照签名对象的当前格式版本。
+///
+/// 刻意与 [`SNAPSHOT_FORMAT_VERSION`] 分开：签名是独立对象，M2 给它加字段时不应该
+/// 被迫提升快照版本——那会让所有已发布快照的标识失效。
+pub const SIGNATURE_FORMAT_VERSION: u32 = 1;
 /// 单个快照允许的父快照数量上限。
 pub const MAX_PARENTS: usize = 8;
 /// 快照元数据的键值数量上限。
@@ -178,8 +182,8 @@ pub struct SnapshotSignature {
     pub signature: Vec<u8>,
 }
 
-cbor_struct!(SnapshotSignature {
-    format_version: u32,
+crate::cbor_struct_versioned!(SnapshotSignature, SIGNATURE_FORMAT_VERSION, {
+    format_version,
     snapshot: SnapshotId,
     device: DeviceId,
     algorithm: String,
@@ -190,7 +194,7 @@ impl SnapshotSignature {
     /// 构造 M0 使用的“未签名”占位对象。
     pub fn unsigned(snapshot: SnapshotId, device: DeviceId) -> Self {
         SnapshotSignature {
-            format_version: SNAPSHOT_FORMAT_VERSION,
+            format_version: SIGNATURE_FORMAT_VERSION,
             snapshot,
             device,
             algorithm: "none".to_owned(),
@@ -455,6 +459,30 @@ mod tests {
         assert_eq!(
             headless.validate(),
             Err(SnapshotError::NonInitialRevisionWithoutHead(3))
+        );
+    }
+
+    #[test]
+    fn snapshot_signature_has_its_own_version_and_rejects_unknown_ones() {
+        let signature =
+            SnapshotSignature::unsigned(SnapshotId::of(b"head"), DeviceId::derive(b"device"));
+        assert_eq!(signature.format_version, SIGNATURE_FORMAT_VERSION);
+        let bytes = signature.to_canonical_vec();
+        assert_eq!(
+            SnapshotSignature::from_canonical_slice(&bytes).unwrap(),
+            signature
+        );
+
+        let mut value = signature.to_value();
+        if let Value::Array(items) = &mut value {
+            items[0] = Value::Uint(5);
+        }
+        assert_eq!(
+            SnapshotSignature::from_canonical_slice(&crate::cbor::encode(&value)),
+            Err(CborError::UnsupportedFormatVersion {
+                found: 5,
+                supported: 1
+            })
         );
     }
 

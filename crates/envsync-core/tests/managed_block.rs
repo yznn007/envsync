@@ -871,6 +871,10 @@ proptest! {
             new_body.push('\n');
         }
 
+        // 只有块内内容真正变化时才必然产生写入；两者相等时 `render` 按设计返回
+        // `Unchanged`，那属于另一条已有用例（幂等性）覆盖的路径。
+        prop_assume!(old_body != new_body);
+
         let existing = format!("{head}{}{suffix}", block(MAIN, &old_body));
         let out = render_written(&input(
             &resource,

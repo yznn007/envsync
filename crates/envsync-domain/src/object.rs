@@ -10,7 +10,6 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 use crate::cbor::{CborCodec, CborError, Value};
-use crate::cbor_struct;
 use crate::id::{BlobId, ConflictId, Digest32, IdError, ResourceId, SnapshotId, StateRootId};
 use crate::resource::{ResourceEntry, ResourceEntryError};
 
@@ -401,8 +400,11 @@ pub struct Conflict {
     pub diagnostics: Vec<String>,
 }
 
-cbor_struct!(Conflict {
-    format_version: u32,
+/// 冲突对象的当前格式版本。
+pub const CONFLICT_FORMAT_VERSION: u32 = 1;
+
+crate::cbor_struct_versioned!(Conflict, CONFLICT_FORMAT_VERSION, {
+    format_version,
     resource: ResourceId,
     kind: ConflictKind,
     base: Option<BlobId>,
@@ -410,9 +412,6 @@ cbor_struct!(Conflict {
     theirs: Option<BlobId>,
     diagnostics: Vec<String>,
 });
-
-/// 冲突对象的当前格式版本。
-pub const CONFLICT_FORMAT_VERSION: u32 = 1;
 
 impl Conflict {
     /// 内容标识。
@@ -539,6 +538,32 @@ mod tests {
         assert_eq!(
             ObjectId::from(BlobId::of(bytes)),
             ObjectId::for_bytes(ObjectKind::Blob, bytes)
+        );
+    }
+
+    #[test]
+    fn conflict_rejects_unknown_format_version() {
+        // 回归测试：Conflict 曾用不做版本校验的 `cbor_struct!` 生成解码逻辑，
+        // 未知版本会被静默接受，违反设计文档 §3.3。
+        let conflict = Conflict {
+            format_version: CONFLICT_FORMAT_VERSION,
+            resource: ResourceId::parse("git/config").unwrap(),
+            kind: ConflictKind::TextOverlap,
+            base: None,
+            ours: None,
+            theirs: None,
+            diagnostics: vec![],
+        };
+        let mut value = conflict.to_value();
+        if let Value::Array(items) = &mut value {
+            items[0] = Value::Uint(2);
+        }
+        assert_eq!(
+            Conflict::from_canonical_slice(&crate::cbor::encode(&value)),
+            Err(CborError::UnsupportedFormatVersion {
+                found: 2,
+                supported: 1
+            })
         );
     }
 

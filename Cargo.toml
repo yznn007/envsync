@@ -7,6 +7,8 @@ members = [
     "crates/envsync-storage",
     "crates/envsync-core",
     "crates/envsync-cli",
+    # 端到端验收套件：只依赖真实 CLI 二进制，不被其他 crate 依赖。
+    "crates/envsync-e2e",
 ]
 
 [workspace.package]
