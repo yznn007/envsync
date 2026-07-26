@@ -1,0 +1,18 @@
+[package]
+name = "envsync-platform"
+description = "EnvSync 平台层：能力约束的文件读写"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+envsync-domain.workspace = true
+cap-std.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

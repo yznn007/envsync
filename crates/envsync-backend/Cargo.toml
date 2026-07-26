@@ -1,0 +1,17 @@
+[package]
+name = "envsync-backend"
+description = "EnvSync 后端抽象与实现"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+envsync-domain.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

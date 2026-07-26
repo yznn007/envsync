@@ -1,0 +1,132 @@
+# EnvSync 工作区配置示例
+#
+# 这份文件被 `crates/envsync-core/tests/config.rs` 用 `include_str!` 读入并真实解析，
+# 因此它**永远不会过期**：字段一旦改名或语义变化，测试立刻失败。
+#
+# 三条阅读须知：
+#
+# 1. 所有路径都是占位符（`/home/YOUR_USER`、`/srv/YOUR_BACKEND`），请替换成你自己的
+#    真实路径。示例里绝不写入任何真实用户名、主机名或密钥。
+# 2. 相对路径一律相对**本配置文件所在目录**解析，与你在哪个目录执行命令无关。
+# 3. 未知字段会被直接拒绝（不是忽略）。写错字段名会报错，而不是让你以为策略生效了。
+
+# 配置版本。当前只支持 1；写别的值会报错，不会被静默按旧版语义解释。
+version: 1
+
+# 工作区标识，UUID。由 `envsync init` 生成，之后不要手改：它参与快照与引用的绑定。
+workspace_id: "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+
+# 本设备信息。
+device:
+  # 设备显示名，只用于诊断输出，可以随便改。
+  name: "workstation"
+  # 设备种子：64 个小写十六进制字符（32 字节），用于派生 DeviceId（见 ADR-0002）。
+  # 这是本机私有材料，绝不会被上传到后端；换机器请重新生成，不要复制粘贴。
+  # 下面这一串只是示例占位值，请勿在真实环境使用。
+  seed_hex: "3a7f1c92b4de5068a1cf23947db6e50f8c41a2937be05d6c1f83a4b72e90cd15"
+
+# 同步后端。M0 只支持本地目录（内容寻址对象库 + 引用文件）。
+backend:
+  kind: local
+  # 后端根目录。可以是任何你能读写的目录，包括挂载的网盘目录。
+  path: "/srv/YOUR_BACKEND/envsync"
+
+# 本地状态目录：journal 数据库、草稿库、备份都放在这里。
+# 可省略，默认就是本配置文件同目录下的 `.envsync`。
+# 具体布局：<state_dir>/journal.db、<state_dir>/draft/、<state_dir>/backups/
+state_dir: ".envsync"
+
+# 授权根：EnvSync 被允许触碰的目录白名单。
+# 任何资源都必须落在某个授权根内部；写入时逐段做 no-follow 检查，符号链接穿越会被拒绝。
+# 至少要声明一个根；根路径必须是绝对路径。
+roots:
+  home: "/home/YOUR_USER"
+  # 可以声明多个根，例如把 XDG 配置目录单独授权，方便按目录收紧范围：
+  # xdg_config: "/home/YOUR_USER/.config"
+
+# 被管理的资源列表。允许为空（空工作区是合法配置），之后再逐个添加。
+resources:
+  # ---- 示例一：整文件管理 ----------------------------------------------------
+  # full_file 表示这个文件完全由 EnvSync 拥有：内容以快照为准，本地手改会被视为漂移。
+  # 适合“纯粹从仓库分发”的配置，例如 git 的全局配置。
+  - id: git/config/global
+    root: home
+    target: .config/git/config
+    mode: full_file
+    disposition: managed
+
+  # ---- 示例二：托管区块 + 完整策略 -------------------------------------------
+  # managed_block 只管理文件里带稳定标识的区块，块外内容仍然属于你。
+  # 适合 .zshrc 这种“既有个人内容、又想同步一部分”的文件。
+  - id: shell/zsh/main
+    root: home
+    target: .zshrc
+    mode: managed_block
+    disposition: managed
+    # 托管区块的注释前缀。可省略，默认是 "# "。
+    # 对 Lua（`-- `）、Vimscript（`" `）等注释语法不同的文件必须显式指定。
+    comment_prefix: "# "
+    # policy 整块可省略，块内每个字段也可以单独省略，省略时用下面注明的默认值。
+    policy:
+      # 单文件字节上限，超过报错而不是截断。默认 16 MiB。
+      max_bytes: 16777216
+      # 换行风格：preserve（沿用目标文件现状）| lf | crlf。默认 preserve。
+      line_ending: preserve
+      # POSIX 权限位。可省略，省略时沿用现有文件或平台默认。
+      # 建议写成带引号的八进制字符串 "0644"；写十进制整数 420 是等价的。
+      # 注意：YAML 里不加引号的 0644 会被当成十进制 644，不是你想要的权限位。
+      unix_mode: "0644"
+      # 是否是秘密资源。true 时禁止退化到可能暴露明文的写入路径。默认 false。
+      secret: false
+
+  # ---- 示例三：显式删除 ------------------------------------------------------
+  # disposition 有三种取值：
+  #   managed       —— 收敛到快照内容；
+  #   ensure_absent —— 显式删除（tombstone）。只有这一种能产生删除动作；
+  #                    “文件读不出来”“平台不支持”永远不会被推断成删除意图；
+  #   unmanaged     —— 不归 EnvSync 管理，仅记录存在性。
+  # - id: shell/bash/legacy
+  #   root: home
+  #   target: .bashrc.old
+  #   mode: full_file
+  #   disposition: ensure_absent
+
+# ---- 高级用法（M1 起可用，M0 会直接报错） -----------------------------------
+#
+# structured_merge：对结构化配置做语义合并，而不是整文件覆盖。
+# 使用时必须同时声明 policy.structured_format（json | yaml | toml | ini | git_config），
+# 否则报 config.structured_without_format。M0 阶段即使写全也会报 config.mode_not_supported。
+#
+# - id: editor/vscode/settings
+#   root: home
+#   target: .config/Code/User/settings.json
+#   mode: structured_merge
+#   disposition: managed
+#   policy:
+#     structured_format: json
+#
+# generated_include：生成一个独立文件，再向主配置注入一条 include/source 指令。
+# 同样是 M1 起才启用。
+#
+# - id: shell/zsh/generated
+#   root: home
+#   target: .config/envsync/zsh.zsh
+#   mode: generated_include
+#   disposition: managed
+#
+# ---- target 的书写规则 -------------------------------------------------------
+#
+# target 是相对授权根的路径，用 `/` 分隔。以下写法一律被拒绝（config.invalid_target）：
+#
+#   /etc/passwd        绝对路径
+#   ../../etc/passwd   包含 `..`
+#   ./.zshrc           包含 `.`
+#   a//b               空段
+#   C:/Users/x         盘符（冒号在 NTFS 上还是备用数据流分隔符）
+#   //server/share     UNC 前缀
+#   a\b                反斜杠
+#   NUL.txt            Windows 保留设备名
+#   "file "            以空格或点结尾的段
+#
+# 这些限制在所有平台上一致生效，这样同一份配置在 Linux、macOS、Windows 上表达的意图
+# 完全相同。

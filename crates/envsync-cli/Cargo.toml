@@ -1,0 +1,27 @@
+[package]
+name = "envsync-cli"
+description = "EnvSync 命令行界面"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "envsync"
+path = "src/main.rs"
+
+[dependencies]
+envsync-core.workspace = true
+envsync-domain.workspace = true
+envsync-backend.workspace = true
+envsync-storage.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

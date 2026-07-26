@@ -1,0 +1,21 @@
+[package]
+name = "envsync-e2e"
+description = "EnvSync M0 端到端验收套件（只在工作区内使用，不发布）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+envsync-core.workspace = true
+envsync-domain.workspace = true
+envsync-storage.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+
+[[test]]
+name = "local_file_loop"
+path = "tests/local_file_loop.rs"
