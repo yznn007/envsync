@@ -9,3 +9,9 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+envsync-domain.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
