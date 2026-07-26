@@ -357,11 +357,36 @@ impl Plan {
         }
     }
 
-    /// 参与计划标识计算的绑定内容。
+    /// 编码除 `created_at_unix_ms` 之外的全部字段。
     ///
-    /// 刻意排除 `created_at_unix_ms`：否则同样的输入在不同时刻会得到不同的计划标识，
-    /// “重新计划并比较标识”这一新鲜度检查将永远失败。
+    /// `Plan` 序列化为 `[binding, created_at]` 两元数组，这样「ID 覆盖什么」在编码
+    /// 结构上一目了然，而不依赖注释约定。
     fn binding_value(&self) -> Value {
+        self.encode_binding(&self.observations)
+    }
+
+    /// 计划标识的原像。
+    ///
+    /// 与 [`Plan::binding_value`] 的唯一区别是**观察时刻被归零**：
+    /// `Observation::observed_at_unix_ms` 只是诊断信息，每次重新观察都会变。若让它
+    /// 进入原像，「重新计划并比较标识」这一新鲜度检查将永远失败，命令面完全不可用
+    /// （见 ADR-0003，对 `created_at_unix_ms` 是同样的道理）。
+    ///
+    /// 被绑定的是观察的**内容**（资源与状态，含内容摘要），而不是观察发生的时刻。
+    fn id_preimage(&self) -> Value {
+        let normalised: Vec<Observation> = self
+            .observations
+            .iter()
+            .map(|observation| Observation {
+                resource: observation.resource.clone(),
+                state: observation.state.clone(),
+                observed_at_unix_ms: 0,
+            })
+            .collect();
+        self.encode_binding(&normalised)
+    }
+
+    fn encode_binding(&self, observations: &[Observation]) -> Value {
         Value::Array(vec![
             Value::Uint(self.format_version as u64),
             self.workspace.to_value(),
@@ -369,7 +394,7 @@ impl Plan {
             self.target_snapshot.to_value(),
             Value::Uint(self.base_revision),
             self.next_ref.to_value(),
-            self.observations.to_value(),
+            Value::Array(observations.iter().map(CborCodec::to_value).collect()),
             self.actions.to_value(),
             self.diagnostics.to_value(),
         ])
@@ -377,7 +402,7 @@ impl Plan {
 
     /// 计划标识。
     pub fn id(&self) -> PlanId {
-        PlanId::of(&cbor::encode(&self.binding_value()))
+        PlanId::of(&cbor::encode(&self.id_preimage()))
     }
 
     /// 是否存在阻塞诊断。
@@ -531,6 +556,34 @@ mod tests {
         early.created_at_unix_ms = 1;
         late.created_at_unix_ms = 999_999;
         assert_eq!(early.id(), late.id(), "创建时间不应影响计划标识");
+    }
+
+    #[test]
+    fn plan_id_ignores_observation_timestamps() {
+        // 回归测试：观察时刻曾经进入 Plan ID 原像，导致两次重新计划只要不在同一
+        // 毫秒就得到不同标识，`sync` 的新鲜度检查 100% 判定为 stale，命令面不可用。
+        let mut early = plan_with(
+            vec![action("a/one", ActionKind::CreateFile)],
+            vec![observation("a/one")],
+        );
+        let mut late = early.clone();
+        early.observations[0].observed_at_unix_ms = 1;
+        late.observations[0].observed_at_unix_ms = 9_999_999;
+        assert_eq!(early.id(), late.id(), "观察时刻不应影响计划标识");
+
+        // 但观察的**内容**变化仍然必须改变标识。
+        let mut changed = early.clone();
+        changed.observations[0].state = ObservedState::Present(PresentFile {
+            content_digest: Digest32::domain_hash("t", b"drift"),
+            size: 5,
+            mtime_unix_ms: None,
+            permissions: PermissionSummary {
+                readonly: false,
+                unix_mode: None,
+            },
+            managed_digest: None,
+        });
+        assert_ne!(early.id(), changed.id(), "观察内容变化必须改变计划标识");
     }
 
     #[test]

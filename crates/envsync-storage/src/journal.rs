@@ -1108,12 +1108,30 @@ mod tests {
     }
 
     #[test]
-    fn terminal_states_have_no_successors() {
+    fn terminal_states_have_only_the_documented_exception() {
+        // 终态原则上没有后继。唯一的例外是「显式回滚一次已成功的同步」：
+        // `Completed -> RollingBack`。这条边是业务需求（CLI 的 `envsync rollback`），
+        // 而不是失败路径；它不影响 `list_unfinished` 的语义，因为 `Completed`
+        // 仍然是终态，不会被恢复流程当作未完成操作捡起来。
         for state in OperationState::ALL {
-            if state.is_terminal() {
-                assert!(state.successors().is_empty(), "{state} 不应有后继状态");
+            if !state.is_terminal() {
+                continue;
+            }
+            let successors = state.successors();
+            if state == OperationState::Completed {
+                assert_eq!(
+                    successors,
+                    vec![OperationState::RollingBack],
+                    "Completed 只允许通向显式回滚"
+                );
+            } else {
+                assert!(successors.is_empty(), "{state} 不应有后继状态");
             }
         }
+        // 终态集合本身不变：恢复流程绝不会把它们当作未完成操作。
+        assert!(OperationState::Completed.is_terminal());
+        assert!(OperationState::Aborted.is_terminal());
+        assert!(OperationState::RolledBack.is_terminal());
     }
 
     #[test]

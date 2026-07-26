@@ -337,10 +337,12 @@ impl<'a> RecoveryEngine<'a> {
                         operation,
                         &ErrorDetail::new("recovery.manual_required", &detail),
                     )?;
-                    if before != OperationState::PublishedNotConverged {
-                        self.journal
-                            .transition(operation, OperationState::PublishedNotConverged)?;
-                    }
+                    // 走到这里时操作**一定**处于 `applying`：函数开头已经把非 applying
+                    // 的入口状态推进过去了。因此这次迁移必须无条件执行，不能用入口状态
+                    // 做判据——否则从 `published_not_converged` 再次恢复时会停在
+                    // `applying`，与返回的报告自相矛盾，恢复也就不再幂等。
+                    self.journal
+                        .transition(operation, OperationState::PublishedNotConverged)?;
                     notes.push(detail);
                     return Ok(RecoveryReport {
                         operation,
