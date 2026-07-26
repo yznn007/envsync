@@ -1,0 +1,19 @@
+[package]
+name = "envsync-policy"
+description = "EnvSync 可解释安全策略引擎：封闭规则 AST、deny-first 求值与可审计解释"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+envsync-domain.workspace = true
+serde.workspace = true
+serde_yaml_ng.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

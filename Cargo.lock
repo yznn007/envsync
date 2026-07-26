@@ -610,6 +610,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "envsync-policy"
+version = "0.1.0"
+dependencies = [
+ "envsync-domain",
+ "proptest",
+ "serde",
+ "serde_yaml_ng",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "envsync-storage"
 version = "0.1.0"
 dependencies = [

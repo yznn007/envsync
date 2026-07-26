@@ -14,6 +14,7 @@
 //! | [`reader`] | 能力约束读取，产出 [`envsync_domain::Observation`] |
 //! | [`writer`] | 安全写入、备份、删除与回滚收据 |
 //! | [`secure_store`] | 系统凭据库（Keychain / Credential Manager / Secret Service） |
+//! | [`command`] | 能力约束的外部命令执行：模板白名单、超时、输出上限与脱敏 |
 //!
 //! ## 三条硬约束
 //!
@@ -55,6 +56,7 @@ use std::io;
 use envsync_domain::Digest32;
 
 pub mod capability;
+pub mod command;
 pub mod reader;
 pub mod secure_store;
 pub mod writer;
@@ -62,6 +64,11 @@ pub mod writer;
 pub use capability::{
     AuthorizedRoot, MissingDirs, RelativeTarget, ResolvedPath, RootRegistry, TargetError,
     DEFAULT_DIR_MODE, SECRET_DIR_MODE,
+};
+pub use command::{
+    ArgPattern, CommandOutcome, CommandReceipt, CommandRunner, CommandSpec, CommandTemplate,
+    CwdPolicy, OutputSummary, SecretEnvValue, ValueClass, DEFAULT_TIMEOUT, MAX_OUTPUT_LIMIT,
+    MAX_TIMEOUT, RECEIPT_HEAD_LINES, RECEIPT_TAIL_LINES, REDACTED_PLACEHOLDER,
 };
 pub use reader::{FileReader, ReadOutcome, FILE_CONTENT_DOMAIN};
 /// 内存安全存储替身。**只在 `test-support` feature 打开时存在**，生产构建里没有这个符号。
@@ -242,6 +249,78 @@ pub enum PlatformError {
         /// 拒绝原因。恒为 `&'static str`，绝不含 value 本身。
         reason: &'static str,
     },
+
+    /// 引用了没有注册过的命令模板。
+    #[error("未注册的命令模板 `{template_id}`")]
+    CommandTemplateUnknown {
+        /// 被引用的模板标识。
+        template_id: String,
+    },
+
+    /// 用同一个标识注册了两个命令模板。
+    #[error("命令模板 `{template_id}` 已经注册过")]
+    CommandTemplateDuplicate {
+        /// 冲突的模板标识。
+        template_id: &'static str,
+    },
+
+    /// 可执行文件不满足「绝对路径 + 与模板一致 + 真的可执行」。
+    #[error("拒绝执行：{reason}")]
+    CommandExecutableRejected {
+        /// 拒绝原因。恒为 `&'static str`，因此不含任何路径。
+        reason: &'static str,
+    },
+
+    /// 试图直接执行 shell 或解释器。
+    ///
+    /// EnvSync 只用 `Command::new(exe).args(argv)`，永远不把命令拼成字符串交给
+    /// `sh -c`；允许注册 shell 等于把参数模板的全部保证作废。
+    #[error("拒绝执行 shell 或解释器 `{name}`")]
+    CommandShellRejected {
+        /// 被拒绝的可执行文件名（不含目录）。
+        name: String,
+    },
+
+    /// 参数与模板不符。
+    #[error("第 {index} 个参数被拒绝：{reason}")]
+    CommandArgRejected {
+        /// 出问题的参数下标（从 0 开始）。
+        index: usize,
+        /// 拒绝原因。恒为 `&'static str`，因此不含参数取值本身。
+        reason: &'static str,
+    },
+
+    /// 环境变量未被模板声明，或名字非法。
+    #[error("环境变量 `{name}` 被拒绝：{reason}")]
+    CommandEnvRejected {
+        /// 变量名。**只有名字**，绝不含取值。
+        name: String,
+        /// 拒绝原因。
+        reason: &'static str,
+    },
+
+    /// 工作目录未被声明，或不在授权根之内。
+    #[error("工作目录被拒绝：{reason}")]
+    CommandCwdRejected {
+        /// 拒绝原因。恒为 `&'static str`，因此不含路径。
+        reason: &'static str,
+    },
+
+    /// 执行请求本身不合法（超时、输出上限等）。
+    #[error("命令请求不合法：{reason}")]
+    CommandSpecInvalid {
+        /// 拒绝原因。
+        reason: &'static str,
+    },
+
+    /// 命令超时，进程已被终止。
+    #[error("命令模板 `{template_id}` 超时（{timeout_ms} 毫秒），进程已终止")]
+    CommandTimeout {
+        /// 超时的模板标识。
+        template_id: &'static str,
+        /// 配置的超时（毫秒）。
+        timeout_ms: u64,
+    },
 }
 
 impl PlatformError {
@@ -268,6 +347,17 @@ impl PlatformError {
             PlatformError::SecureStoreLocked { .. } => "platform.secure_store_locked",
             PlatformError::SecureStoreBackend { .. } => "platform.secure_store_backend",
             PlatformError::SecureStoreInvalidValue { .. } => "platform.secure_store_invalid_value",
+            PlatformError::CommandTemplateUnknown { .. } => "platform.command_template_unknown",
+            PlatformError::CommandTemplateDuplicate { .. } => "platform.command_template_duplicate",
+            PlatformError::CommandExecutableRejected { .. } => {
+                "platform.command_executable_rejected"
+            }
+            PlatformError::CommandShellRejected { .. } => "platform.command_shell_rejected",
+            PlatformError::CommandArgRejected { .. } => "platform.command_arg_rejected",
+            PlatformError::CommandEnvRejected { .. } => "platform.command_env_rejected",
+            PlatformError::CommandCwdRejected { .. } => "platform.command_cwd_rejected",
+            PlatformError::CommandSpecInvalid { .. } => "platform.command_spec_invalid",
+            PlatformError::CommandTimeout { .. } => "platform.command_timeout",
         }
     }
 }
