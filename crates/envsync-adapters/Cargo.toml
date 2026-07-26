@@ -12,9 +12,16 @@ authors.workspace = true
 envsync-domain.workspace = true
 envsync-core.workspace = true
 envsync-platform.workspace = true
+# Agent 渲染器需要读写目标工具的 JSON 配置（Claude 的 settings.json/.mcp.json、
+# OpenCode 的 opencode.json）。结构化合并是「不覆盖本地未管理内容」的前提：
+# 只有解析成对象才能只替换 EnvSync 管理的键、原样保留其余键。
+serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 proptest.workspace = true
+# 包适配器契约测试要把动作送过核心层的策略闸门（`ConfirmedPlan` 需要一个 `PolicySet`），
+# 因此只有测试目标需要策略引擎；库本身不认识策略。
+envsync-policy.workspace = true

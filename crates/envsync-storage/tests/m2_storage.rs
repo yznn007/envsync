@@ -1,9 +1,11 @@
-//! M2 存储层：迁移到 v5、成员索引、检查点审计副本与轮换 journal。
+//! M2 存储层：迁移到当前 schema、成员索引、检查点审计副本与轮换 journal。
 //!
 //! 关注三件事：
 //!
 //! 1. **升级不能损坏 M0/M1 数据。** 用真正的 0001 + 0002 脚本手工搭出一个 schema 2 的
-//!    库、写入 journal / 草稿 / 冲突数据，再让当前版本去打开它。
+//!    库、写入 journal / 草稿 / 冲突数据，再让当前版本去打开它。断言用
+//!    `SCHEMA_VERSION` 而不是写死的数字：后续里程碑还会继续加迁移脚本，而这条测试
+//!    关心的性质不随版本号改变。
 //! 2. **成员索引只接受链头的合法延伸。** 断层、断链、重复登记各有明确行为。
 //! 3. **检查点审计副本是纯存取。** 它自己不做单调性判定——判定在
 //!    `envsync_core::checkpoint::check_advance`，这里只验证读写往返与删除。
@@ -195,15 +197,16 @@ fn table_exists(path: &Path, table: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn m1_database_upgrades_to_v5_without_losing_data() {
+fn m1_database_upgrades_to_the_current_schema_without_losing_data() {
     let dir = TempDir::new().expect("临时目录");
     let path = dir.path().join("journal.db");
     build_m1_database(&path);
     assert_eq!(raw_schema_version(&path), "2");
 
     let journal = Journal::open(&path).expect("升级并打开");
-    assert_eq!(SCHEMA_VERSION, 5);
-    assert_eq!(journal.schema_version().expect("版本"), 5);
+    // 断言的是「升级到本实现支持的版本」，而不是某个写死的数字：M3 之后
+    // `SCHEMA_VERSION` 会继续前进，而这条测试关心的性质（M0/M1 数据不丢）不随之改变。
+    assert_eq!(journal.schema_version().expect("版本"), SCHEMA_VERSION);
     assert!(journal.diagnostics().expect("诊断").is_durable());
 
     // M0 数据完好。
@@ -237,7 +240,7 @@ fn m1_database_upgrades_to_v5_without_losing_data() {
 }
 
 #[test]
-fn a_brand_new_database_starts_at_v5_and_reopening_is_idempotent() {
+fn a_brand_new_database_starts_at_the_current_schema_and_reopening_is_idempotent() {
     let dir = TempDir::new().expect("临时目录");
     let path = dir.path().join("journal.db");
     for _ in 0..3 {
