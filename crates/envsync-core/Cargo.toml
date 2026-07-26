@@ -1,0 +1,11 @@
+[package]
+name = "envsync-core"
+description = "EnvSync 核心服务：捕获、计划、应用、恢复"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]

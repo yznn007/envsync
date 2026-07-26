@@ -1,0 +1,15 @@
+[package]
+name = "envsync-cli"
+description = "EnvSync 命令行界面"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "envsync"
+path = "src/main.rs"
+
+[dependencies]

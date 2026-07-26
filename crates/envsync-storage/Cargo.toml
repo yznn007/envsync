@@ -1,0 +1,11 @@
+[package]
+name = "envsync-storage"
+description = "EnvSync 本地存储：操作日志与草稿"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
