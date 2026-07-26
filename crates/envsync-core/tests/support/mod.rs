@@ -86,6 +86,9 @@ pub fn resource_config(
         disposition,
         policy: ResourcePolicy::default(),
         comment_prefix: DEFAULT_COMMENT_PREFIX.to_owned(),
+        // M1 新增：默认是「全局资源、无设备覆盖」。
+        selector: None,
+        device_overrides: BTreeMap::new(),
     }
 }
 
@@ -112,6 +115,8 @@ pub fn workspace_config(
         },
         state_dir: state_dir.to_path_buf(),
         roots,
+        // M1 新增：不声明标签与能力的最小 Profile。
+        profile: envsync_core::DeviceProfileConfig::default(),
         resources,
     }
 }
@@ -680,6 +685,8 @@ impl FileMutator for FakeMutator {
             original_digest: action.expected_before,
             applied_digest: action.expected_after,
             guarantee: RollbackCapability::Exact,
+            // 内存 fake 不碰真实文件系统，因此永远不会创建中间目录。
+            created_dirs: Vec::new(),
         })
     }
 

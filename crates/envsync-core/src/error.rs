@@ -26,6 +26,27 @@ pub enum CoreError {
     #[error(transparent)]
     Draft(#[from] envsync_storage::DraftError),
 
+    /// 冲突索引错误。
+    #[error(transparent)]
+    ConflictStore(#[from] envsync_storage::ConflictError),
+
+    /// 三方合并失败（解析、超限或渲染校验不通过）。
+    #[error("三方合并失败：{0}")]
+    Merge(#[source] crate::merge::MergeError),
+
+    /// 投影失败。
+    #[error(transparent)]
+    Projection(#[from] crate::projection::ProjectionError),
+
+    /// 存在未解决的合并冲突，本次同步拒绝继续。
+    ///
+    /// 出现它时**本地文件与远端 Ref 都没有被改动**。CLI 把它映射成退出码 13。
+    #[error("存在 {count} 个未解决的合并冲突；请先运行 `envsync conflicts resolve`")]
+    Conflicted {
+        /// 未解决的冲突数量。
+        count: usize,
+    },
+
     /// 编解码错误。
     #[error(transparent)]
     Codec(#[from] envsync_domain::CborError),
@@ -106,6 +127,10 @@ impl CoreError {
             CoreError::Platform(err) => err.code(),
             CoreError::Journal(err) => err.code(),
             CoreError::Draft(err) => err.code(),
+            CoreError::ConflictStore(err) => err.code(),
+            CoreError::Merge(err) => err.code(),
+            CoreError::Projection(err) => err.code(),
+            CoreError::Conflicted { .. } => "sync.conflicted",
             CoreError::Config(err) => err.code(),
             CoreError::Render(err) => err.code(),
             CoreError::Codec(_) => "codec.invalid",
@@ -144,6 +169,11 @@ impl CoreError {
     /// 是否为部分收敛（CLI 退出码 20）。
     pub fn is_partial_convergence(&self) -> bool {
         matches!(self, CoreError::PublishedNotConverged { .. })
+    }
+
+    /// 是否为未解决的合并冲突（CLI 退出码 13）。
+    pub fn is_conflicted(&self) -> bool {
+        matches!(self, CoreError::Conflicted { .. })
     }
 }
 

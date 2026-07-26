@@ -41,7 +41,7 @@ use std::path::{Path, PathBuf};
 use cap_std::fs::{Dir, OpenOptions};
 use envsync_domain::{Digest32, OperationId, ResourceId, RollbackCapability};
 
-use crate::capability::{AuthorizedRoot, RelativeTarget};
+use crate::capability::{AuthorizedRoot, RelativeTarget, DEFAULT_DIR_MODE, SECRET_DIR_MODE};
 use crate::reader::{FileReader, ReadOutcome};
 use crate::{digest_label, PlatformError};
 
@@ -130,6 +130,12 @@ pub struct Receipt {
     pub applied_digest: Option<Digest32>,
     /// 回滚能力。
     pub guarantee: RollbackCapability,
+    /// 本次写入**新创建**的中间目录（相对授权根的路径，按创建顺序）。
+    ///
+    /// 只含相对分段，可以安全地写进日志与诊断。[`SafeWriter::rollback`] **不会**删除
+    /// 它们：目录是共享资源，回滚时它里面可能已经有别的进程放进去的文件，误删的代价
+    /// 远高于留下一个空目录。留在收据里是为了让人工排查时知道「这些目录是我们建的」。
+    pub created_dirs: Vec<String>,
 }
 
 /// 安全写入器。
@@ -199,6 +205,22 @@ impl SafeWriter {
         current.and_then(|outcome| outcome.permissions.unix_mode)
     }
 
+    /// 推导**新建中间目录**应有的 POSIX 权限位。
+    ///
+    /// 秘密资源用 [`SECRET_DIR_MODE`]（`0o700`）：文件本身是 `0o600`，但一个 `0o755`
+    /// 的父目录仍然会把文件名、大小与修改时间暴露给同机的其他用户。其余资源用
+    /// [`DEFAULT_DIR_MODE`]（`0o755`），与 `mkdir` 的常规预期一致。
+    ///
+    /// 刻意**不**沿用 `request.unix_mode`：那是文件的权限位，`0o600` 的目录无法被
+    /// `cd` 进去（缺执行位），照搬会造出一个自己都进不去的目录。
+    fn effective_dir_mode(request: &WriteRequest<'_>) -> u32 {
+        if request.secret {
+            SECRET_DIR_MODE
+        } else {
+            DEFAULT_DIR_MODE
+        }
+    }
+
     /// 原子写入目标。
     ///
     /// # 错误
@@ -214,7 +236,12 @@ impl SafeWriter {
             });
         }
 
-        let resolved = request.root.resolve(request.target)?;
+        // 写入路径按需创建中间目录：`~/.config/` 不存在不该让同步失败，但目录只会建在
+        // 授权根内，且逐段仍做 no-follow 检查。
+        let resolved = request
+            .root
+            .resolve_for_create(request.target, Self::effective_dir_mode(request))?;
+        let created_dirs = resolved.created_dirs().to_vec();
         let current = FileReader::read_resolved(&resolved, self.max_bytes)?;
         let actual = current.as_ref().map(|outcome| outcome.digest);
         if actual != request.expected_before {
@@ -286,6 +313,7 @@ impl SafeWriter {
             operation = %request.operation,
             target = resolved.display_target(),
             applied = %applied_digest.short(),
+            created_dirs = created_dirs.len(),
             "完成原子写入"
         );
         Ok(Receipt {
@@ -295,14 +323,45 @@ impl SafeWriter {
             applied_digest: Some(applied_digest),
             // 原文件已按字节备份，或原本就不存在（回滚 = 删除），两种情况都能精确复原。
             guarantee: RollbackCapability::Exact,
+            created_dirs,
         })
     }
 
     /// 删除目标。
     ///
     /// **总是先备份**；目标不存在时是幂等成功，返回 `backup_path` 为 `None` 的收据。
+    ///
+    /// 删除**绝不创建目录**：这里用 [`AuthorizedRoot::resolve`] 而不是
+    /// [`AuthorizedRoot::resolve_for_create`]。为了删掉一个不存在的文件而先把它的父目录
+    /// 造出来，是纯粹的副作用；中间目录缺失本身就已经证明目标不存在，幂等成功即可。
     pub fn apply_delete(&self, request: &DeleteRequest<'_>) -> Result<Receipt, PlatformError> {
-        let resolved = request.root.resolve(request.target)?;
+        let resolved = match request.root.resolve(request.target) {
+            Ok(resolved) => resolved,
+            // 中间目录都不存在 ⇒ 目标当然也不存在。计划要求它消失，事实就是它已经
+            // 不在了，这是幂等成功；只有在计划期望它**存在**时才是观察过期。
+            Err(error) if error.is_not_found() => {
+                if request.expected_before.is_some() {
+                    return Err(PlatformError::StaleObservation {
+                        expected: request.expected_before,
+                        actual: None,
+                    });
+                }
+                tracing::debug!(
+                    resource = %request.resource,
+                    target = %request.target,
+                    "删除目标的中间目录不存在，视为幂等成功"
+                );
+                return Ok(Receipt {
+                    resource: request.resource.clone(),
+                    backup_path: None,
+                    original_digest: None,
+                    applied_digest: None,
+                    guarantee: RollbackCapability::Exact,
+                    created_dirs: Vec::new(),
+                });
+            }
+            Err(error) => return Err(error),
+        };
         let current = FileReader::read_resolved(&resolved, self.max_bytes)?;
         let actual = current.as_ref().map(|outcome| outcome.digest);
         if actual != request.expected_before {
@@ -325,6 +384,7 @@ impl SafeWriter {
                 original_digest: None,
                 applied_digest: None,
                 guarantee: RollbackCapability::Exact,
+                created_dirs: Vec::new(),
             });
         };
 
@@ -366,6 +426,7 @@ impl SafeWriter {
             original_digest: Some(outcome.digest),
             applied_digest: None,
             guarantee: RollbackCapability::Exact,
+            created_dirs: Vec::new(),
         })
     }
 
@@ -375,6 +436,14 @@ impl SafeWriter {
     /// [`PlatformError::RollbackRefused`]：摘要不符说明用户在此期间又改过这个文件，
     /// 盲目回滚会把用户的新修改一起抹掉。备份缺失或备份内容与
     /// `receipt.original_digest` 不符时同样拒绝，并保持现场不变以便人工诊断。
+    ///
+    /// # 为什么不删除写入时创建的中间目录
+    ///
+    /// [`Receipt::created_dirs`] 记录了本次写入新建的目录，但回滚**只还原文件字节，
+    /// 不删除目录**。目录是共享资源：在写入与回滚之间，用户或别的工具完全可能已经往
+    /// 里面放了东西，而「删一个我以为是空的目录」的失败模式是不可逆的数据丢失。留下
+    /// 一个空目录的代价则只是几个 inode。这里为每个被保留的目录写一条 `tracing` 记录，
+    /// 需要彻底清理的人可以据此手工删除。
     pub fn rollback(
         &self,
         receipt: &Receipt,
@@ -382,6 +451,13 @@ impl SafeWriter {
         target: &RelativeTarget,
     ) -> Result<(), PlatformError> {
         let resolved = root.resolve(target)?;
+        if !receipt.created_dirs.is_empty() {
+            tracing::info!(
+                resource = %receipt.resource,
+                dirs = %receipt.created_dirs.join("、"),
+                "回滚保留写入时创建的中间目录（避免误删用户目录）"
+            );
+        }
         let current = FileReader::read_resolved(&resolved, self.max_bytes)?;
         let actual = current.as_ref().map(|outcome| outcome.digest);
         if actual != receipt.applied_digest {
@@ -458,15 +534,19 @@ impl SafeWriter {
 
     /// 校验目标当前内容摘要。
     ///
-    /// `expected` 为 `None` 表示期望目标不存在。
+    /// `expected` 为 `None` 表示期望目标不存在。**不创建任何目录**：校验是只读操作，
+    /// 中间目录不存在等价于目标不存在。
     pub fn verify(
         &self,
         root: &AuthorizedRoot,
         target: &RelativeTarget,
         expected: Option<Digest32>,
     ) -> Result<(), PlatformError> {
-        let resolved = root.resolve(target)?;
-        let actual = FileReader::current_digest(&resolved, self.max_bytes)?;
+        let actual = match root.resolve(target) {
+            Ok(resolved) => FileReader::current_digest(&resolved, self.max_bytes)?,
+            Err(error) if error.is_not_found() => None,
+            Err(error) => return Err(error),
+        };
         if actual == expected {
             Ok(())
         } else {

@@ -789,7 +789,7 @@ EnvSync 不使用「一个全局版本号」，而是让每一层各自携带版
 | 报「引用了缺失的对象」 | `object.missing` | 后端里缺少目标快照可达的某个 Blob | 通常是后端被部分删除。从仍然完整的设备重新 `capture` → `sync` |
 | 配置改了却不生效 | `config.unknown_field` | 字段名写错。未知字段是**拒绝**而不是忽略 | 对照 `examples/workspace.yaml` |
 | `target` 被拒绝 | `config.invalid_target` / `platform.invalid_target` | 绝对路径、`..`、`.`、空段、反斜杠、冒号、UNC 前缀、Windows 保留设备名、以空格或点结尾的段、超长（>1024 字节）或超段数（>32） | 这些限制在三大平台上**一致**生效，好让同一份配置表达完全相同的意图 |
-| M0 下用 `structured_merge` 或 `generated_include` | `config.mode_not_supported` | 这两种模式 M1 起才启用 | 暂用 `full_file` 或 `managed_block` |
+| 用 `generated_include` | `config.mode_not_supported` | 该模式由适配器拆成「Full File + Managed Block」两个资源实现，不作为独立模式暴露 | 见 `docs/adapters.md`；`structured_merge` 自 M1 起可用，但需同时声明 `policy.structured_format` |
 | Managed Block 报 marker 异常 | `render.*` | 用户文件里的 marker 重复、嵌套、顺序颠倒、缺一端或格式非法 | **绝不猜测修复**：marker 异常通常意味着人工编辑冲突或文件损坏。手工整理该文件的 `>>> envsync:` / `<<< envsync:` 区块后重新 `plan` |
 | `--json` 输出无法被 `jq` 解析 | — | 有日志混进了 stdout | 不应发生：日志 writer 固定为 stderr。若复现请报告，并附 `RUST_LOG` 取值 |
 

@@ -531,5 +531,8 @@ fn to_action_receipt(stored: &envsync_storage::Receipt) -> ActionReceipt {
         original_digest: stored.original_digest,
         applied_digest: stored.applied_digest,
         guarantee: stored.guarantee,
+        // journal 不保存这一项（见 `ActionReceipt::created_dirs` 的说明）；它只用于
+        // 留痕，不参与回滚判定，因此从存储读回时留空是安全的。
+        created_dirs: Vec::new(),
     }
 }

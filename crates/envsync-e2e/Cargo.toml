@@ -10,12 +10,18 @@ authors.workspace = true
 publish = false
 
 [dependencies]
+envsync-backend.workspace = true
 envsync-core.workspace = true
 envsync-domain.workspace = true
 envsync-storage.workspace = true
+git2.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 
 [[test]]
 name = "local_file_loop"
 path = "tests/local_file_loop.rs"
+
+[[test]]
+name = "git_multi_device"
+path = "tests/git_multi_device.rs"

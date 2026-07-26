@@ -456,7 +456,7 @@ fn sync_dir(_dir: &Path) -> io::Result<()> {
 }
 
 /// 校验 `list_objects` 的前缀。
-fn validate_prefix(prefix: &str) -> Result<(), BackendError> {
+pub(crate) fn validate_prefix(prefix: &str) -> Result<(), BackendError> {
     let reject = |detail: &str| BackendError::InvalidPrefix {
         prefix: prefix.to_owned(),
         detail: detail.to_owned(),
@@ -476,12 +476,12 @@ fn validate_prefix(prefix: &str) -> Result<(), BackendError> {
 }
 
 /// 判断字符串是否全为小写十六进制字符。
-fn is_lower_hex(text: &str) -> bool {
+pub(crate) fn is_lower_hex(text: &str) -> bool {
     !text.is_empty() && text.chars().all(|ch| matches!(ch, '0'..='9' | 'a'..='f'))
 }
 
 /// 由分片目录名与文件名还原 [`ObjectId`]；不合法返回 `None`。
-fn parse_object_name(shard: &str, name: &str) -> Option<ObjectId> {
+pub(crate) fn parse_object_name(shard: &str, name: &str) -> Option<ObjectId> {
     let (rest, kind) = name.rsplit_once('.')?;
     let kind = ObjectKind::parse(kind)?;
     let hex = format!("{shard}{rest}");
@@ -490,6 +490,6 @@ fn parse_object_name(shard: &str, name: &str) -> Option<ObjectId> {
 }
 
 /// 把格式标记转成可安全展示的单行文本。
-fn escape_marker(text: &str) -> String {
+pub(crate) fn escape_marker(text: &str) -> String {
     text.chars().take(64).flat_map(char::escape_debug).collect()
 }

@@ -1,0 +1,20 @@
+[package]
+name = "envsync-adapters"
+description = "EnvSync 内建适配器：文件、Git 配置、Shell、终端"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+envsync-domain.workspace = true
+envsync-core.workspace = true
+envsync-platform.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+proptest.workspace = true

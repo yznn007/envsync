@@ -57,10 +57,14 @@ pub mod capability;
 pub mod reader;
 pub mod writer;
 
-pub use capability::{AuthorizedRoot, RelativeTarget, ResolvedPath, RootRegistry, TargetError};
+pub use capability::{
+    AuthorizedRoot, MissingDirs, RelativeTarget, ResolvedPath, RootRegistry, TargetError,
+    DEFAULT_DIR_MODE, SECRET_DIR_MODE,
+};
 pub use reader::{FileReader, ReadOutcome, FILE_CONTENT_DOMAIN};
 pub use writer::{
-    DeleteRequest, FaultInjection, Receipt, SafeWriter, WriteRequest, TEMP_FILE_PREFIX,
+    DeleteRequest, FaultInjection, Receipt, SafeWriter, WriteRequest, SECRET_DEFAULT_MODE,
+    TEMP_FILE_PREFIX,
 };
 
 /// 平台层错误。

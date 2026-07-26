@@ -151,7 +151,8 @@ fn init_creates_temp_root_backend_and_state_dir() {
         .init_json()
         .expect("第一台设备应当有 init 的 JSON 输出")
         .clone();
-    assert_eq!(init["schema_version"], 1);
+    // M1 把 CLI JSON 契约提升到 v2（新增 status.open_conflicts 等字段）。
+    assert_eq!(init["schema_version"], 2);
     assert_eq!(init["command"], "init");
     assert_eq!(init["status"], "ok");
     assert_eq!(init["data"]["backend_kind"], "local");

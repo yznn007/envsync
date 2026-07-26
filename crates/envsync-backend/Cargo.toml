@@ -10,6 +10,7 @@ authors.workspace = true
 
 [dependencies]
 envsync-domain.workspace = true
+git2.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

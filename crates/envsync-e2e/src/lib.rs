@@ -52,10 +52,12 @@ use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use envsync_core::{DeviceConfig, ResourceConfig, WorkspaceConfig};
+use envsync_backend::git::DEFAULT_BRANCH;
+use envsync_backend::GitAuth;
+use envsync_core::{BackendConfig, DeviceConfig, ResourceConfig, WorkspaceConfig};
 use envsync_domain::{
     CborCodec, DesiredDisposition, FileMode, ObjectId, ResourceId, ResourcePolicy, SnapshotBody,
-    SnapshotId, StateRoot,
+    SnapshotId, StateRoot, WorkspaceRef,
 };
 use envsync_storage::{DraftStore, Journal};
 use serde_json::Value;
@@ -322,6 +324,14 @@ impl E2eWorld {
         device
     }
 
+    /// 在世界里新建一个**裸 Git 远端**，用作 Git Backend 的 `remote_url`。
+    ///
+    /// 用真实的 bare 仓库而不是 mock：M1 的 CAS 语义建立在「远端拒绝非 fast-forward
+    /// 更新」之上，只有真远端才验得到。
+    pub fn git_remote(&self, name: &str) -> GitRemote {
+        GitRemote::init(self.root.path().join(format!("{name}.git")))
+    }
+
     /// 准备一台设备的目录布局，但不写配置。
     fn device_layout(&self, name: &str) -> Device {
         let base = self.root.path().join(name);
@@ -428,6 +438,47 @@ impl Device {
         let mut config = base.clone();
         config.resources = resources;
         self.write_config(&config);
+    }
+
+    /// 把这台设备的后端换成 Git（分支固定为
+    /// [`DEFAULT_BRANCH`](envsync_backend::git::DEFAULT_BRANCH)）。
+    ///
+    /// cache clone 一律落在**本设备**的状态目录下：第二台设备的配置是从第一台复制
+    /// 来的，若不改写就会两台设备共用一个 cache，测出来的「多设备」是假的。
+    pub fn use_git_backend(&self, remote: &GitRemote, auth: GitAuth) {
+        let mut config = self.config();
+        config.backend = BackendConfig::Git {
+            remote_url: remote.url(),
+            branch: DEFAULT_BRANCH.to_owned(),
+            cache_dir: self.git_cache_dir(),
+            auth,
+        };
+        self.write_config(&config);
+    }
+
+    /// 覆盖本设备 Profile 里的标签与能力。
+    pub fn set_profile(&self, tags: &[&str], capabilities: &[&str]) {
+        let mut config = self.config();
+        config.profile.tags = tags.iter().map(|tag| (*tag).to_owned()).collect();
+        config.profile.capabilities = capabilities
+            .iter()
+            .map(|capability| (*capability).to_owned())
+            .collect();
+        self.write_config(&config);
+    }
+
+    /// Git 后端私有 cache clone 的目录。
+    pub fn git_cache_dir(&self) -> PathBuf {
+        self.state_dir.join("git-cache")
+    }
+
+    /// cache clone 里的 `FETCH_HEAD`。
+    ///
+    /// libgit2 每次 fetch 都会重写它，因此「删掉它再等它出现」是一个可靠的
+    /// **正向信号**：目标进程已经真的联过一次远端。CAS 竞争测试用它来确定
+    /// 「慢的一方已经读到了 revision」，从而不必依赖 sleep 猜时序。
+    pub fn git_fetch_marker(&self) -> PathBuf {
+        self.git_cache_dir().join("FETCH_HEAD")
     }
 
     // ---- 授权根内的文件 -----------------------------------------------------
@@ -570,6 +621,39 @@ impl Device {
     /// `envsync status --json` 的 `data`。
     pub fn status(&self) -> Value {
         let run = self.run_json(&["status"]);
+        run.expect_ok();
+        run.data()
+    }
+
+    // ---- M1 新命令 -----------------------------------------------------------
+
+    /// `envsync fetch --json` 的 `data`，断言成功。
+    pub fn fetch(&self) -> Value {
+        let run = self.run_json(&["fetch"]);
+        run.expect_ok();
+        run.data()
+    }
+
+    /// `envsync merge --json` 的 `data`，断言命令本身成功。
+    ///
+    /// 注意「命令成功」与「合并干净」是两回事：出现冲突时 `merge` 仍以退出码 0
+    /// 结束，只是 `outcome` 变成 `conflicted`。
+    pub fn merge(&self) -> Value {
+        let run = self.run_json(&["merge"]);
+        run.expect_ok();
+        run.data()
+    }
+
+    /// `envsync conflicts list --json` 的 `data`，断言成功。
+    pub fn conflicts(&self) -> Value {
+        let run = self.run_json(&["conflicts", "list"]);
+        run.expect_ok();
+        run.data()
+    }
+
+    /// `envsync profile explain --json` 的 `data`，断言成功。
+    pub fn profile_explain(&self) -> Value {
+        let run = self.run_json(&["profile", "explain"]);
         run.expect_ok();
         run.data()
     }
@@ -737,6 +821,151 @@ impl SyncInfo {
 }
 
 // ---------------------------------------------------------------------------
+// Git 远端
+// ---------------------------------------------------------------------------
+
+/// 一个临时的**裸 Git 远端**，直接用它的文件系统路径当 remote URL。
+///
+/// 它同时是断言工具：Git Backend 的全部承诺（Ref 只经 CAS 前进、提交确定且不含本机
+/// 信息、失败方不留下 Ref 提交）最终都要在这个仓库里被查出来，而不是只看 CLI 的自述。
+#[derive(Debug)]
+pub struct GitRemote {
+    /// 裸仓库路径。
+    path: PathBuf,
+    /// 「不可达」期间仓库被挪到的位置。
+    parked: PathBuf,
+}
+
+/// 远端受信分支上的一条提交。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteCommit {
+    /// 提交 OID 的十六进制文本。
+    pub oid: String,
+    /// 提交信息。
+    pub message: String,
+}
+
+impl RemoteCommit {
+    /// 是否是一次 Ref 发布（而不是对象上传）。
+    pub fn is_ref_publish(&self) -> bool {
+        self.message.starts_with("envsync ref")
+    }
+}
+
+/// 远端上记录的工作区 Ref。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteRef {
+    /// 当前 revision。
+    pub revision: u64,
+    /// 当前头快照的十六进制标识；从未发布过时为 `None`。
+    pub head: Option<String>,
+}
+
+impl GitRemote {
+    /// 在给定路径上初始化一个空的裸仓库。
+    fn init(path: PathBuf) -> Self {
+        git2::Repository::init_bare(&path).expect("应当能初始化裸 Git 远端");
+        let parked = path.with_extension("git-offline");
+        GitRemote { path, parked }
+    }
+
+    /// remote URL（本地路径形式）。
+    pub fn url(&self) -> String {
+        arg(&self.path)
+    }
+
+    /// 把远端改名，模拟「远端不可达」。
+    pub fn take_offline(&self) {
+        std::fs::rename(&self.path, &self.parked).expect("应当能把远端挪走");
+    }
+
+    /// 把远端改回来。
+    pub fn bring_online(&self) {
+        std::fs::rename(&self.parked, &self.path).expect("应当能把远端挪回来");
+    }
+
+    /// 打开裸仓库。
+    fn repo(&self) -> git2::Repository {
+        git2::Repository::open_bare(&self.path).expect("应当能打开裸 Git 远端")
+    }
+
+    /// 受信分支当前指向的提交 OID；分支不存在时为 `None`。
+    pub fn branch_head(&self) -> Option<String> {
+        self.repo()
+            .refname_to_id(&format!("refs/heads/{DEFAULT_BRANCH}"))
+            .ok()
+            .map(|oid| oid.to_string())
+    }
+
+    /// 受信分支上的全部提交，**从新到旧**。
+    pub fn commits(&self) -> Vec<RemoteCommit> {
+        let repo = self.repo();
+        let Some(head) = self.branch_head() else {
+            return Vec::new();
+        };
+        let mut walk = repo.revwalk().expect("应当能创建 revwalk");
+        walk.push(head.parse().expect("分支头是合法 OID"))
+            .expect("应当能压入分支头");
+        walk.filter_map(Result::ok)
+            .map(|oid| {
+                let commit = repo.find_commit(oid).expect("应当能读提交");
+                RemoteCommit {
+                    oid: oid.to_string(),
+                    message: commit.message().unwrap_or_default().to_owned(),
+                }
+            })
+            .collect()
+    }
+
+    /// 受信分支上**最新的一次 Ref 发布**提交。
+    ///
+    /// 对象上传也会在同一条分支上留下提交，因此「分支头」并不等于「谁赢了 CAS」；
+    /// 判断胜负必须看最新的 Ref 提交。
+    pub fn latest_ref_commit(&self) -> Option<RemoteCommit> {
+        self.commits()
+            .into_iter()
+            .find(RemoteCommit::is_ref_publish)
+    }
+
+    /// `ancestor` 是否是分支头本身或它的祖先。
+    pub fn branch_contains(&self, ancestor: &str) -> bool {
+        let Some(head) = self.branch_head() else {
+            return false;
+        };
+        let ancestor: git2::Oid = ancestor.parse().expect("祖先是合法 OID");
+        let head: git2::Oid = head.parse().expect("分支头是合法 OID");
+        head == ancestor
+            || self
+                .repo()
+                .graph_descendant_of(head, ancestor)
+                .expect("应当能判断祖先关系")
+    }
+
+    /// 读出远端记录的工作区 Ref。
+    ///
+    /// 直接从分支头的 tree 里取 `.envsync/refs/<workspace>.cbor` 并按 canonical CBOR
+    /// 解码——不经过 EnvSync 的任何代码路径，因此可以用来交叉验证后端实现。
+    pub fn workspace_ref(&self, workspace: &str) -> Option<RemoteRef> {
+        let repo = self.repo();
+        let head = self.branch_head()?;
+        let commit = repo
+            .find_commit(head.parse().expect("分支头是合法 OID"))
+            .expect("应当能读提交");
+        let tree = commit.tree().expect("应当能读 tree");
+        let entry = tree
+            .get_path(Path::new(&format!(".envsync/refs/{workspace}.cbor")))
+            .ok()?;
+        let object = entry.to_object(&repo).expect("应当能读对象");
+        let blob = object.as_blob().expect("Ref 必须是普通文件");
+        let reference = WorkspaceRef::from_canonical_slice(blob.content()).expect("Ref 应当可解码");
+        Some(RemoteRef {
+            revision: reference.revision,
+            head: reference.head.map(|id| id.to_hex()),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 通用小工具
 // ---------------------------------------------------------------------------
 
@@ -773,6 +1002,10 @@ pub fn resource(
         disposition,
         policy: ResourcePolicy::default(),
         comment_prefix: "# ".to_owned(),
+        // M1 新增：本夹具构造的是「所有设备都适用」的全局资源，因此不带 selector，
+        // 也没有设备级覆盖。Profile 投影的专项测试在 envsync-core/tests/projection.rs。
+        selector: None,
+        device_overrides: std::collections::BTreeMap::new(),
     }
 }
 
@@ -839,6 +1072,20 @@ pub fn wait_for_objects(objects_dir: &Path, expected: usize) {
         "等待后端对象超时：期望至少 {expected} 个，实际 {}",
         count_files(objects_dir)
     );
+}
+
+/// 等待某个路径出现，最多等 `seconds` 秒。
+///
+/// 用于把「另一个进程已经走到某一步」变成**可观测的事件**，从而不必用 sleep 去猜。
+pub fn wait_for_path(path: &Path, seconds: u64) {
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    while Instant::now() < deadline {
+        if path.exists() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    panic!("等待 {path:?} 出现超时（{seconds} 秒）");
 }
 
 /// 占住某个工作区的后端锁，让所有 `sync` 都停在 CAS 之前。

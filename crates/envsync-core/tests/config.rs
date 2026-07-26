@@ -62,12 +62,14 @@ fn parse(text: &str) -> Result<WorkspaceConfig, ConfigError> {
 }
 
 // ---------------------------------------------------------------------------
-// 规则 1：version 必须精确等于 1，绝不静默降级
+// 规则 1：version 必须落在 [MIN_CONFIG_VERSION, CONFIG_VERSION] 内，绝不静默降级
+//
+// M1 起支持读取版本 1 与 2（见下方的迁移测试）；范围之外一律拒绝。
 // ---------------------------------------------------------------------------
 
 #[test]
 fn rule01_unsupported_version_is_rejected() {
-    for bad in ["0", "2", "99"] {
+    for bad in ["0", "3", "99"] {
         let text = yaml_with("").replace("version: 1", &format!("version: {bad}"));
         let error = parse(&text).expect_err("版本不匹配必须报错");
         assert_eq!(error.code(), "config.unsupported_version");
@@ -88,6 +90,126 @@ fn rule01_version_error_wins_over_field_errors() {
     assert_eq!(
         parse(text).expect_err("必须报错").code(),
         "config.unsupported_version"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 迁移：v1 文档仍可读，读进来即升级为当前版本
+// ---------------------------------------------------------------------------
+
+#[test]
+fn migration_v1_document_is_read_with_default_m1_fields() {
+    // 一份地道的 v1 文档：没有 profile、没有 selector、没有 device_overrides。
+    let config = parse(&yaml_with_resource(
+        "id: shell/zsh/main\nroot: home\ntarget: .zshrc\nmode: full_file\ndisposition: managed\n",
+    ))
+    .expect("v1 文档必须仍然可读");
+
+    assert_eq!(config.version, CONFIG_VERSION, "读入后即为当前版本");
+    assert_eq!(config.profile, envsync_core::DeviceProfileConfig::default());
+    let resource = &config.resources[0];
+    assert!(resource.selector.is_none(), "v1 没有选择器，默认全局资源");
+    assert!(resource.device_overrides.is_empty());
+}
+
+#[test]
+fn migration_v1_document_rejects_m1_only_fields() {
+    // 在 v1 文档里写 M1 字段必须报错：忽略它会让用户以为选择器已经生效。
+    let text = yaml_with("profile:\n  tags: [work]\n");
+    let error = parse(&text).expect_err("v1 文档不得混入 v2 字段");
+    assert_eq!(error.code(), "config.field_requires_version");
+}
+
+#[test]
+fn migration_v1_round_trips_into_v2() {
+    let v1 = parse(&yaml_with_resource(
+        "id: shell/zsh/main\nroot: home\ntarget: .zshrc\nmode: full_file\ndisposition: managed\n",
+    ))
+    .expect("v1 文档必须仍然可读");
+
+    let yaml = v1.to_yaml().expect("序列化应当成功");
+    assert!(yaml.contains(&format!("version: {CONFIG_VERSION}")));
+    let v2 = WorkspaceConfig::parse_yaml(&yaml, &base_dir()).expect("升级后的文档必须可读");
+    assert_eq!(v1, v2, "迁移必须是无损的");
+}
+
+#[test]
+fn v2_selector_and_device_overrides_round_trip() {
+    let device = envsync_domain::DeviceId::derive(b"laptop").to_hex();
+    let text = yaml_with_resource(&format!(
+        "id: shell/pwsh/main\n\
+         root: home\n\
+         target: profile.ps1\n\
+         mode: full_file\n\
+         disposition: managed\n\
+         selector:\n\
+         \x20 all:\n\
+         \x20   - os: windows\n\
+         \x20   - capability: pwsh\n\
+         device_overrides:\n\
+         \x20 {device}:\n\
+         \x20   disposition: unmanaged\n\
+         \x20   target: other.ps1\n"
+    ))
+    .replace("version: 1", "version: 2");
+
+    let config = parse(&text).expect("v2 文档必须可读");
+    let resource = &config.resources[0];
+    assert!(resource.selector.is_some(), "选择器应当被解析出来");
+    let overrides = resource
+        .device_overrides
+        .get(&device)
+        .expect("应当有针对本设备的覆盖");
+    assert_eq!(
+        overrides.disposition,
+        Some(envsync_domain::DesiredDisposition::Unmanaged)
+    );
+    assert_eq!(overrides.target.as_deref(), Some("other.ps1"));
+
+    // 套用覆盖后得到本设备实际使用的资源配置。
+    let resolved = resource.resolved_for(envsync_domain::DeviceId::derive(b"laptop"));
+    assert_eq!(resolved.target, "other.ps1");
+
+    // 往返稳定。
+    let yaml = config.to_yaml().expect("序列化应当成功");
+    assert_eq!(
+        WorkspaceConfig::parse_yaml(&yaml, &base_dir()).expect("往返后必须可读"),
+        config
+    );
+}
+
+#[test]
+fn v2_git_backend_is_parsed_and_rejects_credentials_in_url() {
+    let text = yaml_with("")
+        .replace("version: 1", "version: 2")
+        .replace(
+            "backend:\n  kind: local\n  path: \"/srv/backend\"",
+            "backend:\n  kind: git\n  remote_url: \"ssh://git@example.invalid/envsync.git\"\n  auth:\n    kind: ssh-agent",
+        );
+    let config = parse(&text).expect("git 后端配置应当可读");
+    let envsync_core::BackendConfig::Git {
+        remote_url,
+        branch,
+        cache_dir,
+        ..
+    } = &config.backend
+    else {
+        panic!("应当解析为 Git 变体")
+    };
+    assert_eq!(remote_url, "ssh://git@example.invalid/envsync.git");
+    assert_eq!(branch, "envsync", "省略 branch 时取默认分支");
+    assert_eq!(cache_dir, &config.state_dir.join("git-cache"));
+
+    // URL 里内嵌凭据必须在配置边界就被挡下。
+    let with_password = text.replace(
+        "ssh://git@example.invalid/envsync.git",
+        "https://user:hunter2@example.invalid/envsync.git",
+    );
+    assert_eq!(
+        parse(&with_password)
+            .expect_err("带凭据的 URL 必须被拒绝")
+            .code(),
+        "config.invalid_backend"
     );
 }
 
@@ -328,9 +450,10 @@ fn rule08_structured_merge_without_format_is_rejected() {
 }
 
 #[test]
-fn rule08_structured_merge_with_format_is_rejected_in_m0() {
-    // 配置写全了也仍然拒绝：M0 还没实现语义合并，静默降级成整文件覆盖会毁掉用户数据。
-    let error = parse(&yaml_with_resource(
+fn rule08_structured_merge_with_format_is_accepted() {
+    // M1 起五种结构化合并器都已实现，配置层因此接受 `structured_merge`；
+    // 「必须同时声明 structured_format」这条校验保留（见上一个测试）。
+    let config = parse(&yaml_with_resource(
         "id: editor/vscode/settings\n\
          root: home\n\
          target: .config/Code/User/settings.json\n\
@@ -339,16 +462,37 @@ fn rule08_structured_merge_with_format_is_rejected_in_m0() {
          policy:\n\
          \x20 structured_format: json\n",
     ))
-    .expect_err("M0 不支持 structured_merge");
-    assert_eq!(error.code(), "config.mode_not_supported");
-    match error {
-        ConfigError::ModeNotSupportedInM0 { mode, .. } => assert_eq!(mode, "structured_merge"),
-        other => panic!("错误类型不符：{other:?}"),
-    }
+    .expect("structured_merge + structured_format 是合法配置");
+    let resource = &config.resources[0];
+    assert_eq!(resource.mode, FileMode::StructuredMerge);
+    assert_eq!(
+        resource.policy.structured_format,
+        Some(StructuredFormat::Json)
+    );
 }
 
 #[test]
-fn rule08_generated_include_is_rejected_in_m0() {
+fn rule08_structured_merge_survives_yaml_round_trip() {
+    // 往返稳定性：`to_yaml` 写出的模式必须还能被自己读回来，否则 `envsync init
+    // --discover` 写出的配置在下一条命令里就会被拒绝。
+    let config = parse(&yaml_with_resource(
+        "id: vcs/git/user\n\
+         root: home\n\
+         target: .gitconfig\n\
+         mode: structured_merge\n\
+         disposition: managed\n\
+         policy:\n\
+         \x20 structured_format: git_config\n",
+    ))
+    .expect("structured_merge 合法");
+    let text = config.to_yaml().expect("可序列化");
+    assert!(text.contains("structured_merge"), "{text}");
+    let again = WorkspaceConfig::parse_yaml(&text, Path::new("/tmp")).expect("往返可解析");
+    assert_eq!(again.resources, config.resources);
+}
+
+#[test]
+fn rule08_generated_include_is_rejected_and_points_at_the_docs() {
     let error = parse(&yaml_with_resource(
         "id: shell/zsh/generated\n\
          root: home\n\
@@ -356,10 +500,19 @@ fn rule08_generated_include_is_rejected_in_m0() {
          mode: generated_include\n\
          disposition: managed\n",
     ))
-    .expect_err("M0 不支持 generated_include");
+    .expect_err("generated_include 没有对应的落地语义");
     assert_eq!(error.code(), "config.mode_not_supported");
+    let message = error.to_string();
+    assert!(
+        message.contains("docs/adapters.md"),
+        "错误信息必须指向文档，实际是：{message}"
+    );
+    assert!(
+        message.contains("Full File") && message.contains("Managed Block"),
+        "错误信息必须说明它被拆成哪两个资源，实际是：{message}"
+    );
     match error {
-        ConfigError::ModeNotSupportedInM0 { mode, .. } => assert_eq!(mode, "generated_include"),
+        ConfigError::ModeNotSupported { mode, .. } => assert_eq!(mode, "generated_include"),
         other => panic!("错误类型不符：{other:?}"),
     }
 }
@@ -539,7 +692,9 @@ fn rule14_relative_paths_resolve_against_base_dir() {
 
     assert_eq!(config.state_dir, PathBuf::from("/tmp/x/.envsync"));
     assert_eq!(config.root_path("home").unwrap(), Path::new("/tmp/x/home"));
-    let BackendConfig::Local { path } = &config.backend;
+    let BackendConfig::Local { path } = &config.backend else {
+        panic!("本地后端配置应当解析为 Local 变体")
+    };
     assert_eq!(path, Path::new("/tmp/x/backend"));
 }
 
@@ -551,7 +706,9 @@ fn rule14_absolute_paths_are_kept_as_is() {
     )
     .expect("配置合法");
     assert_eq!(config.state_dir, PathBuf::from("/var/lib/envsync"));
-    let BackendConfig::Local { path } = &config.backend;
+    let BackendConfig::Local { path } = &config.backend else {
+        panic!("本地后端配置应当解析为 Local 变体")
+    };
     assert_eq!(path, Path::new("/srv/backend"));
 }
 
@@ -665,7 +822,9 @@ fn scaffold_produces_valid_minimal_config() {
     assert!(config.resources.is_empty(), "空工作区是合法的初始状态");
     assert_eq!(config.state_dir, base.join(".envsync"));
     assert!(config.root_path("home").is_ok());
-    let BackendConfig::Local { path } = &config.backend;
+    let BackendConfig::Local { path } = &config.backend else {
+        panic!("本地后端配置应当解析为 Local 变体")
+    };
     assert_eq!(path, Path::new("/srv/backend"));
 }
 

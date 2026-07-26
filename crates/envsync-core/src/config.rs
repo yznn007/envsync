@@ -49,23 +49,41 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use envsync_backend::git::DEFAULT_BRANCH as DEFAULT_GIT_BRANCH;
+use envsync_backend::git_auth::validate_remote_url;
+use envsync_backend::GitAuth;
 use envsync_domain::{
-    ActionTarget, DesiredDisposition, DeviceId, Digest32, FileMode, LineEnding, ResourceId,
-    ResourcePolicy, StructuredFormat, WorkspaceId,
+    ActionTarget, Arch, DesiredDisposition, DeviceId, DeviceProfile, Digest32, FileMode,
+    LineEnding, Os, ProfileError, ResourceId, ResourcePolicy, Selector, StructuredFormat,
+    WorkspaceId, MAX_SELECTOR_DEPTH,
 };
 use envsync_platform::{PlatformError, RelativeTarget};
 
-/// 当前支持的配置版本。
+/// 本程序写出的配置版本。
 ///
-/// 版本号是**精确匹配**的：读到别的值一律报
-/// [`ConfigError::UnsupportedVersion`]，不做任何向前或向后兼容的猜测。
-pub const CONFIG_VERSION: u32 = 1;
+/// M1 把版本提升到 2：新增 `profile`、资源级 `selector` 与 `device_overrides`，
+/// 以及 Git 后端。**读取**仍然兼容版本 1（见 [`MIN_CONFIG_VERSION`]）；范围之外的
+/// 版本号一律报 [`ConfigError::UnsupportedVersion`]，绝不按别的版本猜测语义。
+pub const CONFIG_VERSION: u32 = 2;
+
+/// 仍然可以被读取的最低配置版本。
+///
+/// 版本 1 的文档没有 M1 新增字段，解析时一律取默认值；反过来，在声明 `version: 1`
+/// 的文档里写 M1 字段会被拒绝——否则用户会以为选择器生效了，而实际上它只是被当成
+/// 未来版本的噪声。
+pub const MIN_CONFIG_VERSION: u32 = 1;
+
+/// 首个带有 `profile` / `selector` / `device_overrides` / Git 后端的版本。
+const PROFILE_CONFIG_VERSION: u32 = 2;
 
 /// 默认的本地状态目录名（相对配置文件所在目录）。
 pub const DEFAULT_STATE_DIR: &str = ".envsync";
 
 /// Managed Block 的默认注释前缀。
 pub const DEFAULT_COMMENT_PREFIX: &str = "# ";
+
+/// Git 后端私有 cache clone 的默认目录名（相对 `state_dir`）。
+pub const DEFAULT_GIT_CACHE_DIR: &str = "git-cache";
 
 /// 派生 `scaffold` 设备种子时使用的域分隔标签。
 const DEVICE_SEED_DOMAIN: &str = "envsync:config:device-seed:v1";
@@ -89,8 +107,29 @@ pub struct WorkspaceConfig {
     pub state_dir: PathBuf,
     /// 授权根：别名 -> 绝对路径。
     pub roots: BTreeMap<String, PathBuf>,
+    /// 本设备的 Profile 声明（标签、能力、可选主机名）。
+    ///
+    /// **不包含 `os` / `arch`**：这两项由编译期 `cfg` 探测（见
+    /// [`detected_os`] 与 [`detected_arch`]），不从配置读取——配置会被同步到所有
+    /// 设备，允许它自报平台等于允许一台设备冒充另一台。
+    pub profile: DeviceProfileConfig,
     /// 被管理的资源列表；空列表表示空工作区，是合法配置。
     pub resources: Vec<ResourceConfig>,
+}
+
+/// 本设备的 Profile 声明。
+///
+/// 取值都会在解析期做规范化校验（`trim` 后非空、长度与数量有上限），因此由
+/// [`WorkspaceConfig::device_profile`] 构造出的 [`DeviceProfile`] 一定通过
+/// [`DeviceProfile::validate`]。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeviceProfileConfig {
+    /// 主机名覆盖；省略时 Profile 的 `hostname` 为 `None`（即不参与投影）。
+    pub hostname: Option<String>,
+    /// 设备标签，例如 `work`、`laptop`。
+    pub tags: BTreeSet<String>,
+    /// 本设备可用能力，例如 `pwsh`、`brew`。
+    pub capabilities: BTreeSet<String>,
 }
 
 /// 本设备配置。
@@ -124,11 +163,11 @@ impl DeviceConfig {
 
 /// 后端配置。
 ///
-/// M0 只有本地目录后端；用枚举而不是结构体，是为了让 M1 新增后端时，所有需要
-/// 分支处理的调用点都被编译器点名，而不是被一个默认分支悄悄吞掉。
+/// 用枚举而不是结构体，是为了让新增后端时，所有需要分支处理的调用点都被编译器
+/// 点名，而不是被一个默认分支悄悄吞掉。
 ///
-/// 这里**不加** `#[non_exhaustive]`：调用方用 `let BackendConfig::Local { .. } = ...`
-/// 解构是当前最自然的写法，新增变体时让它们编译失败正是我们想要的。
+/// 这里**不加** `#[non_exhaustive]`：调用方用 `match` 穷举是当前最自然的写法，
+/// 新增变体时让它们编译失败正是我们想要的。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendConfig {
     /// 本地目录后端（内容寻址对象库 + 引用文件）。
@@ -136,6 +175,49 @@ pub enum BackendConfig {
         /// 后端根目录的绝对路径。
         path: PathBuf,
     },
+    /// Git 后端：把内容寻址对象映射到普通 Git tree，用远端 branch head 做 CAS。
+    Git {
+        /// 远端 URL。已通过
+        /// [`validate_remote_url`](envsync_backend::git_auth::validate_remote_url)：
+        /// 不含 userinfo，也不带查询串，因此凭据不可能藏在配置里。
+        remote_url: String,
+        /// 受信分支名；省略时取
+        /// [`DEFAULT_BRANCH`](envsync_backend::git::DEFAULT_BRANCH)。
+        branch: String,
+        /// 私有 cache clone 的绝对路径；省略时取 `<state_dir>/git-cache`。
+        cache_dir: PathBuf,
+        /// 认证方式；只能是 `ssh-agent`、`credential-helper` 或 `token-secret-ref`。
+        auth: GitAuth,
+    },
+}
+
+impl BackendConfig {
+    /// 后端种类的稳定短名称，用于诊断与 CLI 输出。
+    pub fn kind(&self) -> &'static str {
+        match self {
+            BackendConfig::Local { .. } => "local",
+            BackendConfig::Git { .. } => "git",
+        }
+    }
+}
+
+/// 针对**单台设备**的资源覆盖。
+///
+/// 覆盖只能收窄或改写已有资源的落地方式，**不能**引入 Workspace 中不存在的资源：
+/// 投影阶段先按资源标识去 Snapshot 里找条目，找不到就没有任何可覆盖的对象。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResourceOverride {
+    /// 覆盖期望处置；省略时沿用全局取值。
+    pub disposition: Option<DesiredDisposition>,
+    /// 覆盖相对授权根的目标路径；省略时沿用全局取值。
+    pub target: Option<String>,
+}
+
+impl ResourceOverride {
+    /// 是否什么都没覆盖。
+    pub fn is_empty(&self) -> bool {
+        self.disposition.is_none() && self.target.is_none()
+    }
 }
 
 /// 单个资源的配置。
@@ -155,9 +237,38 @@ pub struct ResourceConfig {
     pub policy: ResourcePolicy,
     /// Managed Block 的注释前缀，默认 [`DEFAULT_COMMENT_PREFIX`]。
     pub comment_prefix: String,
+    /// 选择器：声明「哪些设备适用该资源」；`None` 表示全局资源。
+    ///
+    /// 解析期已通过 [`Selector::validate`]，因此可以直接求值。
+    pub selector: Option<Selector>,
+    /// device-id 级别的覆盖：十六进制设备标识 -> 覆盖内容。
+    ///
+    /// 键是 [`DeviceId`] 的十六进制文本，解析期已校验其合法性。
+    pub device_overrides: BTreeMap<String, ResourceOverride>,
 }
 
 impl ResourceConfig {
+    /// 查询针对某台设备的覆盖。
+    pub fn override_for(&self, device: DeviceId) -> Option<&ResourceOverride> {
+        self.device_overrides.get(&device.to_hex())
+    }
+
+    /// 应用某台设备的覆盖，得到该设备实际使用的资源配置。
+    ///
+    /// 没有覆盖时返回克隆的原配置；这让调用方可以无条件地使用返回值，而不必在
+    /// 两条路径之间做分支。
+    pub fn resolved_for(&self, device: DeviceId) -> ResourceConfig {
+        let mut resolved = self.clone();
+        if let Some(overrides) = self.override_for(device) {
+            if let Some(disposition) = overrides.disposition {
+                resolved.disposition = disposition;
+            }
+            if let Some(target) = &overrides.target {
+                resolved.target = target.clone();
+            }
+        }
+        resolved
+    }
     /// 转换为领域层的动作目标。
     ///
     /// 计划里只保存“根别名 + 相对分段”，绝不保存绝对路径——绝对路径既是本机信息
@@ -192,7 +303,7 @@ impl WorkspaceConfig {
         // 先只看版本号：版本不匹配时，后续字段的语义本就未知，继续按当前 schema
         // 解析只会产生误导性的字段级错误。
         let probe: VersionProbe = serde_yaml_ng::from_str(text).map_err(ConfigError::from_yaml)?;
-        if probe.version != CONFIG_VERSION {
+        if probe.version < MIN_CONFIG_VERSION || probe.version > CONFIG_VERSION {
             return Err(ConfigError::UnsupportedVersion {
                 found: probe.version,
                 supported: CONFIG_VERSION,
@@ -247,6 +358,48 @@ impl WorkspaceConfig {
         self.state_dir.join("backups")
     }
 
+    /// 冲突索引数据库路径。
+    ///
+    /// 刻意与草稿库**同一个文件**：[`envsync_storage::ConflictStore::resolve`] 需要在
+    /// `objects` 表里确认结果 Blob 确实存在，而那张表属于草稿库。分成两个文件会让
+    /// 这道检查永远失败。
+    pub fn conflict_db_path(&self) -> PathBuf {
+        self.draft_dir().join(envsync_storage::DATABASE_FILE_NAME)
+    }
+
+    /// 由配置构造本设备的 [`DeviceProfile`]。
+    ///
+    /// `os` / `arch` 来自编译期 `cfg`，`hostname` / `tags` / `capabilities` 来自
+    /// `profile` 段，`device` 取由种子派生的 [`DeviceId`]。
+    pub fn device_profile(&self) -> DeviceProfile {
+        let mut profile =
+            DeviceProfile::new(detected_os(), detected_arch()).with_device(self.device.device_id());
+        if let Some(hostname) = &self.profile.hostname {
+            profile = profile.with_hostname(hostname);
+        }
+        for tag in &self.profile.tags {
+            profile = profile.with_tag(tag);
+        }
+        for capability in &self.profile.capabilities {
+            profile = profile.with_capability(capability);
+        }
+        profile
+    }
+
+    /// 生成「已经套用本设备覆盖」的配置副本。
+    ///
+    /// 计划阶段使用它而不是原始配置：device-id 覆盖里的 `target` 只影响本机落地
+    /// 位置，绝不能改变共享 Snapshot 的内容。
+    pub fn for_device(&self, device: DeviceId) -> WorkspaceConfig {
+        let mut resolved = self.clone();
+        resolved.resources = self
+            .resources
+            .iter()
+            .map(|resource| resource.resolved_for(device))
+            .collect();
+        resolved
+    }
+
     /// 生成一份最小可用的初始配置（`envsync init` 用）。
     ///
     /// 生成结果满足全部校验规则：声明了一个名为 `home` 的授权根（取 `HOME` /
@@ -277,8 +430,41 @@ impl WorkspaceConfig {
             },
             state_dir: base_dir.join(DEFAULT_STATE_DIR),
             roots,
+            profile: DeviceProfileConfig::default(),
             resources: Vec::new(),
         }
+    }
+
+    /// 把一组资源单独序列化成 `resources:` YAML 片段。
+    ///
+    /// `envsync adapters discover` 用它产出**可直接粘贴进配置**的文本：输出的字段名、
+    /// 取值写法与 [`WorkspaceConfig::to_yaml`] 完全一致（同一套线格式类型），因此粘进
+    /// 配置文件后一定能被 [`WorkspaceConfig::parse_yaml`] 读回来——不会出现「文档教的
+    /// 写法和解析器接受的写法不一样」这类问题。
+    ///
+    /// 只序列化资源本身：授权根、后端、设备身份都不在片段里，粘贴不会覆盖用户已有的
+    /// 那些字段。
+    ///
+    /// 与 [`WorkspaceConfig::to_yaml`] 的一处差别：**取默认值的策略字段被省略**。
+    /// 理由有两条——
+    ///
+    /// 1. 片段是给人读、给人改的，`max_bytes: 16777216` 这类噪声只会淹没真正要看的
+    ///    `unix_mode` 与 `structured_format`；
+    /// 2. 全量写出会包含 `secret: false` 这一行，而 CLI 的脱敏器按**键名**工作，会把它
+    ///    渲染成 `secret: <redacted>`，粘贴回去就是一份解析不了的 YAML。省略默认值让
+    ///    这条键根本不出现，从而不必为了输出好看去削弱脱敏器。
+    ///
+    /// 省略是安全的：所有被省略的字段在解析时都会取回同一个默认值，往返语义不变。
+    pub fn resources_to_yaml(resources: &[ResourceConfig]) -> Result<String, ConfigError> {
+        let raw = ResourcesFragment {
+            resources: resources
+                .iter()
+                .map(RawResource::from_config_minimal)
+                .collect(),
+        };
+        serde_yaml_ng::to_string(&raw).map_err(|error| ConfigError::Serialize {
+            message: error.to_string(),
+        })
     }
 
     /// 序列化回 YAML（`envsync init` 写文件用）。
@@ -357,9 +543,16 @@ pub enum ConfigError {
         resource: String,
     },
 
-    /// 使用了 M0 尚未实现的文件模式。
-    #[error("资源 `{resource}` 使用的模式 `{mode}` 在 M0 尚未支持")]
-    ModeNotSupportedInM0 {
+    /// 使用了本实现不接受的文件模式。
+    ///
+    /// M1 起 `structured_merge` 已经放开；仍被拒绝的只有 `generated_include`。
+    /// 错误码保持 `config.mode_not_supported` 不变，避免破坏既有契约。
+    #[error(
+        "资源 `{resource}` 使用的模式 `{mode}` 不被支持：\
+         Generated Include 由适配器拆成 Full File + Managed Block 两个资源实现，\
+         见 docs/adapters.md"
+    )]
+    ModeNotSupported {
         /// 出问题的资源标识。
         resource: String,
         /// 被拒绝的模式名。
@@ -401,6 +594,73 @@ pub enum ConfigError {
     UnknownBackendKind {
         /// 配置里写的种类。
         kind: String,
+    },
+
+    /// 后端配置的字段与所声明的种类不匹配。
+    #[error("`{kind}` 后端的配置非法：{reason}")]
+    InvalidBackend {
+        /// 后端种类。
+        kind: &'static str,
+        /// 具体原因；只描述结构，绝不回显 URL 或凭据。
+        reason: String,
+    },
+
+    /// 在旧版本文档里使用了更高版本才引入的字段。
+    #[error("字段 `{field}` 需要配置版本 {since}，当前文档声明的是版本 {found}")]
+    FieldRequiresVersion {
+        /// 越界使用的字段。
+        field: &'static str,
+        /// 引入该字段的版本。
+        since: u32,
+        /// 文档自己声明的版本。
+        found: u32,
+    },
+
+    /// `profile` 段的取值不规范。
+    #[error("profile.{field} 非法：{source}")]
+    InvalidProfileValue {
+        /// 出错的字段名。
+        field: &'static str,
+        /// 领域层给出的具体原因。
+        #[source]
+        source: ProfileError,
+    },
+
+    /// 资源的选择器写法不对（不是单键映射、键未知、取值类型不对或嵌套过深）。
+    #[error("资源 `{resource}` 的 selector 写法不对：{reason}")]
+    InvalidSelectorShape {
+        /// 出问题的资源标识。
+        resource: String,
+        /// 具体原因。
+        reason: String,
+    },
+
+    /// 资源的选择器不合法（深度、节点数或取值不规范）。
+    #[error("资源 `{resource}` 的 selector 非法：{source}")]
+    InvalidSelector {
+        /// 出问题的资源标识。
+        resource: String,
+        /// 领域层给出的具体原因。
+        #[source]
+        source: ProfileError,
+    },
+
+    /// `device_overrides` 的键不是合法的设备标识。
+    #[error("资源 `{resource}` 的 device_overrides 键 `{key}` 不是合法的设备标识")]
+    InvalidDeviceOverrideKey {
+        /// 出问题的资源标识。
+        resource: String,
+        /// 非法的键。
+        key: String,
+    },
+
+    /// `device_overrides` 中出现了什么都不覆盖的空条目。
+    #[error("资源 `{resource}` 的 device_overrides 条目 `{key}` 没有覆盖任何字段")]
+    EmptyDeviceOverride {
+        /// 出问题的资源标识。
+        resource: String,
+        /// 空条目的键。
+        key: String,
     },
 
     /// YAML 语法或类型错误。
@@ -450,12 +710,19 @@ impl ConfigError {
             ConfigError::RootNotAbsolute { .. } => "config.root_not_absolute",
             ConfigError::NoRoots => "config.no_roots",
             ConfigError::StructuredWithoutFormat { .. } => "config.structured_without_format",
-            ConfigError::ModeNotSupportedInM0 { .. } => "config.mode_not_supported",
+            ConfigError::ModeNotSupported { .. } => "config.mode_not_supported",
             ConfigError::InvalidDeviceSeed { .. } => "config.invalid_device_seed",
             ConfigError::InvalidWorkspaceId => "config.invalid_workspace_id",
             ConfigError::InvalidResourceId { .. } => "config.invalid_resource_id",
             ConfigError::InvalidUnixMode { .. } => "config.invalid_unix_mode",
             ConfigError::UnknownBackendKind { .. } => "config.unknown_backend_kind",
+            ConfigError::InvalidBackend { .. } => "config.invalid_backend",
+            ConfigError::FieldRequiresVersion { .. } => "config.field_requires_version",
+            ConfigError::InvalidProfileValue { .. } => "config.invalid_profile_value",
+            ConfigError::InvalidSelector { .. } => "config.invalid_selector",
+            ConfigError::InvalidSelectorShape { .. } => "config.invalid_selector",
+            ConfigError::InvalidDeviceOverrideKey { .. } => "config.invalid_device_override_key",
+            ConfigError::EmptyDeviceOverride { .. } => "config.empty_device_override",
             ConfigError::Yaml { .. } => "config.yaml",
             ConfigError::Io { .. } => "config.io",
             ConfigError::NonUtf8Path { .. } => "config.non_utf8_path",
@@ -592,6 +859,182 @@ fn default_home_dir(base_dir: &Path) -> PathBuf {
     base_dir.to_path_buf()
 }
 
+// ---------------------------------------------------------------------------
+// 选择器的 YAML 写法
+//
+// 每个节点都是**单键映射**，键决定节点种类：
+//
+// ```yaml
+// selector:
+//   all:
+//     - os: windows
+//     - capability: pwsh
+//     - not:
+//         tag: server
+// ```
+//
+// 组合子：`all`（序列）、`any`（序列）、`not`（单个节点）；
+// 谓词：`os`、`arch`、`hostname`、`tag`、`capability`、`device`（都取字符串）。
+// ---------------------------------------------------------------------------
+
+/// 把 YAML 节点转成领域层选择器，并在**转换过程中**限制深度。
+///
+/// 深度检查必须发生在这里而不是留给之后的 `validate`：递归转换本身就会先把栈耗尽。
+fn selector_from_yaml(
+    value: &serde_yaml_ng::Value,
+    resource: &str,
+    depth: usize,
+) -> Result<Selector, ConfigError> {
+    if depth > MAX_SELECTOR_DEPTH {
+        return Err(selector_shape(
+            resource,
+            format!("嵌套深度超过上限 {MAX_SELECTOR_DEPTH}"),
+        ));
+    }
+    let mapping = value
+        .as_mapping()
+        .ok_or_else(|| selector_shape(resource, "选择器节点必须是映射".to_owned()))?;
+    if mapping.len() != 1 {
+        return Err(selector_shape(
+            resource,
+            format!("选择器节点必须正好有一个键，实际有 {} 个", mapping.len()),
+        ));
+    }
+    let (key, payload) = mapping
+        .iter()
+        .next()
+        .ok_or_else(|| selector_shape(resource, "选择器节点为空".to_owned()))?;
+    let key = key
+        .as_str()
+        .ok_or_else(|| selector_shape(resource, "选择器的键必须是字符串".to_owned()))?;
+
+    let children = |items: &serde_yaml_ng::Value| -> Result<Vec<Selector>, ConfigError> {
+        items
+            .as_sequence()
+            .ok_or_else(|| selector_shape(resource, format!("`{key}` 的取值必须是序列")))?
+            .iter()
+            .map(|item| selector_from_yaml(item, resource, depth + 1))
+            .collect()
+    };
+
+    Ok(match key {
+        "all" => Selector::All(children(payload)?),
+        "any" => Selector::Any(children(payload)?),
+        "not" => Selector::Not(Box::new(selector_from_yaml(payload, resource, depth + 1)?)),
+        _ => Selector::Is(predicate_from_yaml(key, payload, resource)?),
+    })
+}
+
+/// 把单个谓词键值对转成领域层谓词。
+fn predicate_from_yaml(
+    key: &str,
+    payload: &serde_yaml_ng::Value,
+    resource: &str,
+) -> Result<envsync_domain::Predicate, ConfigError> {
+    use envsync_domain::Predicate;
+
+    let text = payload
+        .as_str()
+        .ok_or_else(|| selector_shape(resource, format!("`{key}` 的取值必须是字符串")))?;
+    let invalid = |detail: String| selector_shape(resource, detail);
+
+    Ok(match key {
+        "os" => Predicate::Os(
+            Os::parse(text).ok_or_else(|| invalid(format!("未知的操作系统 `{text}`")))?,
+        ),
+        "arch" => Predicate::Arch(
+            Arch::parse(text).ok_or_else(|| invalid(format!("未知的架构 `{text}`")))?,
+        ),
+        "hostname" => Predicate::hostname(text).map_err(|source| ConfigError::InvalidSelector {
+            resource: resource.to_owned(),
+            source,
+        })?,
+        "tag" => Predicate::tag(text).map_err(|source| ConfigError::InvalidSelector {
+            resource: resource.to_owned(),
+            source,
+        })?,
+        "capability" => {
+            Predicate::capability(text).map_err(|source| ConfigError::InvalidSelector {
+                resource: resource.to_owned(),
+                source,
+            })?
+        }
+        "device" => Predicate::Device(
+            text.parse::<DeviceId>()
+                .map_err(|_| invalid(format!("`{text}` 不是合法的设备标识")))?,
+        ),
+        other => return Err(invalid(format!("未知的选择器键 `{other}`"))),
+    })
+}
+
+/// 把领域层选择器写回 YAML 的单键映射形式。
+fn selector_to_yaml(selector: &Selector) -> serde_yaml_ng::Value {
+    use envsync_domain::Predicate;
+    use serde_yaml_ng::Value;
+
+    let single = |key: &str, payload: Value| -> Value {
+        let mut mapping = serde_yaml_ng::Mapping::new();
+        mapping.insert(Value::String(key.to_owned()), payload);
+        Value::Mapping(mapping)
+    };
+
+    match selector {
+        Selector::All(items) => single(
+            "all",
+            Value::Sequence(items.iter().map(selector_to_yaml).collect()),
+        ),
+        Selector::Any(items) => single(
+            "any",
+            Value::Sequence(items.iter().map(selector_to_yaml).collect()),
+        ),
+        Selector::Not(inner) => single("not", selector_to_yaml(inner)),
+        Selector::Is(predicate) => {
+            let (key, text) = match predicate {
+                Predicate::Os(os) => ("os", os.as_str().to_owned()),
+                Predicate::Arch(arch) => ("arch", arch.as_str().to_owned()),
+                Predicate::Hostname(value) => ("hostname", value.clone()),
+                Predicate::Tag(value) => ("tag", value.clone()),
+                Predicate::Capability(value) => ("capability", value.clone()),
+                Predicate::Device(device) => ("device", device.to_hex()),
+            };
+            single(key, Value::String(text))
+        }
+    }
+}
+
+/// 构造「选择器写法不对」的错误。
+fn selector_shape(resource: &str, reason: String) -> ConfigError {
+    ConfigError::InvalidSelectorShape {
+        resource: resource.to_owned(),
+        reason,
+    }
+}
+
+/// 本次编译目标的操作系统。
+///
+/// 刻意**不从配置读取**：配置会被同步到所有设备，让它自报平台等于允许一台设备
+/// 冒充另一台，从而绕过按 `os` 编写的选择器。未收录的操作系统退化为
+/// [`Os::Linux`]——EnvSync 只在三大平台上做过验证，退化取值让程序仍可运行，而选择
+/// 器写 `os: linux` 时的行为是可预期的。
+pub fn detected_os() -> Os {
+    if cfg!(target_os = "macos") {
+        Os::MacOs
+    } else if cfg!(target_os = "windows") {
+        Os::Windows
+    } else {
+        Os::Linux
+    }
+}
+
+/// 本次编译目标的处理器架构；理由同 [`detected_os`]。
+pub fn detected_arch() -> Arch {
+    if cfg!(target_arch = "aarch64") {
+        Arch::Aarch64
+    } else {
+        Arch::X86_64
+    }
+}
+
 /// 路径转 UTF-8 字符串，用于序列化。
 fn path_to_string(path: &Path, context: &str) -> Result<String, ConfigError> {
     path.to_str()
@@ -625,7 +1068,19 @@ struct RawConfig {
     state_dir: Option<String>,
     #[serde(default)]
     roots: BTreeMap<String, String>,
+    /// 版本 2 起可用；版本 1 的文档里出现它会被拒绝。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    profile: Option<RawProfile>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    resources: Vec<RawResource>,
+}
+
+/// 只含 `resources:` 一个键的片段，供 [`WorkspaceConfig::resources_to_yaml`] 使用。
+///
+/// 刻意复用 [`RawResource`] 而不是另写一套序列化：片段的写法必须与完整配置逐字段一致，
+/// 否则「照抄 discover 的输出」就会写出解析不了的配置。
+#[derive(Serialize)]
+struct ResourcesFragment {
     resources: Vec<RawResource>,
 }
 
@@ -636,11 +1091,43 @@ struct RawDevice {
     seed_hex: String,
 }
 
+#[derive(Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct RawProfile {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hostname: Option<String>,
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    tags: BTreeSet<String>,
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    capabilities: BTreeSet<String>,
+}
+
+/// 后端线格式。
+///
+/// 所有子字段都是可选的，由 `kind` 决定哪些必须出现、哪些必须缺席；缺少或多写都
+/// 报错，绝不「按种类忽略无关字段」——那会让写错种类的配置静默地用上默认后端。
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawBackend {
     kind: String,
-    path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    remote_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cache_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auth: Option<RawGitAuth>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawGitAuth {
+    kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    secret_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -655,6 +1142,26 @@ struct RawResource {
     comment_prefix: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     policy: Option<RawPolicy>,
+    /// 版本 2 起可用。
+    ///
+    /// 这里刻意用 [`serde_yaml_ng::Value`] 而不是直接 `Selector`：领域层的
+    /// `Selector` 是外部标记（externally tagged）枚举，YAML 会把它写成 `!all` 这样的
+    /// **标签**，对手写配置极不友好。配置层因此定义自己的「单键映射」写法，并在
+    /// [`selector_from_yaml`] 里显式转换与限深。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    selector: Option<serde_yaml_ng::Value>,
+    /// 版本 2 起可用。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    device_overrides: BTreeMap<String, RawResourceOverride>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct RawResourceOverride {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disposition: Option<DesiredDisposition>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<String>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -730,15 +1237,7 @@ impl RawConfig {
             .map_err(|_| ConfigError::InvalidWorkspaceId)?;
 
         validate_seed(&self.device.seed_hex)?;
-
-        if self.backend.kind != "local" {
-            return Err(ConfigError::UnknownBackendKind {
-                kind: self.backend.kind,
-            });
-        }
-        let backend = BackendConfig::Local {
-            path: resolve_path(base_dir, Path::new(&self.backend.path)),
-        };
+        self.reject_future_fields()?;
 
         if self.roots.is_empty() {
             return Err(ConfigError::NoRoots);
@@ -756,6 +1255,10 @@ impl RawConfig {
             Some(raw) => resolve_path(base_dir, Path::new(&raw)),
             None => base_dir.join(DEFAULT_STATE_DIR),
         };
+
+        // 后端解析要用到 state_dir（Git cache 的默认位置），因此排在它之后。
+        let backend = self.backend.into_config(base_dir, &state_dir)?;
+        let profile = self.profile.unwrap_or_default().into_config()?;
 
         let mut seen: BTreeSet<ResourceId> = BTreeSet::new();
         let mut resources = Vec::with_capacity(self.resources.len());
@@ -779,13 +1282,50 @@ impl RawConfig {
             backend,
             state_dir,
             roots,
+            profile,
             resources,
         })
     }
 
+    /// 拒绝「旧版本文档里写了新版本字段」。
+    ///
+    /// 忽略它们比报错更危险：用户会以为选择器或 Git 后端已经生效，而实际上程序
+    /// 正在按全局资源和本地目录后端运行。
+    fn reject_future_fields(&self) -> Result<(), ConfigError> {
+        if self.version >= PROFILE_CONFIG_VERSION {
+            return Ok(());
+        }
+        let mut offender = None;
+        if self.profile.is_some() {
+            offender = Some("profile");
+        } else if self.backend.kind == "git" {
+            offender = Some("backend.kind=git");
+        } else if let Some(resource) = self
+            .resources
+            .iter()
+            .find(|resource| resource.selector.is_some())
+        {
+            let _ = resource;
+            offender = Some("resources[].selector");
+        } else if self
+            .resources
+            .iter()
+            .any(|resource| !resource.device_overrides.is_empty())
+        {
+            offender = Some("resources[].device_overrides");
+        }
+        match offender {
+            Some(field) => Err(ConfigError::FieldRequiresVersion {
+                field,
+                since: PROFILE_CONFIG_VERSION,
+                found: self.version,
+            }),
+            None => Ok(()),
+        }
+    }
+
     /// 强类型 -> 线格式。
     fn from_config(config: &WorkspaceConfig) -> Result<Self, ConfigError> {
-        let BackendConfig::Local { path } = &config.backend;
         let mut roots = BTreeMap::new();
         for (alias, path) in &config.roots {
             roots.insert(
@@ -806,13 +1346,169 @@ impl RawConfig {
                 name: config.device.name.clone(),
                 seed_hex: config.device.seed_hex.clone(),
             },
-            backend: RawBackend {
-                kind: "local".to_owned(),
-                path: path_to_string(path, "backend.path")?,
-            },
+            backend: RawBackend::from_config(&config.backend)?,
             state_dir: Some(path_to_string(&config.state_dir, "state_dir")?),
             roots,
+            profile: RawProfile::from_config(&config.profile),
             resources,
+        })
+    }
+}
+
+impl RawProfile {
+    /// 线格式 -> 强类型，逐项做规范化校验。
+    fn into_config(self) -> Result<DeviceProfileConfig, ConfigError> {
+        // 借领域层的构造器做校验：它对 trim、空值、长度和数量的判断与投影时完全一致。
+        let mut probe = DeviceProfile::new(detected_os(), detected_arch());
+        if let Some(hostname) = &self.hostname {
+            probe = probe
+                .try_with_hostname(hostname.clone())
+                .map_err(|source| ConfigError::InvalidProfileValue {
+                    field: "hostname",
+                    source,
+                })?;
+        }
+        for tag in &self.tags {
+            probe = probe.try_with_tag(tag.clone()).map_err(|source| {
+                ConfigError::InvalidProfileValue {
+                    field: "tags",
+                    source,
+                }
+            })?;
+        }
+        for capability in &self.capabilities {
+            probe = probe
+                .try_with_capability(capability.clone())
+                .map_err(|source| ConfigError::InvalidProfileValue {
+                    field: "capabilities",
+                    source,
+                })?;
+        }
+        probe
+            .validate()
+            .map_err(|source| ConfigError::InvalidProfileValue {
+                field: "profile",
+                source,
+            })?;
+
+        Ok(DeviceProfileConfig {
+            hostname: probe.hostname,
+            tags: probe.tags,
+            capabilities: probe.capabilities,
+        })
+    }
+
+    /// 强类型 -> 线格式。
+    fn from_config(profile: &DeviceProfileConfig) -> Option<Self> {
+        if profile.hostname.is_none() && profile.tags.is_empty() && profile.capabilities.is_empty()
+        {
+            return None;
+        }
+        Some(RawProfile {
+            hostname: profile.hostname.clone(),
+            tags: profile.tags.clone(),
+            capabilities: profile.capabilities.clone(),
+        })
+    }
+}
+
+impl RawBackend {
+    /// 线格式 -> 强类型：按 `kind` 决定必须出现和必须缺席的字段。
+    fn into_config(self, base_dir: &Path, state_dir: &Path) -> Result<BackendConfig, ConfigError> {
+        match self.kind.as_str() {
+            "local" => {
+                let path = self.path.ok_or(ConfigError::InvalidBackend {
+                    kind: "local",
+                    reason: "缺少 `path`".to_owned(),
+                })?;
+                for (field, present) in [
+                    ("remote_url", self.remote_url.is_some()),
+                    ("branch", self.branch.is_some()),
+                    ("cache_dir", self.cache_dir.is_some()),
+                    ("auth", self.auth.is_some()),
+                ] {
+                    if present {
+                        return Err(ConfigError::InvalidBackend {
+                            kind: "local",
+                            reason: format!("`{field}` 只属于 git 后端"),
+                        });
+                    }
+                }
+                Ok(BackendConfig::Local {
+                    path: resolve_path(base_dir, Path::new(&path)),
+                })
+            }
+            "git" => {
+                if self.path.is_some() {
+                    return Err(ConfigError::InvalidBackend {
+                        kind: "git",
+                        reason: "`path` 只属于 local 后端；请用 `remote_url`".to_owned(),
+                    });
+                }
+                let remote_url = self.remote_url.ok_or(ConfigError::InvalidBackend {
+                    kind: "git",
+                    reason: "缺少 `remote_url`".to_owned(),
+                })?;
+                // 校验只回显静态原因，绝不把 URL 拼进错误信息——它可能带凭据。
+                validate_remote_url(&remote_url).map_err(|error| ConfigError::InvalidBackend {
+                    kind: "git",
+                    reason: error.to_string(),
+                })?;
+                let auth = self.auth.ok_or(ConfigError::InvalidBackend {
+                    kind: "git",
+                    reason: format!("缺少 `auth`；可选值：{}", GitAuth::KINDS.join("、")),
+                })?;
+                let auth =
+                    GitAuth::parse(&auth.kind, auth.secret_id.as_deref()).map_err(|error| {
+                        ConfigError::InvalidBackend {
+                            kind: "git",
+                            reason: error.to_string(),
+                        }
+                    })?;
+                Ok(BackendConfig::Git {
+                    remote_url,
+                    branch: self.branch.unwrap_or_else(|| DEFAULT_GIT_BRANCH.to_owned()),
+                    cache_dir: match self.cache_dir {
+                        Some(raw) => resolve_path(base_dir, Path::new(&raw)),
+                        None => state_dir.join(DEFAULT_GIT_CACHE_DIR),
+                    },
+                    auth,
+                })
+            }
+            _ => Err(ConfigError::UnknownBackendKind { kind: self.kind }),
+        }
+    }
+
+    /// 强类型 -> 线格式。
+    fn from_config(backend: &BackendConfig) -> Result<Self, ConfigError> {
+        Ok(match backend {
+            BackendConfig::Local { path } => RawBackend {
+                kind: "local".to_owned(),
+                path: Some(path_to_string(path, "backend.path")?),
+                remote_url: None,
+                branch: None,
+                cache_dir: None,
+                auth: None,
+            },
+            BackendConfig::Git {
+                remote_url,
+                branch,
+                cache_dir,
+                auth,
+            } => RawBackend {
+                kind: "git".to_owned(),
+                path: None,
+                remote_url: Some(remote_url.clone()),
+                branch: Some(branch.clone()),
+                cache_dir: Some(path_to_string(cache_dir, "backend.cache_dir")?),
+                auth: Some(RawGitAuth {
+                    kind: auth.kind().to_owned(),
+                    secret_id: match auth {
+                        GitAuth::TokenSecretRef { secret_id } => Some(secret_id.clone()),
+                        _ => None,
+                    },
+                }),
+            },
         })
     }
 }
@@ -854,27 +1550,67 @@ impl RawResource {
         }
         policy.structured_format = raw_policy.structured_format;
 
-        // 先报“缺少格式”，再报“模式未实现”：前者是配置本身自相矛盾，
-        // 无论哪个里程碑都是错的；后者只是当前版本的能力边界。
+        // 先报“缺少格式”，再报“模式不被支持”：前者是配置本身自相矛盾（声明了结构化
+        // 合并却没说用哪种语法），无论哪个里程碑都是错的；后者是本实现的能力边界。
         if self.mode == FileMode::StructuredMerge && policy.structured_format.is_none() {
             return Err(ConfigError::StructuredWithoutFormat {
                 resource: id.to_string(),
             });
         }
         match self.mode {
-            FileMode::StructuredMerge => {
-                return Err(ConfigError::ModeNotSupportedInM0 {
-                    resource: id.to_string(),
-                    mode: "structured_merge",
-                })
-            }
+            // Generated Include 不是一种渲染模式，而是「生成独立文件 + 向主配置注入
+            // include」这两件事的组合；内建适配器把它拆成 Full File 与 Managed Block
+            // 两个资源实现，因此配置层没有它对应的落地语义。
             FileMode::GeneratedInclude => {
-                return Err(ConfigError::ModeNotSupportedInM0 {
+                return Err(ConfigError::ModeNotSupported {
                     resource: id.to_string(),
                     mode: "generated_include",
                 })
             }
-            FileMode::FullFile | FileMode::ManagedBlock => {}
+            FileMode::FullFile | FileMode::ManagedBlock | FileMode::StructuredMerge => {}
+        }
+
+        // 选择器来自会被同步到所有设备的配置，是不可信输入：转换时限深，转换后再
+        // 校验一次深度、节点数与取值规范性。
+        let selector = match &self.selector {
+            Some(raw) => {
+                let selector = selector_from_yaml(raw, &id.to_string(), 1)?;
+                selector
+                    .validate()
+                    .map_err(|source| ConfigError::InvalidSelector {
+                        resource: id.to_string(),
+                        source,
+                    })?;
+                Some(selector)
+            }
+            None => None,
+        };
+
+        let mut device_overrides = BTreeMap::new();
+        for (key, raw_override) in self.device_overrides {
+            // 键必须是合法设备标识：拼错的键会静默失效，那是最难排查的一类问题。
+            key.parse::<DeviceId>()
+                .map_err(|_| ConfigError::InvalidDeviceOverrideKey {
+                    resource: id.to_string(),
+                    key: key.clone(),
+                })?;
+            let overrides = ResourceOverride {
+                disposition: raw_override.disposition,
+                target: raw_override.target,
+            };
+            if overrides.is_empty() {
+                return Err(ConfigError::EmptyDeviceOverride {
+                    resource: id.to_string(),
+                    key,
+                });
+            }
+            if let Some(target) = &overrides.target {
+                RelativeTarget::parse(target).map_err(|source| ConfigError::InvalidTarget {
+                    resource: id.to_string(),
+                    source,
+                })?;
+            }
+            device_overrides.insert(key, overrides);
         }
 
         // disposition 与 blob 的组合一致性属于快照语义，由
@@ -891,7 +1627,58 @@ impl RawResource {
             comment_prefix: self
                 .comment_prefix
                 .unwrap_or_else(|| DEFAULT_COMMENT_PREFIX.to_owned()),
+            selector,
+            device_overrides,
         })
+    }
+
+    /// 强类型 -> 线格式，**省略一切取默认值的字段**。
+    ///
+    /// 供 [`WorkspaceConfig::resources_to_yaml`] 产出可粘贴的片段；理由见那里的文档。
+    /// 省略后的片段与全量写法解析结果完全相同。
+    fn from_config_minimal(resource: &ResourceConfig) -> Self {
+        let default_policy = ResourcePolicy::default();
+        let policy = RawPolicy {
+            max_bytes: (resource.policy.max_bytes != default_policy.max_bytes)
+                .then_some(resource.policy.max_bytes),
+            line_ending: (resource.policy.line_ending != default_policy.line_ending)
+                .then_some(resource.policy.line_ending),
+            unix_mode: resource.policy.unix_mode.map(RawUnixMode::from_mode),
+            // `secret: false` 是默认值，因此非秘密资源根本不会写出这一行。
+            secret: (resource.policy.secret != default_policy.secret)
+                .then_some(resource.policy.secret),
+            structured_format: resource.policy.structured_format,
+        };
+        let policy_is_default = policy.max_bytes.is_none()
+            && policy.line_ending.is_none()
+            && policy.unix_mode.is_none()
+            && policy.secret.is_none()
+            && policy.structured_format.is_none();
+
+        RawResource {
+            id: resource.id.to_string(),
+            root: resource.root.clone(),
+            target: resource.target.clone(),
+            mode: resource.mode,
+            disposition: resource.disposition,
+            comment_prefix: (resource.comment_prefix != DEFAULT_COMMENT_PREFIX)
+                .then(|| resource.comment_prefix.clone()),
+            policy: (!policy_is_default).then_some(policy),
+            selector: resource.selector.as_ref().map(selector_to_yaml),
+            device_overrides: resource
+                .device_overrides
+                .iter()
+                .map(|(key, overrides)| {
+                    (
+                        key.clone(),
+                        RawResourceOverride {
+                            disposition: overrides.disposition,
+                            target: overrides.target.clone(),
+                        },
+                    )
+                })
+                .collect(),
+        }
     }
 
     /// 强类型 -> 线格式。策略字段全量写出，保证往返一致。
@@ -910,6 +1697,20 @@ impl RawResource {
                 secret: Some(resource.policy.secret),
                 structured_format: resource.policy.structured_format,
             }),
+            selector: resource.selector.as_ref().map(selector_to_yaml),
+            device_overrides: resource
+                .device_overrides
+                .iter()
+                .map(|(key, overrides)| {
+                    (
+                        key.clone(),
+                        RawResourceOverride {
+                            disposition: overrides.disposition,
+                            target: overrides.target.clone(),
+                        },
+                    )
+                })
+                .collect(),
         }
     }
 }

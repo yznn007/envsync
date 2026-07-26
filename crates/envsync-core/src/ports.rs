@@ -83,6 +83,13 @@ pub struct ActionReceipt {
     pub applied_digest: Option<Digest32>,
     /// 回滚能力。
     pub guarantee: RollbackCapability,
+    /// 本次写入新创建的中间目录（相对授权根的路径）。
+    ///
+    /// 它**不会**被写进 journal：`envsync_storage::Receipt` 的字段集合属于已发布的
+    /// 存储 schema，为一条纯诊断信息升一次 schema 版本并不划算。因此从 journal 读回
+    /// 的收据这一项恒为空，留痕由写入与回滚时的 `tracing` 记录承担——它本来也只用于
+    /// 人工排查「这些目录是谁建的」，不参与任何判定。
+    pub created_dirs: Vec<String>,
 }
 
 /// 文件变更端口：执行单个动作、验证结果、回滚。
@@ -185,7 +192,13 @@ pub mod platform {
         ) -> CoreResult<Option<Digest32>> {
             let root = self.roots.get(&target.root)?;
             let relative = RelativeTarget::from_action_target(target)?;
-            let resolved = root.resolve(&relative)?;
+            // 中间目录不存在 ⇒ 目标不存在。这里**不**用 `resolve_for_create`：只是想知道
+            // 一个摘要，不该顺手在用户磁盘上造目录。
+            let resolved = match root.resolve(&relative) {
+                Ok(resolved) => resolved,
+                Err(error) if error.is_not_found() => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
             Ok(FileReader::current_digest(&resolved, policy.max_bytes)?)
         }
     }
@@ -220,9 +233,17 @@ pub mod platform {
     impl FileMutator for PlatformMutator {
         fn preflight(&self, action: &Action) -> CoreResult<()> {
             let (root, relative) = self.resolve(action)?;
-            // 只解析路径 + 读取当前摘要，绝不写入。
-            let resolved = root.resolve(&relative)?;
-            let current = FileReader::current_digest(&resolved, ResourcePolicy::DEFAULT_MAX_BYTES)?;
+            // 只解析路径 + 读取当前摘要，**绝不写入**，因此这里刻意用 `resolve` 而不是
+            // `resolve_for_create`：预检不该有任何副作用。中间目录不存在意味着目标不存在，
+            // 这对「即将创建它」的动作来说恰恰是期望中的状态，真正的建目录发生在
+            // `apply` 里。
+            let current = match root.resolve(&relative) {
+                Ok(resolved) => {
+                    FileReader::current_digest(&resolved, ResourcePolicy::DEFAULT_MAX_BYTES)?
+                }
+                Err(error) if error.is_not_found() => None,
+                Err(error) => return Err(error.into()),
+            };
             if current != action.expected_before {
                 return Err(CoreError::Platform(
                     envsync_platform::PlatformError::StaleObservation {
@@ -266,6 +287,7 @@ pub mod platform {
                 original_digest: receipt.original_digest,
                 applied_digest: receipt.applied_digest,
                 guarantee: receipt.guarantee,
+                created_dirs: receipt.created_dirs,
             })
         }
 
@@ -281,7 +303,13 @@ pub mod platform {
 
         fn cleanup_staged(&self, operation: OperationId, action: &Action) -> CoreResult<usize> {
             let (root, relative) = self.resolve(action)?;
-            let resolved = root.resolve(&relative)?;
+            // 中间目录不存在时没有任何暂存文件可清理，不是错误；这里也**绝不**为了
+            // 清理而把目录建出来。
+            let resolved = match root.resolve(&relative) {
+                Ok(resolved) => resolved,
+                Err(error) if error.is_not_found() => return Ok(0),
+                Err(error) => return Err(error.into()),
+            };
             let prefix = format!(
                 "{}{}-",
                 envsync_platform::TEMP_FILE_PREFIX,
@@ -311,6 +339,7 @@ pub mod platform {
                 original_digest: receipt.original_digest,
                 applied_digest: receipt.applied_digest,
                 guarantee: receipt.guarantee,
+                created_dirs: receipt.created_dirs.clone(),
             };
             self.writer.rollback(&platform_receipt, root, &relative)?;
             Ok(())

@@ -771,3 +771,310 @@ fn verify_reports_mismatch_without_leaking_paths() {
     );
     assert!(!error.to_string().contains(std::path::MAIN_SEPARATOR));
 }
+
+// ---------------------------------------------------------------------------
+// 中间目录的按需创建
+//
+// 复现场景：资源 `target: .config/work-vpn.conf`，而设备上 `~/.config/` 根本不存在。
+// 在此之前，`AuthorizedRoot::resolve` 会以 `NotFound` 失败，整条 `sync` 退出码 1。
+// 现在写入路径按需创建中间目录，但**只在授权根内**，且逐段仍做 no-follow 检查。
+// ---------------------------------------------------------------------------
+
+/// 目标文件的 POSIX 权限位；非 unix 平台上返回 `None`。
+#[cfg(unix)]
+fn mode_of(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .ok()
+        .map(|metadata| metadata.permissions().mode() & 0o7777)
+}
+
+#[cfg(not(unix))]
+fn mode_of(_path: &Path) -> Option<u32> {
+    None
+}
+
+/// 多级中间目录会被逐段创建，内容与收据都正确。
+#[test]
+fn write_creates_missing_intermediate_directories() {
+    let fixture = Fixture::new();
+    let resource = resource();
+    let target = target(".config/envsync/nested/work-vpn.conf");
+    let writer = fixture.writer();
+
+    assert!(!fixture.exists(".config"), "前提：中间目录一开始不存在");
+
+    let receipt = writer
+        .apply_write(&write_request(
+            OperationId::generate(),
+            &resource,
+            &fixture.root,
+            &target,
+            b"endpoint = vpn.corp.example\n",
+            None,
+        ))
+        .expect("中间目录缺失不应让写入失败");
+
+    assert_eq!(
+        fixture.read(".config/envsync/nested/work-vpn.conf"),
+        b"endpoint = vpn.corp.example\n"
+    );
+    // 收据按创建顺序记录每一段，且只含相对路径——绝不泄露本机绝对路径。
+    assert_eq!(
+        receipt.created_dirs,
+        vec![
+            ".config".to_owned(),
+            ".config/envsync".to_owned(),
+            ".config/envsync/nested".to_owned(),
+        ]
+    );
+    assert!(receipt
+        .created_dirs
+        .iter()
+        .all(|dir| !dir.starts_with(std::path::MAIN_SEPARATOR)));
+
+    // 普通资源的新建目录是 0o755。
+    if cfg!(unix) {
+        for dir in [".config", ".config/envsync", ".config/envsync/nested"] {
+            assert_eq!(
+                mode_of(&fixture.base().join(dir)),
+                Some(0o755),
+                "{dir} 的权限位应当是 0o755"
+            );
+        }
+    }
+}
+
+/// 中间某段已经是符号链接时拒绝写入，且**绝不**在链接指向的目标里造目录。
+#[test]
+#[cfg(unix)]
+fn write_refuses_when_an_intermediate_segment_is_a_symlink() {
+    let fixture = Fixture::new();
+    let outside = tempfile::tempdir().expect("创建授权根之外的目录");
+    std::os::unix::fs::symlink(outside.path(), fixture.base().join(".config"))
+        .expect("把 .config 做成指向授权根之外的符号链接");
+
+    let resource = resource();
+    let target = target(".config/envsync/work-vpn.conf");
+    let error = fixture
+        .writer()
+        .apply_write(&write_request(
+            OperationId::generate(),
+            &resource,
+            &fixture.root,
+            &target,
+            b"x\n",
+            None,
+        ))
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            &error,
+            PlatformError::SymlinkRejected { segment, index, .. }
+                if segment == ".config" && *index == 0
+        ),
+        "{error:?}"
+    );
+    // 拒绝必须是彻底的：链接指向的目录里不能多出任何东西。
+    assert!(
+        std::fs::read_dir(outside.path())
+            .expect("列目录")
+            .next()
+            .is_none(),
+        "绝不能穿过符号链接在授权根之外创建目录或文件"
+    );
+}
+
+/// 已存在的中间目录权限一个 bit 都不改。
+#[test]
+#[cfg(unix)]
+fn write_never_touches_permissions_of_existing_directories() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new();
+    let existing = fixture.base().join(".config");
+    std::fs::create_dir(&existing).expect("预先建好 .config");
+    // 一个刻意与默认值不同的权限位。
+    std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o731))
+        .expect("设置目录权限");
+
+    let resource = resource();
+    let target = target(".config/envsync/work-vpn.conf");
+    let receipt = fixture
+        .writer()
+        .apply_write(&write_request(
+            OperationId::generate(),
+            &resource,
+            &fixture.root,
+            &target,
+            b"x\n",
+            None,
+        ))
+        .expect("写入成功");
+
+    assert_eq!(
+        mode_of(&existing),
+        Some(0o731),
+        "已存在的目录是用户的，权限位必须原样保留"
+    );
+    assert_eq!(
+        receipt.created_dirs,
+        vec![".config/envsync".to_owned()],
+        "只有真正新建的那一段才进收据"
+    );
+}
+
+/// 秘密资源的父目录收紧到 0o700，文件本身仍是 0o600。
+#[test]
+#[cfg(unix)]
+fn secret_resources_get_owner_only_parent_directories() {
+    let fixture = Fixture::new();
+    let resource = resource();
+    let target = target(".secrets/envsync/token.conf");
+
+    let mut request = write_request(
+        OperationId::generate(),
+        &resource,
+        &fixture.root,
+        &target,
+        b"token = s3cr3t\n",
+        None,
+    );
+    request.secret = true;
+
+    fixture.writer().apply_write(&request).expect("写入成功");
+
+    for dir in [".secrets", ".secrets/envsync"] {
+        assert_eq!(
+            mode_of(&fixture.base().join(dir)),
+            Some(0o700),
+            "{dir}：秘密资源的父目录必须只有属主能进入"
+        );
+    }
+    assert_eq!(
+        mode_of(&fixture.base().join(".secrets/envsync/token.conf")),
+        Some(0o600),
+        "秘密文件本身仍是 0o600"
+    );
+}
+
+/// 删除动作**不**创建目录：中间目录缺失即幂等成功。
+#[test]
+fn delete_never_creates_directories() {
+    let fixture = Fixture::new();
+    let resource = resource();
+    let target = target(".config/envsync/gone.conf");
+
+    let receipt = fixture
+        .writer()
+        .apply_delete(&DeleteRequest {
+            operation: OperationId::generate(),
+            resource: &resource,
+            root: &fixture.root,
+            target: &target,
+            expected_before: None,
+        })
+        .expect("目标不存在时删除是幂等成功");
+
+    assert_eq!(receipt.original_digest, None);
+    assert_eq!(receipt.applied_digest, None);
+    assert!(receipt.created_dirs.is_empty());
+    assert!(
+        !fixture.exists(".config"),
+        "删除绝不能为了删一个不存在的文件而把父目录造出来"
+    );
+}
+
+/// 删除时期望目标存在、但连中间目录都没有：这是观察过期，不是幂等成功。
+#[test]
+fn delete_with_stale_expectation_reports_stale_observation() {
+    let fixture = Fixture::new();
+    let resource = resource();
+    let target = target(".config/envsync/gone.conf");
+
+    let error = fixture
+        .writer()
+        .apply_delete(&DeleteRequest {
+            operation: OperationId::generate(),
+            resource: &resource,
+            root: &fixture.root,
+            target: &target,
+            expected_before: Some(Digest32::ZERO),
+        })
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            error,
+            PlatformError::StaleObservation {
+                actual: None,
+                expected: Some(_)
+            }
+        ),
+        "{error:?}"
+    );
+    assert!(!fixture.exists(".config"));
+}
+
+/// 回滚保留写入时创建的空目录：宁可留下几个 inode，也不冒险删掉用户的目录。
+#[test]
+fn rollback_keeps_directories_created_by_the_write() {
+    let fixture = Fixture::new();
+    let resource = resource();
+    let target = target(".config/envsync/work-vpn.conf");
+    let writer = fixture.writer();
+
+    let receipt = writer
+        .apply_write(&write_request(
+            OperationId::generate(),
+            &resource,
+            &fixture.root,
+            &target,
+            b"endpoint = vpn.corp.example\n",
+            None,
+        ))
+        .expect("写入成功");
+    assert_eq!(
+        receipt.created_dirs,
+        vec![".config".to_owned(), ".config/envsync".to_owned()]
+    );
+
+    writer
+        .rollback(&receipt, &fixture.root, &target)
+        .expect("原本不存在 ⇒ 回滚即删除文件");
+
+    assert!(
+        !fixture.exists(".config/envsync/work-vpn.conf"),
+        "文件已删除"
+    );
+    assert!(fixture.exists(".config/envsync"), "目录被刻意保留");
+    assert!(fixture.exists(".config"), "目录被刻意保留");
+}
+
+/// 读取路径仍然拒绝创建目录：`resolve` 的语义没有被改动。
+#[test]
+fn plain_resolve_still_refuses_to_create_directories() {
+    let fixture = Fixture::new();
+    let target = target(".config/envsync/work-vpn.conf");
+
+    let error = fixture.root.resolve(&target).unwrap_err();
+    assert!(error.is_not_found(), "{error:?}");
+    assert!(!fixture.exists(".config"));
+
+    // 显式的 create 变体才会建目录，并把新建的每一段报告出来。
+    let resolved = fixture
+        .root
+        .resolve_for_create(&target, envsync_platform::DEFAULT_DIR_MODE)
+        .expect("显式请求创建时成功");
+    assert_eq!(
+        resolved.created_dirs(),
+        [".config".to_owned(), ".config/envsync".to_owned()]
+    );
+    // 幂等：再解析一次不会重复报告。
+    let again = fixture
+        .root
+        .resolve_for_create(&target, envsync_platform::DEFAULT_DIR_MODE)
+        .expect("目录已存在时同样成功");
+    assert!(again.created_dirs().is_empty());
+}

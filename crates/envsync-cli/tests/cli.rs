@@ -130,6 +130,9 @@ impl Workspace {
             disposition: DesiredDisposition::Managed,
             policy: ResourcePolicy::default(),
             comment_prefix: "# ".to_owned(),
+            // M1 新增：默认是「全局资源、无设备覆盖」。
+            selector: None,
+            device_overrides: std::collections::BTreeMap::new(),
         });
         self.write_config(&config);
     }
@@ -371,7 +374,8 @@ fn status_json_shape_is_locked() {
         keys(&value),
         ["command", "data", "diagnostics", "schema_version", "status"]
     );
-    assert_eq!(value["schema_version"], 1);
+    // M1 起默认输出 schema v2；v1 形状由 `--schema-version 1` 显式请求（见 m1_cli.rs）。
+    assert_eq!(value["schema_version"], 2);
     assert_eq!(value["command"], "status");
     assert_eq!(value["status"], "ok");
 
@@ -380,9 +384,16 @@ fn status_json_shape_is_locked() {
         keys(&value["data"]),
         [
             "backend_kind",
+            // 后端不可达时的降级作答标记（schema v2 新增）：为 false 时
+            // revision/head 是本地记录的上次已知状态，而不是远端此刻的内容。
+            "backend_reachable",
             "device",
             "draft_head",
             "head",
+            // 这份「上次已知状态」有多旧；后端可达时为 null（schema v2 新增）。
+            "last_known_revision_at_unix_ms",
+            // M1（schema v2）新增；v1 形状里没有它，见 m1_cli.rs 的 golden 测试。
+            "open_conflicts",
             "pending_actions",
             "resources",
             "revision",
