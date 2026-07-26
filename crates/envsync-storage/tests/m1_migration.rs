@@ -140,8 +140,9 @@ fn m0_database_upgrades_to_v2_without_losing_data() {
     assert_eq!(raw_schema_version(&path), "1");
 
     let journal = Journal::open(&path).expect("升级并打开");
-    assert_eq!(journal.schema_version().expect("版本"), 2);
-    assert_eq!(SCHEMA_VERSION, 2);
+    // 断言写成「升到当前版本」而不是写死某个数字：后续里程碑还会继续加迁移脚本，
+    // 这条测试关心的是「M0 数据在升级后仍然完好」，而不是版本号本身。
+    assert_eq!(journal.schema_version().expect("版本"), SCHEMA_VERSION);
 
     // M0 数据必须一字不差地留在原处。
     let record = journal

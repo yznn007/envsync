@@ -11,6 +11,7 @@ authors.workspace = true
 [dependencies]
 envsync-domain.workspace = true
 envsync-backend.workspace = true
+envsync-crypto.workspace = true
 envsync-platform.workspace = true
 envsync-storage.workspace = true
 serde.workspace = true

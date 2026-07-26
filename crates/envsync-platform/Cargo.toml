@@ -1,6 +1,6 @@
 [package]
 name = "envsync-platform"
-description = "EnvSync 平台层：能力约束的文件读写"
+description = "EnvSync 平台层：能力约束的文件读写与系统安全存储"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,11 +8,27 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+# 仅供测试：暴露 `InMemorySecureStore` 内存 fake 与错误映射探针。
+# 生产构建**绝不能**开启；`[dev-dependencies]` 中的自引用会在 `cargo test`
+# 与 `cargo clippy --all-targets` 时自动启用它，而 `cargo build` 不会。
+test-support = []
+
 [dependencies]
 envsync-domain.workspace = true
 cap-std.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+# 系统凭据库：macOS Keychain / Windows Credential Manager / Linux Secret Service。
+# feature 组合在根 `[workspace.dependencies]` 里固定；缺任何一个都会让 `keyring`
+# 静默退回进程内 mock 后端，`secure_store` 的平台模块用编译期断言堵住了这条路。
+keyring.workspace = true
+zeroize.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
+uuid.workspace = true
+# 自引用 dev-dependency：让测试目标构建时自动打开 `test-support`，
+# 而普通 `cargo build` 保持关闭。
+envsync-platform = { path = ".", features = ["test-support"] }

@@ -15,6 +15,8 @@
 //! | [`render`] | Full File / Managed Block / Structured Merge 的纯函数渲染 |
 //! | [`planner`] | 由配置 + 目标状态 + 观察结果生成不可变计划 |
 //! | [`apply`] | 事务化应用引擎（preflight → publish → apply → verify → journal） |
+//! | [`membership`] | 设备成员签名链的纯函数验证器与编排 API（M2） |
+//! | [`checkpoint`] | 反回滚检查点：单调性判定与信任根（M2） |
 //! | [`mod@merge`] | 文本与结构化三方合并，只产出干净结果或显式 Conflict |
 //! | [`projection`] | Workspace 到 DeviceView 的纯函数投影 |
 //! | [`sync`] | fetch、合并基、三方合并与冲突裁决的编排 |
@@ -32,9 +34,11 @@
 //! 这一竞态可以被摘要比对完整捕获，而不需要在写入路径上再放一份业务逻辑。
 
 pub mod apply;
+pub mod checkpoint;
 pub mod config;
 pub mod error;
 pub mod last_known;
+pub mod membership;
 pub mod merge;
 pub mod offline;
 pub mod planner;
@@ -46,6 +50,10 @@ pub mod service;
 pub mod sync;
 
 pub use apply::{ApplyEngine, ApplyOutcome};
+pub use checkpoint::{
+    advance as advance_checkpoint, check_advance, Checkpoint, CheckpointError, CheckpointStore,
+    InMemoryCheckpointStore, SqliteCheckpointStore,
+};
 pub use config::{
     BackendConfig, ConfigError, DeviceConfig, DeviceProfileConfig, ResourceConfig,
     ResourceOverride, WorkspaceConfig,
@@ -54,6 +62,10 @@ pub use error::{CoreError, CoreResult};
 pub use last_known::{
     is_backend_error_unreachable, is_backend_unreachable, LastKnownRef, LastKnownRefStore,
     LAST_KNOWN_REF_FILE,
+};
+pub use membership::{
+    append as append_membership_event, create_genesis, membership_object_id, public_bytes,
+    verify_membership_chain, MembershipError, VerifiedHead, MEMBERSHIP_SIGNATURE_DOMAIN,
 };
 pub use merge::{
     merge, merge_structured, merge_structured_with, merge_text, IniPolicy, MergeError, MergeInput,

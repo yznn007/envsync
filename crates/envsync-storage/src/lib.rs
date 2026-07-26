@@ -9,6 +9,8 @@
 //! | [`journal`] | 操作日志：状态机、动作进度与回滚收据 |
 //! | [`draft`] | 本地草稿对象：未发布的 Blob/State Root/Snapshot 与计划 |
 //! | [`conflicts`] | 合并冲突的本地索引与状态 |
+//! | [`membership`] | 已验证成员事件的本地索引与链头（M2） |
+//! | [`checkpoints`] | 反回滚检查点的**审计副本**；权威副本在系统安全存储（M2） |
 //! | [`migrations`] | 数据库打开、PRAGMA 与 schema 迁移 |
 //!
 //! ## 三条不变量
@@ -37,15 +39,21 @@
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 
+pub mod checkpoints;
 pub mod conflicts;
 pub mod draft;
 pub mod journal;
+pub mod membership;
 pub mod migrations;
 
+pub use checkpoints::{CheckpointAudit, CheckpointRecord, CheckpointStoreError};
 pub use conflicts::{ConflictError, ConflictRecord, ConflictState, ConflictStore};
 pub use draft::{DraftError, DraftStore, DATABASE_FILE_NAME};
 pub use journal::{
     ActionRecord, ActionState, ErrorDetail, Journal, JournalError, OperationRecord, OperationState,
     Receipt, ReceiptRecord,
+};
+pub use membership::{
+    MembershipEventRecord, MembershipHead, MembershipIndex, MembershipStoreError,
 };
 pub use migrations::{StorageDiagnostics, SCHEMA_VERSION};
