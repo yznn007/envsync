@@ -50,8 +50,12 @@
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 
+pub mod git;
+pub mod git_auth;
 pub mod local;
 
+pub use git::{GitBackend, GitConfig};
+pub use git_auth::GitAuth;
 pub use local::LocalBackend;
 
 use envsync_domain::{CborError, ObjectId, WorkspaceId, WorkspaceRef};

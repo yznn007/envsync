@@ -1,6 +1,6 @@
 [package]
-name = "envsync-core"
-description = "EnvSync 核心服务：捕获、计划、应用、恢复"
+name = "envsync-adapters"
+description = "EnvSync 内建适配器：文件、Git 配置、Shell、终端"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,14 +10,8 @@ authors.workspace = true
 
 [dependencies]
 envsync-domain.workspace = true
-envsync-backend.workspace = true
+envsync-core.workspace = true
 envsync-platform.workspace = true
-envsync-storage.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-serde_yaml_ng.workspace = true
-similar.workspace = true
-toml_edit.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

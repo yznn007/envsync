@@ -8,6 +8,7 @@
 //! |---|---|
 //! | [`journal`] | 操作日志：状态机、动作进度与回滚收据 |
 //! | [`draft`] | 本地草稿对象：未发布的 Blob/State Root/Snapshot 与计划 |
+//! | [`conflicts`] | 合并冲突的本地索引与状态 |
 //! | [`migrations`] | 数据库打开、PRAGMA 与 schema 迁移 |
 //!
 //! ## 三条不变量
@@ -36,10 +37,12 @@
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 
+pub mod conflicts;
 pub mod draft;
 pub mod journal;
 pub mod migrations;
 
+pub use conflicts::{ConflictError, ConflictRecord, ConflictState, ConflictStore};
 pub use draft::{DraftError, DraftStore, DATABASE_FILE_NAME};
 pub use journal::{
     ActionRecord, ActionState, ErrorDetail, Journal, JournalError, OperationRecord, OperationState,

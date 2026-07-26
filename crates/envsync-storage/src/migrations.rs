@@ -16,6 +16,15 @@
 //! 迁移策略：`schema_meta` 表记录 `schema_version`。版本相同则直接返回（幂等）；
 //! 版本更低则在一个事务里执行迁移脚本并写入新版本号；版本**更高**则拒绝打开，
 //! 返回 [`JournalError::SchemaTooNew`]——旧版本程序改写新 schema 会造成不可逆的数据损坏。
+//!
+//! 升级是**逐级**进行的：从版本 N 打开的库依次执行 N+1、N+2 … 的脚本，全部脚本、
+//! 迁移后校验和版本号写入共处**同一个事务**。任何一步失败都整体回滚：库要么完整
+//! 停在旧版本，要么完整到达新版本，不存在“表建了一半、版本号却已经前进”的中间态。
+//!
+//! 脚本执行完还会在事务内做一次「迁移后校验」：逐张表查询它应有的列。
+//! 因为迁移脚本用的是 `CREATE TABLE IF NOT EXISTS`，若外部工具或更早的实验版本留下
+//! 了**同名但结构不同**的表，建表语句会被静默跳过，随后的读写才会以奇怪的方式失败。
+//! 迁移后校验把这种情况变成一次干净的回滚 + [`JournalError::Corrupt`]。
 
 use std::path::Path;
 
@@ -25,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use crate::journal::JournalError;
 
 /// 本版本支持的 schema 版本号。
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// `schema_meta` 中记录 schema 版本的键名。
 pub const SCHEMA_VERSION_KEY: &str = "schema_version";
@@ -38,6 +47,43 @@ const BUSY_TIMEOUT_MS: i64 = 5_000;
 
 /// 0001 迁移脚本，编译期内嵌，避免运行时依赖外部文件。
 const MIGRATION_0001: &str = include_str!("../migrations/0001_journal.sql");
+
+/// 0002 迁移脚本：设备 Profile 与合并冲突索引。
+const MIGRATION_0002: &str = include_str!("../migrations/0002_profiles_conflicts.sql");
+
+/// 迁移后校验用的探针：`(表名, 该版本必须存在的列)`。
+///
+/// 用 `SELECT <列> FROM <表> WHERE 0` 探测：不返回任何行，因此代价与表大小无关，
+/// 但只要有一列缺失就会立刻报错。
+const SCHEMA_PROBES: &[(&str, &str)] = &[
+    (
+        "operations",
+        "operation_id, plan_id, snapshot_id, workspace_id, revision, state, \
+         created_at_unix_ms, updated_at_unix_ms, error_code, error_message",
+    ),
+    (
+        "actions",
+        "operation_id, ordinal, resource_id, target, kind, state, \
+         expected_before_digest, expected_after_digest, error_code, error_message",
+    ),
+    (
+        "receipts",
+        "operation_id, ordinal, resource_id, backup_path, original_digest, \
+         applied_digest, guarantee, created_at_unix_ms",
+    ),
+    ("objects", "object_id, bytes"),
+    ("plans", "plan_id, bytes"),
+    ("draft_meta", "key, value"),
+    (
+        "profiles",
+        "device_id, os, arch, hostname, tags, capabilities, updated_at_unix_ms",
+    ),
+    (
+        "conflicts",
+        "conflict_id, workspace_id, resource_id, kind, base_blob, ours_blob, theirs_blob, \
+         state, resolution_choice, resolved_blob, created_at_unix_ms, resolved_at_unix_ms",
+    ),
+];
 
 /// 连接层运行时诊断，供 `envsync doctor` 与测试断言使用。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,7 +189,8 @@ fn migrate(connection: &Connection) -> Result<(), JournalError> {
          ) STRICT;",
     )?;
 
-    match read_schema_version(connection)? {
+    // `None` 表示这是一个全新的库，从版本 0 开始逐级建表。
+    let current = match read_schema_version(connection)? {
         Some(found) if found > SCHEMA_VERSION => {
             // 旧版本程序绝不能改写新 schema：宁可拒绝打开，也不能损坏用户数据。
             return Err(JournalError::SchemaTooNew {
@@ -152,19 +199,49 @@ fn migrate(connection: &Connection) -> Result<(), JournalError> {
             });
         }
         Some(found) if found == SCHEMA_VERSION => return Ok(()),
-        _ => {}
-    }
+        Some(found) => found,
+        None => 0,
+    };
 
-    // 建表与版本号写入必须原子：否则中途崩溃会留下“表建了一半，版本号却已更新”。
+    // 建表、校验与版本号写入必须原子：否则中途失败会留下“表建了一半，版本号却已更新”。
+    // `unchecked_transaction` 返回的守卫在提交前被丢弃时会自动 ROLLBACK，
+    // 因此下面任何一个 `?` 提前返回都会让数据库原封不动地停在旧版本。
     let transaction = connection.unchecked_transaction()?;
-    transaction.execute_batch(MIGRATION_0001)?;
+    if current < 1 {
+        transaction.execute_batch(MIGRATION_0001)?;
+    }
+    if current < 2 {
+        transaction.execute_batch(MIGRATION_0002)?;
+    }
+    verify_schema(&transaction)?;
     transaction.execute(
         "INSERT INTO schema_meta (key, value) VALUES (?1, ?2)
          ON CONFLICT (key) DO UPDATE SET value = excluded.value",
         rusqlite::params![SCHEMA_VERSION_KEY, SCHEMA_VERSION.to_string()],
     )?;
     transaction.commit()?;
-    tracing::debug!(version = SCHEMA_VERSION, "schema 已迁移到当前版本");
+    tracing::debug!(
+        from = current,
+        to = SCHEMA_VERSION,
+        "schema 已迁移到当前版本"
+    );
+    Ok(())
+}
+
+/// 迁移后校验：确认每张表都存在且带有本版本需要的全部列。
+///
+/// 迁移脚本用 `CREATE TABLE IF NOT EXISTS`（保证幂等），代价是**同名但结构不同**的表
+/// 会让建表语句被静默跳过。这里在事务内主动探测一次，把这种情况变成一次干净的回滚，
+/// 而不是等到某次真正的读写才以难以定位的方式失败。
+fn verify_schema(connection: &Connection) -> Result<(), JournalError> {
+    for (table, columns) in SCHEMA_PROBES {
+        let sql = format!("SELECT {columns} FROM {table} WHERE 0");
+        connection.prepare(&sql).map_err(|error| {
+            JournalError::Corrupt(format!(
+                "迁移后校验失败：表 `{table}` 缺失或结构不符（{error}）"
+            ))
+        })?;
+    }
     Ok(())
 }
 

@@ -11,6 +11,7 @@
 //! | [`id`] | 强类型标识符：随机 ID、派生 ID 与内容寻址 ID |
 //! | [`resource`] | 观察状态、期望处置、资源条目与写入策略 |
 //! | [`object`] | 内容寻址对象：Blob、State Root、Conflict |
+//! | [`profile`] | 设备 Profile、封闭选择器 AST、投影诊断与冲突解决方案 |
 //! | [`snapshot`] | 快照主体、签名与工作区引用 |
 //! | [`plan`] | 绑定观察结果的不可变计划 |
 //!
@@ -58,6 +59,7 @@ pub mod cbor;
 pub mod id;
 pub mod object;
 pub mod plan;
+pub mod profile;
 pub mod resource;
 pub mod snapshot;
 
@@ -73,6 +75,12 @@ pub use object::{
 pub use plan::{
     Action, ActionKind, ActionTarget, BackupPolicy, Diagnostic, Plan, Risk, RollbackCapability,
     Severity, VerifyRule, PLAN_FORMAT_VERSION,
+};
+pub use profile::{
+    Arch, ConflictResolution, DeviceProfile, Os, Predicate, ProfileError, ProjectionNote,
+    ProjectionNoteKind, ResolutionChoice, Selector, MAX_PROFILE_ENTRIES, MAX_PROFILE_VALUE_LEN,
+    MAX_SELECTOR_DEPTH, MAX_SELECTOR_NODES, PROFILE_FORMAT_VERSION, PROJECTION_NOTE_FORMAT_VERSION,
+    RESOLUTION_FORMAT_VERSION, SELECTOR_FORMAT_VERSION,
 };
 pub use resource::{
     DesiredDisposition, FileMode, LineEnding, Observation, ObservedState, PermissionSummary,

@@ -15,6 +15,7 @@
 //! | [`render`] | Full File / Managed Block 纯函数渲染 |
 //! | [`planner`] | 由配置 + 目标状态 + 观察结果生成不可变计划 |
 //! | [`apply`] | 事务化应用引擎（preflight → publish → apply → verify → journal） |
+//! | [`mod@merge`] | 文本与结构化三方合并，只产出干净结果或显式 Conflict |
 //! | [`recovery`] | 崩溃恢复与显式回滚 |
 //! | [`service`] | CLI 与桌面端共用的应用服务门面 |
 //! | [`ports`] | 时钟、观察、文件变更三个端口抽象及其平台实现 |
@@ -29,6 +30,7 @@
 pub mod apply;
 pub mod config;
 pub mod error;
+pub mod merge;
 pub mod planner;
 pub mod ports;
 pub mod recovery;
@@ -38,6 +40,11 @@ pub mod service;
 pub use apply::{ApplyEngine, ApplyOutcome};
 pub use config::{BackendConfig, ConfigError, DeviceConfig, ResourceConfig, WorkspaceConfig};
 pub use error::{CoreError, CoreResult};
+pub use merge::{
+    merge, merge_structured, merge_structured_with, merge_text, IniPolicy, MergeError, MergeInput,
+    MergeOptions, MergeProvenance, MergeResult, MultiValuePolicy, MAX_INPUT_BYTES, MAX_NODES,
+    MAX_PARSE_DEPTH,
+};
 pub use planner::{build_plan, BlobSource, PlanOutcome, PlanRequest};
 pub use ports::{ActionReceipt, Clock, FileMutator, FixedClock, Observer, SystemClock};
 pub use recovery::{

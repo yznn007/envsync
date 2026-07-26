@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/envsync-adapters",
     "crates/envsync-domain",
     "crates/envsync-backend",
     "crates/envsync-platform",
@@ -26,14 +27,18 @@ envsync-backend = { path = "crates/envsync-backend", version = "0.1.0" }
 envsync-platform = { path = "crates/envsync-platform", version = "0.1.0" }
 envsync-storage = { path = "crates/envsync-storage", version = "0.1.0" }
 envsync-core = { path = "crates/envsync-core", version = "0.1.0" }
+envsync-adapters = { path = "crates/envsync-adapters", version = "0.1.0" }
 
 blake3 = "1"
 cap-std = "3"
 clap = { version = "4", features = ["derive"] }
+git2 = { version = "0.20", default-features = false, features = ["vendored-libgit2"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml_ng = "0.10"
+similar = "2"
+toml_edit = "0.23"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
