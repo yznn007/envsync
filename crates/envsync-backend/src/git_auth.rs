@@ -470,7 +470,7 @@ mod tests {
     fn rejects_other_auth_forms() {
         for kind in ["password", "basic", "netrc", "plaintext", ""] {
             let err = GitAuth::parse(kind, Some("hunter2")).unwrap_err();
-            assert_eq!(err.code(), "unsupported");
+            assert_eq!(err.code(), "backend.unsupported");
         }
     }
 

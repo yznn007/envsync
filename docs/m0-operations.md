@@ -710,7 +710,7 @@ EnvSync 不使用「一个全局版本号」，而是让每一层各自携带版
 | State Root / Snapshot Body / Ref / Plan | `CborError::UnsupportedFormatVersion { found, supported }` | `codec.invalid` |
 | 配置 | `ConfigError::UnsupportedVersion` | `config.unsupported_version` |
 | 存储 schema（更高版本） | `JournalError::SchemaTooNew { found, supported }`，**拒绝打开数据库** | `storage.schema_too_new` |
-| 后端目录格式 | `BackendError::FormatMismatch { expected, found }` | `format_mismatch` |
+| 后端目录格式 | `BackendError::FormatMismatch { expected, found }` | `backend.format_mismatch` |
 
 四条理由：
 
@@ -733,7 +733,7 @@ EnvSync 不使用「一个全局版本号」，而是让每一层各自携带版
 | 里程碑 | 会动的版本号 | 具体变化 | 对 M0 数据的影响 |
 |---|---|---|---|
 | **M1**（Git 后端、Profile、结构化合并） | ①State Root、②Snapshot、⑤Conflict、⑦存储 schema、⑧CLI JSON | 新增 Profile 与 Conflict 的 domain schema；`journal.db` 新增 `profiles`、`conflicts` 表；CLI JSON 升为 v2 并**保留 v1 reader** | M0 的对象需要通过迁移测试升级；M0 的 CLI JSON 调用方在 v1 reader 保留期内不受影响 |
-| **M2**（Vault、设备身份、反回滚） | ②Snapshot（签名从 `none` 变为 `ed25519`）、⑦存储 schema，新增 sealed 对象格式版本 | `SnapshotSignature.algorithm` 开始强制校验；新增 Membership Event / Key Envelope / Sealed Secret 三类对象；新增本地检查点表 | **`DeviceId` 需要重新派生**：输入从设备种子换成 `X25519 ‖ Ed25519` 公钥（ADR-0002）。这被记录为一次显式的设备重新注册，而不是静默改写历史。类型、宽度与编码都不变 |
+| **M2**（Vault、设备身份、反回滚） | ②Snapshot（元数据新增 `envsync.` 前缀的工作区级键）、⑦存储 schema，新增 sealed 对象格式版本 | 头快照的 **Vault 索引背书**（`envsync.vault.attestation`）开始强制校验，错误码 `snapshot.signature_invalid`；快照标识本身的签名对象仍是审计用途，理由见 `docs/security/vault-format.md` §5.4。新增 Membership Event / Key Envelope / Sealed Secret 三类对象；新增本地检查点表 | **`DeviceId` 需要重新派生**：输入从设备种子换成 `X25519 ‖ Ed25519` 公钥（ADR-0002）。这被记录为一次显式的设备重新注册，而不是静默改写历史。类型、宽度与编码都不变 |
 | **M3**（包管理器、Agent Bundle） | ①State Root（新增包与 Bundle 条目种类）、⑦存储 schema、⑧CLI JSON | 新增包身份 / 版本策略 / Agent Bundle manifest 的 schema；manifest 自带最低 EnvSync 版本要求 | 纯文件资源的 State Root 语义不变；新种类只是新增条目 |
 | **M4**（桌面端、Gist、插件） | ⑦存储 schema、⑧CLI JSON，新增 Gist sealed bundle 格式版本与插件 RPC schema 版本 | 插件 RPC 独立版本化，host 支持一个 major 的两个 minor，未知 method/version 拒绝；Gist bundle 解包先检查版本与计数再验摘要 | M4 计划包含「从 M0、M1、M2、M3 fixture 逐版本升级」的 E2E；迁移失败时事务回滚并保留可恢复备份 |
 
@@ -757,22 +757,25 @@ EnvSync 不使用「一个全局版本号」，而是让每一层各自携带版
 | **0** | 命令成功 | — | `plan`/`doctor` 恒为 0，健康与否请读 `data.blocked` / `data.healthy` |
 | **1** | 一般错误 | 配置读不到、I/O 失败、需要人工处理 | 读 `diagnostics[0].code`，对照下表 |
 | **2** | 用法错误 | 缺参数、参数值非法、未知子命令 | `envsync <子命令> --help` |
-| **10** | `cas_conflict` | 别的设备在你 `plan` 之后先发布了 | **本地零变更**，安全。`capture` → `plan` → `sync` 重来 |
+| **10** | `backend.cas_conflict` | 别的设备在你 `plan` 之后先发布了 | **本地零变更**，安全。`capture` → `plan` → `sync` 重来 |
 | **11** | `plan.stale` / `plan.not_found` | 计划生成后目标被改动，或计划标识写错 / 草稿库已清 | 重新 `plan` 再 `sync`。两者补救动作相同，故共用一个码 |
 | **12** | `plan.blocked` | 计划里有阻塞诊断 | 读 `diagnostics[]`，按资源逐个修好，再重新 `plan` |
+| **13** | `sync.conflicted` | 存在未解决的合并冲突（M1） | 先 `envsync conflicts resolve`；**本地文件与远端 Ref 都没有被改动** |
+| **14** | `checkpoint.*`（M2） | **检测到后端回滚或分叉**：远端给出的 revision / 成员链头 / 密钥纪元相对本机检查点倒退了 | **不要重试**，这是一次安全事件。读路径与写路径都会以它失败，且**后端 revision 一格都不会被推进**。先用 `envsync security checkpoint` 看本机信任根，再确认后端是不是被回退或替换过 |
+| **15** | `platform.secure_store_*`（M2） | 系统凭据库不存在 / 被锁定 / 拒绝访问 | 解锁凭据库或授予访问权限后重试。**绝不会**回退到明文存储 |
 | **20** | `sync.published_not_converged` | 后端头已前进但本地没跟上 | `doctor` 看建议 → `recover` 或 `rollback`。见 §2.4、§4.4 |
 
 ### 7.2 症状 → 原因 → 处理
 
 | 症状 | 错误码 | 可能原因 | 处理 |
 |---|---|---|---|
-| `sync` 退出 10，抱怨 CAS 冲突 | `cas_conflict` | 另一台设备在你的 `base_revision` 之后发布了新头 | 无需担心本地：CAS 在任何本地写入之前。`capture` → `plan` → `sync` 重来 |
+| `sync` 退出 10，抱怨 CAS 冲突 | `backend.cas_conflict` | 另一台设备在你的 `base_revision` 之后发布了新头 | 无需担心本地：CAS 在任何本地写入之前。`capture` → `plan` → `sync` 重来 |
 | `sync` 退出 11，说计划已失效 | `plan.stale` | `plan` 与 `sync` 之间目标文件被外部修改；或后端 revision 前进了 | 重新 `plan`。注意：计划**不会**因为「审阅花了三分钟」而失效——时刻不参与 Plan ID（ADR-0003） |
 | `sync` 退出 11，说找不到计划 | `plan.not_found` | 计划标识抄错；或换了 `state_dir`；或草稿库被清空 | 重新 `plan` 取新标识 |
 | `sync` 退出 12 | `plan.blocked` | 某资源观察为 `unreadable` / `unsupported` / `excluded` | 逐条读 `diagnostics[].resource` 与 `message`；修好权限或目标类型后重新 `plan`。这三种状态**不会**产生任何写入，更不会被推断为删除 |
 | `sync` 退出 20 | `sync.published_not_converged` | 后端已发布，本地应用中断或失败 | 见 §2.4 与 §4.4，先 `doctor` 后决策 |
-| 命令挂住约 5 秒后报「工作区被锁定」 | `locked` | 另一个进程正持有 per-workspace 发布锁；或上一个持有者被强杀留下锁文件 | 有界重试上限约 5 秒（1000 次 × 5 ms）。超过 30 秒未更新的锁文件会被自动回收后重试。仍然失败时确认没有其他 `envsync sync` 在跑，再检查 `<backend.path>/locks/<workspace-uuid>.lock` |
-| 打开后端就报格式标记不匹配 | `format_mismatch` | `backend.path` 指向了别的目录（不是 EnvSync 后端）；或后端由更高版本写过 | 核对 `backend.path`。`<backend.path>/format` 的内容必须**逐字节**等于 `envsync-backend-format=1`（含结尾换行）。**不要手工改这个文件**——它是版本闸门，不是配置项 |
+| 命令挂住约 5 秒后报「工作区被锁定」 | `backend.locked` | 另一个进程正持有 per-workspace 发布锁；或上一个持有者被强杀留下锁文件 | 有界重试上限约 5 秒（1000 次 × 5 ms）。超过 30 秒未更新的锁文件会被自动回收后重试。仍然失败时确认没有其他 `envsync sync` 在跑，再检查 `<backend.path>/locks/<workspace-uuid>.lock` |
+| 打开后端就报格式标记不匹配 | `backend.format_mismatch` | `backend.path` 指向了别的目录（不是 EnvSync 后端）；或后端由更高版本写过 | 核对 `backend.path`。`<backend.path>/format` 的内容必须**逐字节**等于 `envsync-backend-format=1`（含结尾换行）。**不要手工改这个文件**——它是版本闸门，不是配置项 |
 | 报「授权根不可用」 | `platform.root_unavailable` | 根目录不存在、被卸载、无权限；或是网络挂载尚未就绪 | `doctor` 会单独列出每个根的可访问性。确认路径存在且可读写。根路径必须是**绝对路径**（否则 `config.root_not_absolute`） |
 | 报「授权根不是目录」 | `platform.root_not_directory` | 根路径指向了一个文件 | 改配置 |
 | 报「未注册的授权根别名」 | `platform.unknown_root` / `config.unknown_root` | 资源的 `root:` 写了 `roots:` 里没有的别名 | 对齐别名拼写 |
@@ -785,7 +788,10 @@ EnvSync 不使用「一个全局版本号」，而是让每一层各自携带版
 | 报「目标大小超过上限」 | `platform.too_large` | 文件超过 `policy.max_bytes`（默认 16 MiB） | **绝不截断**是刻意设计。提高该资源的 `policy.max_bytes`，或把大文件移出同步范围 |
 | 报「数据库 schema 版本高于本版本支持」 | `storage.schema_too_new` | 用旧版 EnvSync 打开了新版写过的 `state_dir` | 升级 EnvSync。**不要**删掉 `journal.db` 来「解决」问题——那会丢掉全部恢复凭据 |
 | 报「非法状态迁移」 | `storage.illegal_transition` | 出现即说明实现有 bug，或 `journal.db` 被手工改过 | 保留 `journal.db` 与 `backups/` 原样并报告问题；不要继续在这个 `state_dir` 上操作 |
-| 报「对象内容损坏」 | `corruption` / `draft.corruption` | 后端对象或草稿库内容与其摘要不符（外部工具改写、磁盘错误） | 内容寻址自校验拦下了它，**损坏内容绝不会流向用户文件**。定位到具体对象后从其他设备重新同步 |
+| 报「对象内容损坏」 | `backend.corruption` / `draft.corruption` | 后端对象或草稿库内容与其摘要不符（外部工具改写、磁盘错误） | 内容寻址自校验拦下了它，**损坏内容绝不会流向用户文件**。定位到具体对象后从其他设备重新同步 |
+| `device revoke` 撤销本机自己被拒 | `rotation.cannot_revoke_self`（M2） | 撤销自己会产生一个由**非成员**签出的头快照，读路径要求背书由当前成员签出，工作区会就此永久锁死 | 在另一台管理员设备上撤销它；本机随后用 `envsync device forget` 清理身份 |
+| `vault list` 报 `vault.index_missing` | `vault.index_missing`（M2） | 当前头快照上没有 Vault 索引指针，但本机的密钥环/检查点证明这台设备加入过这个 Vault | 这是「读不到」而不是「里面是空的」。密封对象是内容寻址的，多半仍在后端上：从另一台正常设备跑任意一条 `vault set` / `vault delete` 即可重建指针 |
+| 读 Vault 报 `snapshot.signature_invalid` | `snapshot.signature_invalid`（M2） | 头快照的 Vault 索引背书缺失，或不是由当前成员链上的设备签出的 | **后端交给你的索引来路不明**，不要重试。核对后端是否被第三方写过；必要时从可信设备重新发布一次 Vault |
 | 报「引用了缺失的对象」 | `object.missing` | 后端里缺少目标快照可达的某个 Blob | 通常是后端被部分删除。从仍然完整的设备重新 `capture` → `sync` |
 | 配置改了却不生效 | `config.unknown_field` | 字段名写错。未知字段是**拒绝**而不是忽略 | 对照 `examples/workspace.yaml` |
 | `target` 被拒绝 | `config.invalid_target` / `platform.invalid_target` | 绝对路径、`..`、`.`、空段、反斜杠、冒号、UNC 前缀、Windows 保留设备名、以空格或点结尾的段、超长（>1024 字节）或超段数（>32） | 这些限制在三大平台上**一致**生效，好让同一份配置表达完全相同的意图 |

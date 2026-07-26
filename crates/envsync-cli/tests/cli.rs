@@ -697,7 +697,10 @@ fn cas_conflict_exits_10() {
     } else {
         &second_output
     };
-    assert_eq!(json_of(loser)["diagnostics"][0]["code"], "cas_conflict");
+    assert_eq!(
+        json_of(loser)["diagnostics"][0]["code"],
+        "backend.cas_conflict"
+    );
 }
 
 /// 后台启动一次 `sync`。

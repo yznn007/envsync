@@ -18,6 +18,23 @@ git2.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 
+# M2 攻击矩阵（`tests/vault_multi_device.rs`）专用。
+#
+# 全部放在 `[dev-dependencies]` 而不是 `[dependencies]`：它们打开的是
+# `test-support` / `test-vectors` 这类**只允许出现在测试构建里**的 feature。
+# `cargo build` 不会碰 dev-dependencies，因此 `envsync_binary()` 用
+# `cargo build -p envsync-cli --bin envsync` 单独构建出来的那个二进制里，
+# `VaultContext::with_stores`、`SealedSecret::from_parts_for_tests` 之类的
+# 测试缝**依然不存在**——「测试替身跑进被测二进制」是编译期不可能。
+[dev-dependencies]
+# `envsync-cli` 不在根 `[workspace.dependencies]` 里（没有别的 crate 依赖它），
+# 因此只能写 path 依赖。`test-support` 会连带打开 `envsync-platform/test-support`。
+envsync-cli = { path = "../envsync-cli", features = ["test-support"] }
+envsync-crypto = { workspace = true, features = ["test-vectors"] }
+envsync-platform = { workspace = true, features = ["test-support"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
 [[test]]
 name = "local_file_loop"
 path = "tests/local_file_loop.rs"
@@ -25,3 +42,7 @@ path = "tests/local_file_loop.rs"
 [[test]]
 name = "git_multi_device"
 path = "tests/git_multi_device.rs"
+
+[[test]]
+name = "vault_multi_device"
+path = "tests/vault_multi_device.rs"

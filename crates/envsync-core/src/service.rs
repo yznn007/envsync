@@ -18,6 +18,7 @@
 //!
 //! **草稿库不污染后端**：capture 产生的对象先落本地，只有在 `sync` 发布时才上传。
 
+use std::cell::OnceCell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -33,6 +34,7 @@ use envsync_platform::{AuthorizedRoot, RelativeTarget, RootRegistry, SafeWriter}
 use envsync_storage::{ConflictRecord, ConflictStore, DraftStore, Journal, OperationState};
 
 use crate::apply::{ApplyEngine, ApplyOutcome};
+use crate::checkpoint::{CheckpointStore, SecureCheckpointStore};
 use crate::config::{BackendConfig, WorkspaceConfig};
 use crate::error::{CoreError, CoreResult};
 use crate::last_known::{is_backend_unreachable, LastKnownRef, LastKnownRefStore};
@@ -230,6 +232,16 @@ pub struct EnvSyncService {
     /// 它只用于 `doctor` 的 finding 文案：Git 后端在 `open` 阶段就会 fetch，那一步的
     /// 失败原因比之后任何一次调用都更贴近根因。
     offline_detail: Option<String>,
+    /// 反回滚检查点的权威副本，**惰性**打开。
+    ///
+    /// 惰性有两个理由。其一，M0/M1 的工作区根本没有检查点，为它们去敲一次系统凭据库
+    /// 既没用又可能弹出授权对话框。其二，检查点只在头快照**确实带着 Vault**时才有意义，
+    /// 而那件事要读完远端头才知道。
+    ///
+    /// `OnceCell` 里的 `None` 表示「试过了，这台机器上没有可用的系统凭据库」——此时
+    /// 读路径不做反回滚校验，只留下一条警告。这是刻意的降级：M0/M1 的用户不该因为
+    /// 容器里没有 DBus 会话就连 `status` 都跑不出来。
+    checkpoints: OnceCell<Option<Arc<dyn CheckpointStore>>>,
 }
 
 impl EnvSyncService {
@@ -240,6 +252,32 @@ impl EnvSyncService {
 
     /// 用指定时钟打开服务（测试注入固定时钟以获得确定性输出）。
     pub fn open_with_clock(config: WorkspaceConfig, clock: Arc<dyn Clock>) -> CoreResult<Self> {
+        Self::open_with(config, clock, None)
+    }
+
+    /// 用指定时钟与**指定检查点存储**打开服务。
+    ///
+    /// `checkpoints` 为 `None` 时按需惰性打开系统安全存储里的权威副本（生产路径）；
+    /// 给一个 `Some` 等于「本进程就用这一份」，测试用它注入
+    /// [`crate::checkpoint::InMemoryCheckpointStore`]，从而在没有系统凭据库的机器上也能
+    /// 验证反回滚行为。
+    pub fn open_with(
+        config: WorkspaceConfig,
+        clock: Arc<dyn Clock>,
+        checkpoints: Option<Arc<dyn CheckpointStore>>,
+    ) -> CoreResult<Self> {
+        let cell = OnceCell::new();
+        if let Some(store) = checkpoints {
+            let _ = cell.set(Some(store));
+        }
+        Self::open_inner(config, clock, cell)
+    }
+
+    fn open_inner(
+        config: WorkspaceConfig,
+        clock: Arc<dyn Clock>,
+        checkpoints: OnceCell<Option<Arc<dyn CheckpointStore>>>,
+    ) -> CoreResult<Self> {
         std::fs::create_dir_all(&config.state_dir)
             .map_err(|err| envsync_platform::PlatformError::io("创建状态目录", &err))?;
 
@@ -308,6 +346,7 @@ impl EnvSyncService {
             clock,
             last_known,
             offline_detail,
+            checkpoints,
         })
     }
 
@@ -459,7 +498,22 @@ impl EnvSyncService {
         }
         self.drafts.put(ObjectId::from(state_id), &state_bytes)?;
 
-        let mut metadata = BTreeMap::new();
+        // **工作区级元数据必须被继承。** 快照的 metadata 里混着两类东西：本次 capture
+        // 自己的事实（`device_name` / `format`），和整个工作区的事实（M2 起是 Vault
+        // 索引指针与它的背书）。后者不属于这一次发布，因此这里以父快照的工作区级键为
+        // 起点，只覆盖本次真正要改的键。
+        //
+        // 不这么做的后果不是「少一条元数据」，而是**一次普通 `envsync sync` 静默抹掉
+        // 整个 Vault**：头快照上的索引指针没了，`vault get` 报 `vault.secret_not_found`，
+        // 而 `vault list` 照常以 `status: ok` 返回一个空清单，用户完全看不出发生了什么。
+        let mut metadata = match base_ref.head {
+            Some(head) => {
+                let bytes = self.read_object(ObjectId::from(head))?;
+                let parent = SnapshotBody::from_canonical_slice(&bytes)?;
+                crate::vault::inherited_workspace_metadata(&parent.metadata)
+            }
+            None => BTreeMap::new(),
+        };
         metadata.insert("device_name".to_owned(), self.config.device.name.clone());
         metadata.insert("format".to_owned(), "envsync/m0".to_owned());
 
@@ -1140,12 +1194,87 @@ impl EnvSyncService {
             Err(BackendError::RefNotFound(_)) => WorkspaceRef::initial(self.config.workspace_id),
             Err(err) => return Err(err.into()),
         };
+        // 反回滚校验排在「记录上次已知 Ref」**之前**：一份被回退的 Ref 不该被写进本机
+        // 的降级缓存，否则下一次后端不可达时，我们会把攻击者给的旧状态当成「上次看到的
+        // 真实状态」报出去。
+        self.guard_against_rollback(&reference)?;
         // `RefNotFound` 也算「联系上了」：它是一个确定的答案（这个工作区还没发布过），
         // 记下来同样有意义。
         if let Err(error) = self.last_known.record(&reference, self.clock.now_unix_ms()) {
             tracing::warn!(%error, "记录上次已知 Ref 失败，不影响本次操作");
         }
         Ok(reference)
+    }
+
+    /// 远端头相对本机反回滚检查点的**只读**校验。
+    ///
+    /// M0/M1 的读路径过去完全不查检查点，于是后端被回退之后 `status` 会安静地报告旧
+    /// 状态。这里补上：一旦倒退或分叉就返回 [`CoreError::Checkpoint`]
+    /// （`is_rollback_attack()` 为真，CLI 退出码 14），而且**不推进**检查点——推进只发生
+    /// 在一次成功的 Vault 发布之后。
+    ///
+    /// 三种情况直接放行，都不是「校验通过」而是「无从校验」：
+    ///
+    /// * Ref 还没有头（工作区从未发布过）；
+    /// * 头快照上没有 Vault 索引（M0/M1 工作区，本来就没有检查点）；
+    /// * 本机拿不到系统凭据库（检查点的权威副本在里面）。
+    ///
+    /// 读不到头快照对象时同样放行并只记一条 debug：紧随其后的 `load_state_root_of`
+    /// 会用同一个对象再失败一次，在那里报错比在这里报错更贴近根因。
+    fn guard_against_rollback(&self, reference: &WorkspaceRef) -> CoreResult<()> {
+        let Some(head) = reference.head else {
+            return Ok(());
+        };
+        let bytes = match self.read_object(ObjectId::from(head)) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::debug!(%error, "读不到远端头快照，本次跳过反回滚校验");
+                return Ok(());
+            }
+        };
+        let body = SnapshotBody::from_canonical_slice(&bytes)?;
+        let Some(observed) =
+            crate::vault::inspect_vault_head(self.config.workspace_id, &body, &mut |id| {
+                self.read_object(id)
+            })?
+        else {
+            return Ok(());
+        };
+        let Some(store) = self.checkpoint_store() else {
+            tracing::warn!(
+                "本机没有可用的系统安全存储，本次无法做反回滚校验；\
+                 请解锁凭据库后重试，或改用 `envsync security checkpoint` 确认信任根"
+            );
+            return Ok(());
+        };
+        crate::checkpoint::guard(
+            store.as_ref(),
+            &observed.checkpoint(self.config.workspace_id, reference),
+        )?;
+        Ok(())
+    }
+
+    /// 惰性取得检查点存储；系统凭据库不可用时返回 `None`（只在第一次尝试时告警）。
+    fn checkpoint_store(&self) -> Option<&Arc<dyn CheckpointStore>> {
+        self.checkpoints
+            .get_or_init(
+                || match envsync_platform::secure_store::open_system_store() {
+                    Ok(secure) => {
+                        let secure: Arc<dyn envsync_platform::secure_store::SecureStore> =
+                            Arc::from(secure);
+                        Some(Arc::new(SecureCheckpointStore::new(secure))
+                            as Arc<dyn CheckpointStore>)
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            code = error.code(),
+                            "系统安全存储不可用，反回滚校验将被跳过"
+                        );
+                        None
+                    }
+                },
+            )
+            .as_ref()
     }
 
     /// 读取后端引用，读不到时降级为本地记录的**上次已知** Ref。

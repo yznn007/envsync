@@ -30,6 +30,43 @@ pub enum CoreError {
     #[error(transparent)]
     ConflictStore(#[from] envsync_storage::ConflictError),
 
+    /// 密钥轮换 journal 错误（M2）。
+    #[error(transparent)]
+    RotationStore(#[from] envsync_storage::RotationStoreError),
+
+    /// 密码学层错误（M2）。
+    ///
+    /// 它的 `Display` 只描述结构，绝不携带明文或密钥材料；见
+    /// [`envsync_crypto::CryptoError`] 的文档。
+    #[error(transparent)]
+    Crypto(#[from] envsync_crypto::CryptoError),
+
+    /// 成员链验证或编排失败（M2）。
+    #[error(transparent)]
+    Membership(#[from] crate::membership::MembershipError),
+
+    /// 反回滚检查点错误（M2）。
+    ///
+    /// [`crate::checkpoint::CheckpointError::is_rollback_attack`] 为 `true` 时表示
+    /// **检测到一次回滚攻击**，调用方必须中止而不是重试。
+    #[error(transparent)]
+    Checkpoint(#[from] crate::checkpoint::CheckpointError),
+
+    /// Vault 操作失败（M2）。
+    #[error(transparent)]
+    Vault(#[from] crate::vault::VaultError),
+
+    /// 头快照的 Vault 索引背书缺失或验证失败（M2）。
+    ///
+    /// 它意味着**后端交给我们的这份索引来路不明**：不是本工作区任何一台当前成员设备
+    /// 签出来的。唯一正确的反应是中止，而不是重试。
+    #[error(transparent)]
+    Attestation(#[from] crate::attestation::AttestationError),
+
+    /// 密钥轮换编排失败（M2）。
+    #[error(transparent)]
+    Rotation(#[from] crate::rotation::RotationError),
+
     /// 三方合并失败（解析、超限或渲染校验不通过）。
     #[error("三方合并失败：{0}")]
     Merge(#[source] crate::merge::MergeError),
@@ -128,6 +165,13 @@ impl CoreError {
             CoreError::Journal(err) => err.code(),
             CoreError::Draft(err) => err.code(),
             CoreError::ConflictStore(err) => err.code(),
+            CoreError::RotationStore(err) => err.code(),
+            CoreError::Crypto(_) => "crypto.failed",
+            CoreError::Membership(err) => err.code(),
+            CoreError::Checkpoint(err) => err.code(),
+            CoreError::Vault(err) => err.code(),
+            CoreError::Attestation(err) => err.code(),
+            CoreError::Rotation(err) => err.code(),
             CoreError::Merge(err) => err.code(),
             CoreError::Projection(err) => err.code(),
             CoreError::Conflicted { .. } => "sync.conflicted",
@@ -174,6 +218,34 @@ impl CoreError {
     /// 是否为未解决的合并冲突（CLI 退出码 13）。
     pub fn is_conflicted(&self) -> bool {
         matches!(self, CoreError::Conflicted { .. })
+    }
+
+    /// 是否为「头快照背书不可信」（错误码 `snapshot.signature_invalid`）。
+    pub fn is_attestation_failure(&self) -> bool {
+        matches!(self, CoreError::Attestation(_))
+    }
+
+    /// 是否为「检测到后端回滚/分叉」这一类必须中止的安全事件（CLI 退出码 14）。
+    ///
+    /// 存储故障不算：那是本机问题，修复后可以继续。
+    pub fn is_rollback_attack(&self) -> bool {
+        matches!(self, CoreError::Checkpoint(err) if err.is_rollback_attack())
+    }
+
+    /// 是否为「系统安全存储不可用/被锁定/被拒绝」（CLI 退出码 15）。
+    ///
+    /// 这一类失败**绝不**回退到明文存储：调用方唯一正确的反应是提示用户解锁凭据库或
+    /// 授予访问权限，然后重试。
+    pub fn is_secure_store_unavailable(&self) -> bool {
+        matches!(
+            self,
+            CoreError::Platform(
+                envsync_platform::PlatformError::SecureStoreUnavailable { .. }
+                    | envsync_platform::PlatformError::SecureStoreLocked { .. }
+                    | envsync_platform::PlatformError::SecureStoreDenied { .. }
+                    | envsync_platform::PlatformError::SecureStoreBackend { .. }
+            )
+        )
     }
 }
 

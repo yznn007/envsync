@@ -1,0 +1,34 @@
+[package]
+name = "envsync-crypto"
+description = "EnvSync 密码学层：固定算法套件、设备身份、密封秘密、HPKE 设备信封与 Argon2id 恢复包"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+# 仅供测试：暴露固定 key / nonce / 熵的确定性构造函数与原始签名接口。
+# 生产构建**绝不能**开启；`[dev-dependencies]` 中的自引用会在 `cargo test`
+# 与 `cargo clippy --all-targets` 时自动启用它，而 `cargo build` 不会。
+test-vectors = []
+
+[dependencies]
+envsync-domain.workspace = true
+thiserror.workspace = true
+
+argon2.workspace = true
+chacha20poly1305.workspace = true
+ed25519-dalek.workspace = true
+hkdf.workspace = true
+rand_core.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+x25519-dalek.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+# 自引用 dev-dependency：让测试目标构建时自动打开 `test-vectors`，
+# 而普通 `cargo build` 保持关闭。
+envsync-crypto = { path = ".", features = ["test-vectors"] }

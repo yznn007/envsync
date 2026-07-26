@@ -258,7 +258,7 @@ fn cas_conflict_never_invokes_the_file_mutator() {
         error.is_cas_conflict(),
         "错误必须被识别为 CAS 冲突：{error}"
     );
-    assert_eq!(error.code(), "cas_conflict");
+    assert_eq!(error.code(), "backend.cas_conflict");
     assert_eq!(mutator.apply_count(), 0, "CAS 失败时不得调用 apply");
     assert!(
         mutator.rolled_back().is_empty(),

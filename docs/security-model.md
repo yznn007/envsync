@@ -1,13 +1,29 @@
-# EnvSync 安全模型（M0）
+# EnvSync 安全模型（M0 + M2）
 
-本文描述 EnvSync **M0 阶段**的信任边界、实际提供的安全保证，以及**明确不提供**的保证。
+本文描述 EnvSync 的信任边界、实际提供的安全保证，以及**明确不提供**的保证。
 
-第三部分（§3「M0 不提供的保证」）与前两部分同等重要。一个同步工具最危险的失败模式不是
-「缺少某项防护」，而是「用户以为它有」。在把真实凭据交给 EnvSync 之前，请把 §3 读完。
+**文档结构：** §1–§4 是 **M0 基线**（路径约束、默认不删除、计划先行、原子替换、
+内容寻址、输出脱敏），M1 未改变其中任何一条。**§5 是 M2 叠加**——Vault、设备身份、
+成员签名链、密钥轮换与反回滚检查点。M2 **改变了信任边界**：后端从「被信任持有明文」
+变成「可被攻击者完全控制」。
+
+第三部分（§3「M0 不提供的保证」）与 §5.3（「M2 仍不提供的保证」）与前面同等重要。
+一个同步工具最危险的失败模式不是「缺少某项防护」，而是「用户以为它有」。在把真实凭据
+交给 EnvSync 之前，请把 §3 与 §5.3 读完。
 
 配套文档：运维流程见 [`docs/m0-operations.md`](m0-operations.md)，命令与 JSON 契约见
 [`docs/cli.md`](cli.md)，设计原则见
 [`docs/superpowers/specs/2026-07-24-envsync-design.md`](superpowers/specs/2026-07-24-envsync-design.md)。
+
+M2 专题（规范级细节）：
+
+- [Vault 线格式与密钥派生](security/vault-format.md)：算法套件、sealed object 与 HPKE
+  信封的逐字段定义、域分隔标签总表、纪元语义、nonce 生日界、不变量清单
+- [设备成员链与反回滚检查点](security/device-membership.md)：事件链结构、角色授权矩阵、
+  攻击路径矩阵、四个仪式的序列图、`DeviceId` 迁移、检查点判定规则
+- [恢复短语与恢复包](security/recovery.md)：熵与编码、Argon2id 参数边界、恢复仪式、
+  备份责任
+- [测试向量](security/test-vectors/README.md)：冻结的回归向量与**发布前审计待办**
 
 ---
 
@@ -23,7 +39,7 @@
 | 本机已解锁的用户账户 | **完全信任**（M0 的边界即在此） | 见 §3.6 |
 | **后端存储** | **部分信任**：完整性由内容寻址自校验，**机密性不设防** | 见下 |
 | 网络与传输通道 | M0 **不适用**（本地目录后端无网络 I/O）；M1 起由 Git 传输层负责 | — |
-| 其他设备 | **不做密码学验证** | M0 的 `SnapshotSignature.algorithm` 恒为 `"none"` |
+| 其他设备 | M0 **不做密码学验证**；**M2 起做** | M0 的 `SnapshotSignature.algorithm` 恒为 `"none"`；M2 起头快照的 Vault 索引带**成员签出的背书**，读路径强制校验（§5.2.2） |
 | 插件 | **不适用** | M0 无插件机制（M4） |
 | Agent Bundle | **不适用** | M0 无 Agent Bundle（M3） |
 
@@ -315,7 +331,8 @@ CI 在 `ubuntu-latest`、`macos-latest`、`windows-latest` 三平台运行
 
 ## 3. M0 明确不提供的保证
 
-以下每一条都是**当前的真实状态**，不是疏忽。
+以下每一条都是 **M0 基线**的真实状态。**§3.1、§3.2、§3.3 已由 M2 修补**（分别见
+§5.2.2、§5.2.1、§5.2.4），其余各条在 M2 仍然成立；M2 自己的边界见 §5.3。
 
 ### 3.1 没有任何密码学签名
 
@@ -327,8 +344,18 @@ CI 在 `ubuntu-latest`、`macos-latest`、`windows-latest` 三平台运行
 - **无法检测后端内容被替换成另一份内部自洽的历史。** 摘要保证「对象没被改坏」，但不保证
   「这些对象是你的设备写的」。
 
-真正的 Ed25519 签名与强制校验在 **M2**。在此之前，**后端目录的写权限等价于对工作区的完全
-控制权**——请像对待私有目录一样保护它。
+真正的 Ed25519 签名与强制校验在 **M2** —— **已交付**，见 §5.2.2（设备身份 + 成员签名
+链）。M2 之后，后端目录的写权限**不再**等价于对工作区的完全控制权：伪造的成员事件会被
+链验证器拒绝，伪造的 Vault 索引会被**索引背书**拒绝。但 M1 时代已发布的快照仍然只是
+自述值（`SnapshotSignature::unsigned`），对它们的信任不会被追认。
+
+需要说明清楚的一点：M2 强制校验的是**头快照上的 Vault 索引背书**，而不是快照标识本身的
+签名。原因是内容寻址造成的循环（签名要放进快照，而签名又覆盖快照标识），以及一条硬性的
+产品约束——**一次普通 `envsync sync` 必须不能让 Vault 失效**，而 M0/M1 的发布路径手里
+没有成员链上的签名密钥。背书因此覆盖 `(用途标签, 工作区, 索引对象标识)`，并作为**工作区级
+元数据**被普通同步原样继承。完整推理见
+[`security/vault-format.md` §5.4](security/vault-format.md)。它的直接后果是：
+`SnapshotBody.state_root`（也就是普通同步的**文件内容**）在 M2 仍然只是自述值，见 §5.3.8。
 
 ### 3.2 没有加密：后端持有明文配置内容
 
@@ -342,7 +369,11 @@ Blob 就是文件的原始字节，没有任何加密层。**任何能读后端�
 - `policy.secret: true` **不加密任何东西**，它只影响本机文件权限、风险评级和输出脱敏。
 
 端到端加密的 Vault（每个工作区随机数据密钥、每设备 HPKE envelope、Argon2id 恢复密钥）在
-**M2**。在此之前：**不要把真实 API Token、私钥或任何凭据放进 EnvSync 管理的普通资源。**
+**M2** —— **已交付**，见 §5.2.1。
+
+**但请注意：Vault 是另一条对象通道，它不会自动加密普通资源。** 本节描述的「Blob 是明文」
+在 M2 依然成立（§5.3.8）。真实凭据应当放进 Vault 并在配置里以逻辑 Secret ID 引用，
+**不要**直接同步含凭据的文件。
 
 ### 3.3 没有反回滚保护
 
@@ -350,7 +381,8 @@ Blob 就是文件的原始字节，没有任何加密层。**任何能读后端�
 **不在本地保存已见过的最高 revision**。因此后端可以把 Ref 换回一个更旧的版本，本机下次
 `plan` 会老老实实地朝那个旧快照收敛，并且**不会报告任何异常**。
 
-基于本地检查点的反回滚检测在 **M2**（快照检查点 + 设备成员链）。
+基于本地检查点的反回滚检测在 **M2** —— **已交付**，见 §5.2.4。检查点的四个维度
+（revision / snapshot / 成员链头 + sequence / 密钥纪元）任何一个回退都会阻塞同步。
 
 ### 3.4 advisory 锁在网络文件系统上不可靠
 
@@ -482,31 +514,384 @@ M0 的实现方式是**结构性的**：`SafeWriter` 只有一条写入路径—
 其备份也是 `0o600`；但备份位于 `<state_dir>/backups/` 下，**该目录本身的权限由创建它的
 umask 决定，M0 不额外收紧**。如果 `state_dir` 位于一个宽权限目录下，请自行 `chmod` 它。
 
-### 4.3 M2 之前的硬性建议
+### 4.3 硬性建议：凭据放 Vault，不放普通资源
 
-> **在 M2 的 Vault 交付之前，不要把真实凭据放进 EnvSync 管理的普通资源。**
+> **不要把真实凭据放进 EnvSync 管理的普通资源——即使在 M2 之后。**
 
-原因已在 §3.2 说明：后端持有明文。`secret: true` 保护的是**本机文件权限**和**输出不泄露**，
-它**不保护后端里的字节**。
+原因已在 §3.2 说明：后端持有普通资源的明文。`secret: true` 保护的是**本机文件权限**和
+**输出不泄露**，它**不保护后端里的字节**。M2 的加密只覆盖 Vault（§5.3.8）。
 
 如果你现在就必须同步一个含凭据的文件，可选做法（按推荐度排序）：
 
-1. **不要同步它。** 用系统 Keychain / Credential Manager / Secret Service 管理，等 M2。
+1. **把凭据放进 Vault**（M2），普通资源里只留对逻辑 Secret ID 的引用；或者干脆不同步它，
+   用系统 Keychain / Credential Manager / Secret Service 管理。
 2. 同步一个**不含凭据的模板**（例如 `.zshrc` 里用 `source ~/.secrets.zsh`），把
    `~/.secrets.zsh` 排除在 EnvSync 之外，各设备手工维护。
 3. 若确实要同步，把后端放在**只有你能读**的本地介质上（加密卷、加密的可移动介质），并接受
-   §3.1 / §3.2 / §3.3 的全部后果。
+   §3.2 的全部后果（§3.1 / §3.3 已由 M2 修补）。
 
 另外：**`device.seed_hex` 是本机私有材料，绝不上传后端，也绝不跨机器复制。** 换机器请重新
-生成。它在 M2 会被真正的密钥材料取代（ADR-0002）。
+生成。它在 M2 已被真正的密钥材料取代（ADR-0002）：M2 的 `DeviceId` 由
+`X25519 公钥 ‖ Ed25519 公钥` 派生，两把私钥只存在于系统安全存储里。已有设备的迁移步骤见
+[`security/device-membership.md` §5](security/device-membership.md)。
 
 ---
 
-## 5. 报告安全问题
+## 5. M2 叠加：Vault 与设备安全
+
+§1–§4 描述的是 M0 基线。本节描述 **M2 改变了什么**。
+
+M2 之前，「后端目录的写权限等价于对工作区的完全控制权」（§3.1），并且「任何能读后端
+目录的人都能读到你同步的全部配置文件内容」（§3.2）。M2 把这两条从「已知边界」变成
+「已被防御的攻击」——**但只对放进 Vault 的秘密成立**。普通同步资源（`resources` 里的
+文件）在 M2 仍然是明文 Blob。
+
+### 5.1 信任边界的变化
+
+| 主体 | M0 的信任级别 | **M2 的信任级别** |
+|---|---|---|
+| **后端存储** | 完整性自校验，**机密性不设防**，**不防回滚** | **完全不受信任**：可以被攻击者完整读取、任意篡改、任意回放。它只是一个「可能撒谎的字节仓库」 |
+| 其他设备 | **不做密码学验证** | **必须在成员链上、必须签名有效、必须未被撤销**，三者缺一即拒绝 |
+| 已撤销设备 | 概念不存在 | **视为攻击者**：无法解密新纪元内容、无法签发被接受的事件 |
+| 网络与传输通道 | M1 起由 Git 传输层负责 | Vault 内容对传输层也不可读——传输层安全不再是机密性的必要条件 |
+| 系统凭据库（Keychain / Credential Manager / Secret Service） | 不使用 | **新的信任根**：设备私钥、工作区数据密钥与检查点的权威副本都在这里 |
+| 本机 `state_dir` / SQLite | 完全信任 | 降级为**审计副本**：成员链头与检查点的权威副本在系统凭据库，SQLite 不一致时以凭据库为准并告警 |
+| 本机已解锁的用户账户 | 完全信任（边界即在此） | **不变**——仍然是边界，见 §3.6 与 §5.3.1 |
+| 本机配置文件 `envsync.yaml` | 完全信任（授权根） | **不变**——它仍然是授权根的信任根，M2 不保护它 |
+| 恢复短语 | 概念不存在 | **完全由用户保管**，EnvSync 不持有任何副本，见 [`security/recovery.md` §5](security/recovery.md) |
+
+一句话概括：**M0 信任后端不保密但不撒谎；M2 假设后端既不保密也会撒谎，并把「撒谎会被
+发现」写进了成员链与检查点。**
+
+### 5.2 M2 提供的保证
+
+每条保证都给出实现依据与锁定它的测试。测试名可直接用
+`cargo test --workspace <名字>` 运行。
+
+#### 5.2.1 后端泄露不暴露 Vault 明文
+
+**保证：只有读后端权限的攻击者，无法得到任何 Vault 秘密值的明文。**
+
+秘密值只以 `ObjectKind::SealedSecret` 存在：ChaCha20-Poly1305 密封，密钥是工作区数据
+密钥，AAD 是「除密文外的完整 canonical header」（版本、套件、工作区、逻辑名、纪元、
+nonce 六项）。数据密钥本身只经 HPKE 信封分发给在册设备。
+
+| 实现依据 | 锁定测试 |
+|---|---|
+| 空值 / 二进制 / 1 MiB 边界均可往返 | `round_trip_empty_value`、`round_trip_binary_value`、`round_trip_at_one_mib_boundary` |
+| 超过 1 MiB 在任何分配前拒绝 | `above_one_mib_is_rejected` |
+| 错误密钥打不开 | `wrong_key_fails` |
+| 翻转密文 / tag / nonce 任意一位即失败 | `flipping_any_ciphertext_or_tag_bit_fails`、`flipping_any_nonce_bit_fails` |
+| 跨工作区 / 跨逻辑名 / 跨纪元挪用密文即失败 | `cross_workspace_decryption_fails`、`cross_secret_id_decryption_fails`、`cross_epoch_decryption_fails` |
+| AAD 恰好是「去掉密文的 header」 | `aad_is_exactly_the_header_without_ciphertext` |
+| 逻辑名不是明文摘要（无相等性泄露） | `secret_id_is_a_logical_name_not_a_plaintext_digest` |
+| 每次密封使用全新随机 nonce | `nonce_is_fresh_for_every_seal`、`production_api_never_produces_the_fixed_nonce_vector` |
+| 线格式冻结 | `sealed_secret_wire_vector_is_frozen` |
+
+#### 5.2.2 设备身份可验证，成员关系不可伪造，Vault 索引不可伪造
+
+**保证：一台设备只接受从它已信任的 genesis 合法延伸出来的成员链；后端即使被完全控制，
+也只能「不给数据」，无法伪造成员变更。**
+
+`DeviceId = BLAKE3_domain("envsync:device:v1", x25519_pk ‖ ed25519_pk)`，因此改动任一
+公钥都会改变设备标识（ADR-0002）。事件签名覆盖域前缀、格式版本、套件名、用途标签、
+工作区与 payload 摘要的 canonical CBOR 结构。
+
+| 实现依据 | 锁定测试 |
+|---|---|
+| 标识覆盖两把公钥 | `device_id_is_derived_from_both_public_keys`、`flipping_any_public_key_bit_changes_device_id` |
+| 跨工作区重放 / 改 payload / 换 signer / 换用途标签均失败 | `cross_workspace_replay_is_rejected`、`modified_payload_is_rejected`、`wrong_signer_is_rejected`、`different_domain_is_rejected` |
+| 非 canonical 待签内容失败 | `non_canonical_signed_payload_is_rejected` |
+| 未知签名版本在密码学运算前被拒 | `unknown_signature_version_is_rejected_before_crypto` |
+| 小阶公钥无法验签（`verify_strict`） | `small_order_public_key_cannot_verify` |
+| genesis 必须自签、必须用初始纪元 | `genesis_must_be_self_signed_by_the_admin_it_registers`、`genesis_must_use_the_initial_epoch` |
+| 断链 / 分叉 / 重复 / 回退 / 跳号全部拒绝 | `broken_chain_link_is_rejected`、`fork_at_the_same_sequence_is_rejected`、`duplicated_event_at_the_same_sequence_is_rejected`、`replaying_an_old_event_is_rejected`、`sequence_gaps_are_rejected` |
+| 越权 / 已撤销 actor / 陌生 actor 全部拒绝 | `a_plain_member_cannot_add_promote_or_revoke`、`a_revoked_actor_cannot_sign_further_events`、`an_unknown_actor_is_rejected` |
+| 撤销最后一个管理员被拒 | `the_last_admin_cannot_be_revoked` |
+| 跨 workspace 事件混入被拒 | `cross_workspace_events_are_rejected` |
+| **整条外来链在第一条事件就被拒**（链的 `workspace` 与本地工作区比对） | `an_entire_foreign_chain_is_rejected_at_its_very_first_event` |
+| **Vault 索引背书必须由当前成员签出** | `an_index_without_a_valid_attestation_is_refused`（e2e）、`envsync_core::attestation` 的单元测试 |
+| **尚未建链的工作区仍接受未签名的头**（M0 兼容分界） | `a_workspace_without_a_membership_chain_still_accepts_an_unsigned_head`（e2e） |
+| 超长链在任何曲线运算前被拒 | `oversized_chains_are_rejected_before_any_crypto` |
+| 生成侧不会产出验证器会拒绝的事件 | `append_never_produces_an_event_the_verifier_would_reject` |
+| 错误码稳定且唯一 | `error_codes_are_stable_and_unique_per_variant` |
+
+完整的攻击路径矩阵（26 条）见
+[`security/device-membership.md` §3](security/device-membership.md)。
+
+#### 5.2.3 撤销设备后，它无法解密新纪元的内容
+
+**保证：撤销必然推进密钥纪元；已撤销设备拿不到新纪元的信封，因而无法解密撤销之后写入
+的任何秘密。**
+
+纪元规则是**双向强制**的：撤销必须恰好 `+1`，非撤销事件必须保持不变。因此纪元号是
+「撤销发生过多少次」的精确计数器。
+
+| 实现依据 | 锁定测试 |
+|---|---|
+| 只有目标设备能打开信封 | `only_the_target_device_can_open` |
+| 交换两台设备的信封失败 | `swapping_two_devices_envelopes_fails` |
+| 降级纪元 / 跨工作区重放信封失败 | `epoch_downgrade_fails`、`cross_workspace_replay_fails` |
+| 新纪元信封打不开旧纪元对象 | `new_epoch_envelope_does_not_unlock_old_epoch_object` |
+| 每次封装使用全新临时密钥 | `every_seal_uses_a_fresh_ephemeral_key` |
+| 小阶临时公钥被拒（非贡献性 DH） | `small_order_ephemeral_key_is_rejected` |
+| 撤销必须轮换纪元 | `revoking_without_rotating_the_epoch_is_rejected` |
+| 非撤销事件不得推进纪元 | `advancing_the_epoch_without_a_revocation_is_rejected` |
+| 纪元不得回退、不得跳跃 | `rolling_the_epoch_back_is_rejected`、`future_epoch_jump_is_rejected` |
+| 线格式冻结 | `key_envelope_wire_vector_is_frozen` |
+| 撤销推进纪元并为剩余设备重签信封 | `revocation_advances_the_epoch_and_reissues_envelopes` |
+| 已撤销设备读不到轮换之后写入的内容 | `a_revoked_device_cannot_read_anything_written_after_the_rotation` |
+| 新头绝不先于信封发布；journal 撒谎时拒绝推进 | `the_new_head_is_never_published_before_the_envelopes`、`the_head_is_refused_when_the_journal_lies_about_published_envelopes` |
+| 轮换从任一阶段幂等恢复 | `rotation_resumes_idempotently_from_every_stage`、`an_interrupted_rotation_is_picked_up_by_the_next_revoke_of_the_same_device` |
+| 连续两次轮换后旧对象仍可读 | `two_consecutive_rotations_keep_every_older_object_readable` |
+
+**这条保证有一个必须理解的边界**：撤销**不能**收回被撤销设备已经持有的旧纪元数据密钥。
+见 §5.3.5 与 [`security/vault-format.md` §5.2](security/vault-format.md)。
+
+#### 5.2.4 后端无法把设备拉回旧状态（反回滚）
+
+**保证：设备自己记住已接受的最高 revision、快照、成员链头（摘要 + sequence）与密钥
+纪元；任何一个维度回退，同步都会被阻塞而不是静默收敛。**
+
+这直接修补了 §3.3 记录的 M0 缺口。
+
+**读路径同样校验，而且校验发生在 CAS 之前。** 两件事各自都很要紧：
+
+* **读也校验。** `vault get` / `vault list` / `device list` / `status` 在读到远端头的那
+  一刻就做一次**只读**判定（`checkpoint::guard`，不推进检查点）。否则后端只要把头回退
+  一格，这些命令就会安静地返回旧状态——已撤销的设备重新出现在成员名单里，新纪元里写的
+  秘密凭空消失，而用户看不到任何异常，只有下一次**写**才会撞上检查点。
+* **校验在 CAS 之前。** 写路径先判定「我正要在上面盖章的这个头是不是回滚过的」，通过了
+  才允许 `compare_and_swap_ref`；推进检查点仍在 CAS 成功之后。反过来的话，被骗的客户端
+  会先把后端推进一格、再回头发现自己接受的是一个回滚过的头，攻击留下了既成事实。
+
+| 实现依据 | 锁定测试 |
+|---|---|
+| 读路径以退出码 14 失败，且本地文件零变更 | `rolling_the_backend_back_to_an_old_head`（e2e） |
+| 回滚被拦下时后端 revision **一格都不动** | 同上（同一条测试断言 CAS 从未发生） |
+
+| 实现依据 | 锁定测试 |
+|---|---|
+| revision 回退被阻塞 | `a_lower_revision_is_blocked` |
+| 同一 revision 上的不同快照被阻塞 | `a_different_snapshot_at_the_same_revision_is_blocked` |
+| 旧成员链头被阻塞（即使 revision 前进） | `an_older_membership_head_is_blocked_even_when_the_revision_advances` |
+| 同一 sequence 上的分叉链头被阻塞 | `a_forked_membership_head_at_the_same_sequence_is_blocked` |
+| 旧密钥纪元被阻塞 | `an_older_key_epoch_is_blocked` |
+| 同 revision 同快照但纪元不同被阻塞 | `the_same_revision_with_a_diverging_epoch_is_blocked` |
+| 跨工作区检查点被阻塞 | `a_checkpoint_from_another_workspace_is_blocked` |
+| 真实前进被接受、重放同一个头幂等 | `a_genuine_advance_is_accepted`、`replaying_the_same_head_is_idempotent` |
+| 只有显式 reset 能降低信任根 | `only_an_explicit_reset_can_lower_the_trust_root`、`reset_trust_root_clears_only_the_given_workspace` |
+| SQLite 审计副本执行同一套规则 | `the_sqlite_audit_copy_enforces_the_same_rules` |
+| 新设备靠管理员签名的 invitation 建立首个检查点 | `a_new_device_bootstraps_its_checkpoint_from_an_admin_signed_invitation` |
+| 恢复流程建立新纪元并强制旧设备重新授权 | `recovery_starts_a_new_epoch_and_forces_old_devices_to_re_authorise` |
+| 本地索引只接受当前链头的合法延伸 | `only_a_successor_of_the_current_head_can_be_appended`、`appending_the_same_event_twice_is_idempotent`、`a_malformed_event_is_rejected_before_touching_the_database` |
+
+#### 5.2.5 安全存储不可用时安全失败，绝不写明文回退
+
+**保证：没有可用的系统凭据库时，EnvSync 返回
+`PlatformError::SecureStoreUnavailable` 并终止，绝不把密钥写进明文文件或进程内存假装
+成功。**
+
+`keyring` 在 native feature 未开启或平台不受支持时会**静默**退回到进程内的 mock 后端。
+每个平台模块都 `use` 了对应的 `keyring::<backend>` 模块，一旦 feature 掉了就**编译
+失败**，而不是运行时静默降级。非受支持平台（如 FreeBSD）不构造任何后端，直接返回
+不可用。
+
+| 实现依据 | 锁定测试 |
+|---|---|
+| 系统存储要么可用、要么明确报不可用 | `system_store_is_either_usable_or_explicitly_unavailable` |
+| 无凭据库时快速返回而不是长时间阻塞 | `open_system_store_returns_quickly_without_a_credential_store` |
+| 内存 fake 自述为非系统存储，上层可拦截 | `in_memory_fake_declares_itself_non_system` |
+| fake 满足同一套读写契约 | `in_memory_fake_satisfies_contract` |
+| account 名称格式冻结（持久化契约） | `account_name_format_is_frozen` |
+| account 名称绝不含 value | `account_name_never_contains_the_value` |
+| 后端错误文本不泄露 value / account 名 | `canary_never_leaks_through_descriptors_or_errors`、`mapped_backend_errors_carry_purpose_but_not_the_account_name` |
+| 错误码稳定 | `secure_store_error_codes_are_stable` |
+
+#### 5.2.6 恢复短语与恢复包
+
+**保证：所有设备都丢失时，用户凭一串离线抄写的 128-bit 短语可以重建访问权；短语本身
+EnvSync 不持有任何副本。**
+
+| 实现依据 | 锁定测试 |
+|---|---|
+| 短语只展示一次（写进类型状态，且不实现 `Clone`） | `phrase_is_displayed_exactly_once` |
+| 校验位检出**全部** 32 × 31 种单字符替换 | `checksum_detects_every_single_character_substitution` |
+| 畸形短语被拒（长度、字符集） | `malformed_phrases_are_rejected` |
+| 大小写 / 分隔符 / Crockford 别名归一 | `phrase_parsing_normalizes_case_separators_and_crockford_aliases`、`phrase_round_trips_through_text`、`phrase_grouping_is_stable` |
+| 生成的短语互不相同 | `generated_phrases_are_distinct` |
+| 低于项目下限的 Argon2id 参数被拒（创建与解码两侧） | `parameters_below_project_floor_are_rejected` |
+| 超过资源上限的参数被拒 | `parameters_above_machine_ceiling_are_rejected` |
+| 畸形包不会触发任何 Argon2 分配（< 200 ms 拒绝） | `malformed_package_never_requests_more_than_two_gib_or_endless_iterations` |
+| 错误口令返回与其他失败**同一个** authentication failure | `wrong_phrase_returns_the_same_authentication_failure` |
+| salt / nonce 每包新生成 | `salt_and_nonce_are_fresh_for_every_package` |
+| 线格式冻结 | `recovery_package_wire_vector_is_frozen`、`recovery_phrase_vector_is_frozen` |
+
+#### 5.2.7 秘密不进日志、不进错误、不进磁盘（编译期约束）
+
+**保证：`DataKey`、`Plaintext`、`DeviceKeypair`、`RecoveryPhrase`、`SecretBytes`
+**不实现** `Debug` / `Display` / 序列化 trait，`Drop` 时 zeroize。**
+
+这是**编译期**约束，不是运行时检查：把它们写进 `tracing::info!`、`format!("{:?}")`
+或 `serde_json::to_string` 根本不会编译。不存在「忘了脱敏」这个失败模式，只存在
+「显式调用了 `expose()`」这个 review 中一眼可见的调用点。
+
+| 实现依据 | 锁定测试 |
+|---|---|
+| 14 条会接触明文的失败路径都不泄露 canary | `no_error_path_leaks_the_canary_plaintext` |
+| 探针本身有效（反向自检） | `the_canary_test_would_actually_catch_a_leak` |
+| `SealedSecret` 的 `Debug` 只显示元数据 | `sealed_object_debug_shows_no_plaintext` |
+| 安全存储的描述与错误不泄露 value | `canary_never_leaks_through_descriptors_or_errors` |
+
+M0 的三层脱敏（§2.6）在 M2 仍然生效，作为最后一道防线。
+
+### 5.3 M2 仍然**不**提供的保证
+
+以下每一条都是**当前的真实状态**，不是疏忽。
+
+#### 5.3.1 进程内存不设防：没有 mlock、没有防 swap、没有防 core dump
+
+敏感类型在 `Drop` 时 zeroize，这缩短了密钥留在堆上的**时间窗口**。它**不**提供：
+
+- **没有 `mlock` / `VirtualLock`。** 解密后的明文、数据密钥、设备私钥都可能被操作系统
+  换出到 swap 分区或休眠文件，并在那里以明文留存到被覆盖为止。
+- **没有 core dump 抑制。** 进程崩溃时的核心转储会包含当时内存里的一切。EnvSync 不调用
+  `setrlimit(RLIMIT_CORE, 0)`、不设置 `PR_SET_DUMPABLE`、不在 macOS 上做等价处理。
+- **没有防调试。** 以同一用户身份运行的调试器可以直接读取进程内存。
+- **zeroize 不是绝对的。** 编译器优化、内存分配器的内部复制（`Vec` 扩容时的搬迁）、
+  以及值被移动时留下的旧副本，都可能让密钥的某个副本逃过清零。`zeroize` crate 用
+  volatile 写与编译屏障对抗前者，但它无法追回已经被复制走的字节。
+
+**为什么不做：** `mlock` 与 `RLIMIT_CORE` 在跨平台上需要 `unsafe` FFI 或平台特定 crate，
+而工作区全部 crate 都是 `#![forbid(unsafe_code)]`（§2.7）。更根本的是，这些防护针对的
+是「同机器上的另一个进程 / 事后取证」，而 §3.6 已经把「本机已解锁的用户账户」划在信任
+边界之内——在那个边界之内，攻击者根本不需要读 swap，直接读进程内存即可。
+
+**这意味着：** M2 的威胁模型是「**后端和网络被攻破**」，不是「**你的笔记本被攻破**」。
+如果攻击者已经能在你的账户下运行代码，M2 不保护你。
+
+#### 5.3.2 HPKE 未做 RFC 9180 官方向量互操作验证
+
+`envsync-crypto` 的设备信封是按 RFC 9180 §4.1 + §5.1 **手工实现**的（底层原语来自
+RustCrypto / dalek）。现有测试覆盖的是**自洽性**——`suite_id` 字节、key schedule 的
+确定性与 `info` 绑定、端到端往返、线格式冻结——它们证明「封装和解封是同一套算法」，
+**不能**证明「这套算法就是 RFC 9180」。
+
+一个在 `LabeledExtract` 里漏掉 `suite_id`、或把 `key_schedule_context` 的 `mode` 字节
+放错位置的实现，会完美通过全部现有测试，并被冻结向量忠实地保存下来。
+
+**发布前审计必须补上 RFC 9180 附录 A.3 的官方向量验证**，逐步断言 `enc`、
+`shared_secret`、`key_schedule_context`、`secret`、`key`、`base_nonce` 与最终密文。
+详见 [`security/test-vectors/README.md` §6](security/test-vectors/README.md#todo-for-audit)。
+
+**在此之前，请把设备信封的安全性理解为「依赖本实现对 RFC 9180 的解读正确」，而不是
+「已验证符合 RFC 9180」。**
+
+#### 5.3.3 系统凭据库的真机往返在 CI 容器里没有被验证
+
+`secure_store_contract.rs` 的契约套件（`put` / `get` / `delete` / 覆盖 / not-found）
+在**内存 fake** 上一定运行（`in_memory_fake_satisfies_contract`）。对**真实系统凭据库**
+的那一份（`system_store_is_either_usable_or_explicitly_unavailable`）是**条件执行**的：
+
+- 凭据库可用时，对它跑同一套契约；
+- 不可用时（**CI 容器里的常态**：没有 DBus 会话、没有已解锁的 Keychain），测试只断言
+  「必须报 `platform.secure_store_unavailable`，且不能是别的错误、不能 panic、不能静默
+  降级」。
+
+**因此 CI 的绿灯不代表「密钥在 macOS Keychain / Windows Credential Manager /
+Linux Secret Service 上真的能写进去再读出来」。** 那需要在带图形会话的真机或带凭据库
+的 CI runner 上跑，目前**没有**这样的 job。
+
+同样未被自动验证的：凭据库**锁定**与**访问被拒绝**这两条错误路径。
+`map_leaky_backend_errors_for_test` 覆盖了错误**映射**（保证不泄露），但触发真实锁定
+状态需要人工干预。
+
+#### 5.3.4 Argon2id 的下限按 2026 年的实践偏保守
+
+项目下限是 **64 MiB / 3 次迭代 / 1 线程**，而 `Argon2Params::recommended()` **正好等于
+下限**。
+
+这个取值的理由是「任何一台还能跑 EnvSync 的机器都扛得住」——包括低端笔记本与 CI 容器。
+按 2026 年的实践，它处在可接受区间偏保守的一端：内存硬性 KDF 的推荐值一直在往上走，
+而 64 MiB 是一个很多年前就在用的数字。
+
+**这意味着：** 如果你的恢复包落到了攻击者手里（它是公开材料，放在后端上），破解成本由
+「128 bit 熵 × 64 MiB × 3 次」决定。128 bit 熵本身仍然使穷举不可行，因此这不是一个
+实际漏洞——但它**不留余量**。
+
+**建议：** 桌面端可以把参数调高（上限是 2 GiB / 32 次 / 16 线程），代价是每次恢复多等
+几秒。参数写在恢复包里，因此调高之后创建的包在任何设备上都能被正确打开。
+
+#### 5.3.5 撤销不能收回已经泄露的旧秘密（无前向保密）
+
+一台设备在被撤销**之前**已经拿到了当时纪元的数据密钥。撤销**不能**收回它。因此该设备
+仍然能解密它在撤销前拷贝走的任何密文，即使它再也无法访问后端。
+
+lazy rewrap（旧对象在被读取后才用新纪元密钥重新密封）也不改变这一点：无论 rewrap 进行
+得多快，上面那句话都成立。
+
+**因此：撤销一台可能已经泄露的设备之后，必须到各自的签发方去轮换所有秘密值**——重新
+生成 API token、重新签发证书、重置口令。EnvSync 能保证新值只对剩余设备可见，它无法让
+已经离开进程的字节回来。详见
+[`security/vault-format.md` §5.2](security/vault-format.md) 与
+[`security/device-membership.md` §7](security/device-membership.md)。
+
+#### 5.3.6 genesis 的真伪只能靠带外渠道确认
+
+`verify_membership_chain` 只能证明「这条链从**给定的** genesis 合法延伸而来」，
+**无法证明「这个 genesis 是对的」**。新设备加入时，genesis 摘要必须通过带外可信渠道
+（当面、已认证的即时通讯、已有可信设备显示的二维码）送达并比对。
+
+这是所有信任链方案的共同基础问题，不是 EnvSync 的疏漏——但它是一个**用户必须真的去做**
+的步骤，跳过它会让整条链失去意义。
+
+#### 5.3.7 元数据对后端仍然可见
+
+后端读权限**不能**得到秘密值，但**能**得到：
+
+| 可见的元数据 | 来自 |
+|---|---|
+| 有哪些逻辑秘密名（如 `ci/npm-token`） | Sealed Secret 的 `secret_id` 字段 |
+| 每条秘密的密文长度（≈ 明文长度 + 16） | Sealed Secret 的 `ciphertext` 长度 |
+| 每条秘密属于哪个工作区、哪个纪元 | `workspace_id`、`key_epoch` |
+| 有多少台设备、它们的 `DeviceId` 与公钥 | 成员事件与信封的 `recipient` |
+| 成员变更的完整历史与时间戳 | 成员事件链（`created_at_unix_ms`） |
+| 撤销发生过多少次 | 密钥纪元号 |
+| 恢复包的 Argon2id 参数与 salt | `RecoveryPackage` 的 header |
+
+**明确没有泄露的**：秘密值本身，以及「两条秘密的值是否相同」——后者由「逻辑名不是明文
+摘要」加「每次密封使用新随机 nonce」共同保证（§5.2.1）。
+
+M2 **不提供**元数据保护（padding、逻辑名混淆、oblivious 访问）。如果「这个工作区里有
+一条叫 `prod/db-password` 的秘密」本身就是敏感信息，请不要把它命名成那样。
+
+#### 5.3.8 普通同步资源仍然是明文
+
+**M2 的加密只覆盖 Vault。** `envsync.yaml` 的 `resources` 里声明的文件仍然以明文 Blob
+存进后端，§3.2 的全部结论对它们继续成立。`policy.secret: true` 仍然**不加密任何东西**
+（§4.1）。
+
+秘密应当放进 Vault 并在配置里以逻辑 Secret ID 引用，而不是直接同步含凭据的文件。
+
+#### 5.3.9 其他
+
+| 不提供 | 何时 / 为什么 |
+|---|---|
+| 秘密值的历史版本与审计日志 | 未排期 |
+| 元数据保护（见 §5.3.7） | 无计划 |
+| 对 `envsync.yaml` 自身的完整性保护 | 无计划——它是授权根的信任根，见 §1.1 |
+| 防御本机同用户下的恶意进程 | 无计划，见 §3.6 与 §5.3.1 |
+| 包管理器期望状态、Agent Bundle quarantine、策略引擎 | M3 |
+| 插件沙箱与版本化 RPC | M4 |
+
+---
+
+## 6. 报告安全问题
 
 如果你发现了一个安全问题——特别是能让 EnvSync **写到授权根之外**、**在没有备份的情况下
-覆盖用户文件**、**把秘密内容写进输出或日志**，或**绕过计划直接写入**的路径——请不要提交
-公开 issue。
+覆盖用户文件**、**把秘密内容写进输出或日志**、**绕过计划直接写入**，或者（M2 起）
+**让不受信任的后端伪造成员变更、回滚设备状态，或让已撤销设备读到新纪元内容**的路径
+——请不要提交公开 issue。
 
 请通过项目仓库
 （[`https://github.com/envsync/envsync`](https://github.com/envsync/envsync)）的私密安全
@@ -517,6 +902,6 @@ umask 决定，M0 不额外收紧**。如果 `state_dir` 位于一个宽权限�
 - 你认为被违反的是本文中的哪一条保证；
 - **不要**附带真实凭据、真实用户路径或本机配置——用 `/home/YOUR_USER` 这样的占位符。
 
-请注意 §3 中已经列出的项目**不是**安全漏洞，而是 M0 已知且明示的边界。如果你认为某条边界
-的**说明本身**不准确或有误导性，同样欢迎报告——文档与实现不一致，在本项目里被视为安全
-问题的一种。
+请注意 §3 与 §5.3 中已经列出的项目**不是**安全漏洞，而是已知且明示的边界。如果你认为
+某条边界的**说明本身**不准确或有误导性，同样欢迎报告——文档与实现不一致，在本项目里被
+视为安全问题的一种。

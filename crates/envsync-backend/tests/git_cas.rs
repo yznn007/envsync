@@ -109,7 +109,7 @@ fn concurrent_publish_from_the_same_revision_has_exactly_one_winner() {
 
     // 失败方拿到的是真实的远端 revision，而不是「不知道」。
     let err = beta_result.expect_err("后到者必须失败");
-    assert_eq!(err.code(), "cas_conflict");
+    assert_eq!(err.code(), "backend.cas_conflict");
     assert!(
         matches!(
             err,
@@ -237,7 +237,7 @@ fn rejects_any_other_auth_configuration() {
         ("", None),
     ] {
         let err = GitAuth::parse(kind, secret).expect_err(kind);
-        assert_eq!(err.code(), "unsupported", "{kind}");
+        assert_eq!(err.code(), "backend.unsupported", "{kind}");
     }
     // secret 引用必须是引用形态，不能是 token 原文。
     assert!(GitAuth::parse("token-secret-ref", Some("gh p/token=")).is_err());
@@ -256,7 +256,7 @@ fn rejects_remote_urls_that_carry_credentials() {
         "user:password@example.com:envsync/dotfiles.git",
     ] {
         let err = validate_remote_url(url).expect_err(url);
-        assert_eq!(err.code(), "unsupported", "{url}");
+        assert_eq!(err.code(), "backend.unsupported", "{url}");
     }
 }
 
@@ -268,7 +268,7 @@ fn rejects_remote_urls_that_carry_a_token_query_string() {
         "ssh://example.com/envsync/dotfiles.git?token=secret",
     ] {
         let err = validate_remote_url(url).expect_err(url);
-        assert_eq!(err.code(), "unsupported", "{url}");
+        assert_eq!(err.code(), "backend.unsupported", "{url}");
     }
 }
 

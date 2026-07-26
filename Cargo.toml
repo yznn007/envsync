@@ -10,6 +10,7 @@ members = [
     "crates/envsync-cli",
     # 端到端验收套件：只依赖真实 CLI 二进制，不被其他 crate 依赖。
     "crates/envsync-e2e",
+    "crates/envsync-crypto",
 ]
 
 [workspace.package]
@@ -28,6 +29,7 @@ envsync-platform = { path = "crates/envsync-platform", version = "0.1.0" }
 envsync-storage = { path = "crates/envsync-storage", version = "0.1.0" }
 envsync-core = { path = "crates/envsync-core", version = "0.1.0" }
 envsync-adapters = { path = "crates/envsync-adapters", version = "0.1.0" }
+envsync-crypto = { path = "crates/envsync-crypto", version = "0.1.0" }
 
 blake3 = "1"
 cap-std = "3"
@@ -43,6 +45,18 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+
+# 密码学依赖：全部来自 RustCrypto / dalek 生态，不自研原语。
+ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
+x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+sha2 = "0.10"
+argon2 = "0.5"
+zeroize = { version = "1", features = ["derive"] }
+subtle = "2"
+rand_core = { version = "0.6", features = ["getrandom"] }
 
 tempfile = "3"
 proptest = "1"

@@ -26,7 +26,7 @@
 //! 再从远端一侧按**广度优先**推进，第一个落在祖先集合里的快照就是合并基。广度优先
 //! 保证「最近」，`BTreeSet` 与排序后的 parents 保证结果确定。
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 
 use envsync_backend::{Backend, BackendError};
 use envsync_domain::{
@@ -412,7 +412,18 @@ pub fn merge_states(
     }
     context.drafts.put(ObjectId::from(state_id), &state_bytes)?;
 
-    let mut metadata = BTreeMap::new();
+    // 工作区级元数据（M2 起是 Vault 索引指针与背书）必须跨合并存活，理由与 `capture`
+    // 完全相同：它描述的是「这个工作区现在是什么样」，不是「这一次合并做了什么」。
+    //
+    // 两侧都可能带着它，取值规则是**远端优先**：本地草稿头的那一份来自 capture 当时的
+    // 基线，而远端头是刚从后端读到的。冲突时选后者，代价最多是丢掉一次本机尚未发布的
+    // Vault 变更（它下一次 Vault 发布会自己写回去），而反过来会把别人已经发布的 Vault
+    // 变更盖掉——那是不可逆的。
+    let mut metadata =
+        crate::vault::inherited_workspace_metadata(&context.snapshot(local_head)?.metadata);
+    metadata.extend(crate::vault::inherited_workspace_metadata(
+        &context.snapshot(remote_head)?.metadata,
+    ));
     metadata.insert("device_name".to_owned(), context.device_name.to_owned());
     metadata.insert("format".to_owned(), "envsync/m1".to_owned());
     metadata.insert("merge".to_owned(), "three_way".to_owned());

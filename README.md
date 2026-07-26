@@ -4,15 +4,19 @@ EnvSync 是一个本地优先、跨平台的开发环境同步工具。它面向
 Windows，统一管理 shell 配置、终端配置、Git 参数、包管理器期望状态、AI
 Agent/Skill 配置以及显式选择的凭据。
 
-项目状态：**M0、M1 已完成。**
+项目状态：**M0、M1 已完成；M2 进行中。**
 
 - **M0（安全文件闭环）**：本地后端、Full File 与 Managed Block、确定性快照、不可变
   Plan、CAS 发布、安全写入、SQLite journal、验证、回滚与崩溃恢复、可脚本化 CLI。
 - **M1（可用同步）**：Git 后端、设备 Profile 投影、三方合并（文本 + JSON/YAML/TOML/
   INI/Git config）、冲突对象与裁决流程、首批 shell / 终端 / Git 内建适配器，
   以及 `fetch` / `merge` / `conflicts` / `profile explain` 四组新命令与 JSON 契约 v2。
+- **M2（Vault 与设备安全，进行中）**：密码学层（固定算法套件、设备身份与域分隔签名、
+  密封秘密对象、HPKE 设备信封、Argon2id 恢复包）、设备成员签名链、系统安全存储接入、
+  反回滚检查点、可恢复的密钥轮换与 Vault 应用服务均已落地并有攻击路径测试；
+  `device` / `vault` / `recovery` / `security` 四组命令行入口仍在开发中。
 
-Linux / macOS / Windows 三平台 CI 全部就绪。下一步是 M2（Vault 与设备身份）。
+Linux / macOS / Windows 三平台 CI 全部就绪。
 
 **Git 后端**把 EnvSync 的内容寻址对象映射进一棵普通的 Git tree
 （`.envsync/objects/…` + `.envsync/refs/<workspace>.cbor`），用远端 branch head 做
@@ -20,8 +24,9 @@ CAS：push 永不带 force，发布前做 lease 校验、发布后回读确认�
 git credential helper 或 Vault secret 引用——URL 里写不进凭据。详见
 [Git 后端文档](docs/backends/git.md)。
 
-> M0 与 M1 **不提供**密码学签名、加密和反回滚保护。在 M2 的 Vault 交付之前，
-> 不要把真实凭据放进 EnvSync 管理的普通资源——详见[安全模型](docs/security-model.md)。
+> **普通同步资源在后端上仍然是明文**——M2 的端到端加密只覆盖 Vault。不要把真实凭据
+> 放进 EnvSync 管理的普通资源，详见[安全模型](docs/security-model.md)（§3.2、§5.3.8）。
+> M2 已提供的保证与**仍然不提供**的保证见同一文档的 §5.2 与 §5.3。
 
 ## 快速开始
 
@@ -141,7 +146,8 @@ CI（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）在
 - [命令行文档](docs/cli.md)：命令、参数、JSON 契约（v1/v2）、退出码、脱敏规则
 - [M0 运维手册](docs/m0-operations.md)：数据模型、事务边界与失败状态、备份与恢复、
   版本兼容策略、故障排查手册
-- [安全模型](docs/security-model.md)：信任边界、提供与**不提供**的保证、秘密处理约定
+- [安全模型](docs/security-model.md)：信任边界（M0 基线 + M2 叠加）、提供与**不提供**的
+  保证、秘密处理约定
 - [配置示例](examples/workspace.yaml)：逐字段注释，且被测试真实解析
 - [Git 后端配置示例](examples/workspace-git.yaml)：Git 后端 + Profile + selector + 设备覆盖
 
@@ -154,6 +160,19 @@ CI（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）在
 - [冲突处理](docs/conflicts.md)：冲突对象与状态机、`conflicts` 命令、退出码 13、恢复流程
 - [合并规则](docs/merge.md)：文本 diff3 与五种结构化格式的规则、已知限制、资源上限
 - [适配器](docs/adapters.md)：内建适配器清单、sealed trait 与 M4 插件 SDK 的关系
+
+**M2 安全专题**
+
+- [Vault 线格式与密钥派生](docs/security/vault-format.md)：算法套件、sealed object 与
+  HPKE 信封的逐字段定义、域分隔标签总表、纪元语义与 lazy rewrap 边界、nonce 生日界、
+  编译期不变量清单
+- [设备成员链与反回滚检查点](docs/security/device-membership.md)：事件链结构、角色授权
+  矩阵、26 条攻击路径与对应错误码、邀请/加入/撤销/恢复四个仪式、`DeviceId` 迁移步骤、
+  检查点判定规则与 `reset_trust_root` 的危险性
+- [恢复短语与恢复包](docs/security/recovery.md)：熵与 Base32-Crockford 编码、Argon2id
+  参数上下限、恢复仪式、**备份责任与丢失短语的后果**
+- [测试向量](docs/security/test-vectors/README.md)：冻结的回归向量（**非官方互操作
+  向量**）与发布前审计待办
 
 **设计与计划**
 
@@ -176,7 +195,7 @@ CI（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）在
 
 - **M0（已完成）**：本地后端、安全文件捕获、计划、应用、验证和回滚
 - **M1（已完成）**：Git 后端、Profile 投影、三方合并、冲突对象、首批内建适配器
-- M2：Vault、设备身份、成员关系与恢复
+- **M2（进行中）**：Vault、设备身份、成员关系与恢复
 - M3：包管理器、Agent Bundle、Skill 和策略引擎
 - M4：Tauri 桌面端、Gist 后端、插件 SDK
 

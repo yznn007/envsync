@@ -8,21 +8,37 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[lib]
+name = "envsync_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "envsync"
 path = "src/main.rs"
 
+[features]
+# 仅供测试：暴露 `VaultContext::with_stores`，让集成测试可以注入内存安全存储。
+# 生产构建**绝不能**开启；`[dev-dependencies]` 中的自引用会在 `cargo test`
+# 与 `cargo clippy --all-targets` 时自动启用它，而 `cargo build` 不会。
+test-support = ["envsync-platform/test-support"]
+
 [dependencies]
 envsync-adapters.workspace = true
 envsync-core.workspace = true
+envsync-crypto.workspace = true
 envsync-domain.workspace = true
 envsync-backend.workspace = true
+envsync-platform.workspace = true
 envsync-storage.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# 自引用 dev-dependency：让测试目标构建时自动打开 `test-support`，
+# 而普通 `cargo build` 保持关闭。
+envsync-cli = { path = ".", features = ["test-support"] }

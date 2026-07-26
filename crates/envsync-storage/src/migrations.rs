@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use crate::journal::JournalError;
 
 /// 本版本支持的 schema 版本号。
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// `schema_meta` 中记录 schema 版本的键名。
 pub const SCHEMA_VERSION_KEY: &str = "schema_version";
@@ -50,6 +50,15 @@ const MIGRATION_0001: &str = include_str!("../migrations/0001_journal.sql");
 
 /// 0002 迁移脚本：设备 Profile 与合并冲突索引。
 const MIGRATION_0002: &str = include_str!("../migrations/0002_profiles_conflicts.sql");
+
+/// 0003 迁移脚本：已验证成员事件索引与链头。
+const MIGRATION_0003: &str = include_str!("../migrations/0003_membership.sql");
+
+/// 0004 迁移脚本：反回滚检查点的审计副本。
+const MIGRATION_0004: &str = include_str!("../migrations/0004_checkpoints.sql");
+
+/// 0005 迁移脚本：可恢复的密钥轮换 journal。
+const MIGRATION_0005: &str = include_str!("../migrations/0005_rotation.sql");
 
 /// 迁移后校验用的探针：`(表名, 该版本必须存在的列)`。
 ///
@@ -82,6 +91,25 @@ const SCHEMA_PROBES: &[(&str, &str)] = &[
         "conflicts",
         "conflict_id, workspace_id, resource_id, kind, base_blob, ours_blob, theirs_blob, \
          state, resolution_choice, resolved_blob, created_at_unix_ms, resolved_at_unix_ms",
+    ),
+    (
+        "membership_events",
+        "workspace_id, sequence, event_digest, object_id, epoch, actor, action_kind, \
+         subject, created_at_unix_ms",
+    ),
+    (
+        "membership_head",
+        "workspace_id, head_digest, sequence, epoch, verified_at_unix_ms",
+    ),
+    (
+        "checkpoints",
+        "workspace_id, revision, snapshot_id, membership_digest, membership_sequence, \
+         key_epoch, updated_at_unix_ms",
+    ),
+    (
+        "rotations",
+        "workspace_id, from_epoch, to_epoch, revoked_device, stage, recipients, envelopes, \
+         pending_rewrap, event_created_at_unix_ms, started_at_unix_ms, updated_at_unix_ms",
     ),
 ];
 
@@ -212,6 +240,15 @@ fn migrate(connection: &Connection) -> Result<(), JournalError> {
     }
     if current < 2 {
         transaction.execute_batch(MIGRATION_0002)?;
+    }
+    if current < 3 {
+        transaction.execute_batch(MIGRATION_0003)?;
+    }
+    if current < 4 {
+        transaction.execute_batch(MIGRATION_0004)?;
+    }
+    if current < 5 {
+        transaction.execute_batch(MIGRATION_0005)?;
     }
     verify_schema(&transaction)?;
     transaction.execute(

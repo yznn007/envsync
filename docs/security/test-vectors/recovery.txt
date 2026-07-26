@@ -1,0 +1,172 @@
+EnvSync M2 测试向量 —— Argon2id 恢复包（RecoveryPackage）
+====================================================================
+
+⚠️  以下恢复短语熵、salt 与 nonce 都是硬编码的测试专用假值，
+    仅供测试，绝不用于生产。
+
+来源测试：crates/envsync-crypto/tests/vectors.rs
+          fn recovery_package_wire_vector_is_frozen()
+复现命令：cargo test -p envsync-crypto --test vectors recovery_package_wire_vector_is_frozen
+规范说明：docs/security/recovery.md §2、§3
+短语向量：docs/security/test-vectors/recovery-phrase.txt
+
+
+1. 固定输入
+--------------------------------------------------------------------
+
+entropy       00112233445566778899aabbccddeeff
+              16 字节 = 128 bit。测试常量。
+              含义：恢复短语的原始熵，也是 Argon2id 的 password。
+              对应短语：008J-4CT4-ANK7-F24S-NAXW-SQFE-ZYGH-7XZ2
+              ⚠️ KDF 用的是**熵**而不是短语文本，避免依赖文本归一化规则。
+
+params        memory_kib  = 65536（64 MiB）  = Argon2Params::MIN_MEMORY_KIB
+              time_cost   = 3                = Argon2Params::MIN_TIME_COST
+              parallelism = 1                = Argon2Params::MIN_PARALLELISM
+              即 Argon2Params::recommended()，正好等于项目安全下限。
+              算法 Argon2id，版本 0x13，输出长度 32 字节。
+
+salt          101112131415161718191a1b1c1d1e1f
+              16 字节。测试常量。
+              ⚠️ 生产 API（RecoveryPackage::create）从 OsRng 内部生成 salt，
+                 调用者无法注入；本向量使用的
+                 create_with_salt_nonce_for_tests 只在 test-vectors feature 下存在。
+
+nonce         202122232425262728292a2b
+              12 字节。测试常量。同上，生产由 OsRng 生成。
+
+payload       "test-vector-recovery-material"（29 字节 ASCII）
+              含义：被短语保护的恢复材料。密码学层对它是不透明的；
+                    按设计它承载恢复身份密钥与工作区恢复材料。
+
+算法套件      ESV1_X25519_HKDF_SHA256_CHACHA20POLY1305_ED25519
+格式版本      1
+
+
+2. 派生的中间量：header（同时是 AAD 与 HKDF 的 info）
+--------------------------------------------------------------------
+
+header = canonical_cbor([
+    version, suite, memory_kib, time_cost, parallelism, salt, nonce
+])
+
+header（89 字节，十六进制）：
+
+87017830455356315f5832353531395f484b44465f5348413235365f434841434841
+3230504f4c59313330355f454432353531391a000100000301501011121314151617
+18191a1b1c1d1e1f4c202122232425262728292a2b
+
+注意：header 是 7 元数组（头字节 0x87），完整对象是 8 元数组（头字节 0x88）。
+      header 不是完整对象的字节前缀。
+
+
+3. KEK 派生链
+--------------------------------------------------------------------
+
+① kek_raw = Argon2id(
+       password = entropy（16 字节，见第 1 节）,
+       salt     = salt（16 字节，见第 1 节）,
+       m = 65536 KiB, t = 3, p = 1, version = 0x13,
+       out_len  = 32
+   )
+
+② prk = HKDF-SHA256-Extract(
+       salt = "envsync:recovery-kek:v1"（23 字节 ASCII 字面量，
+              十六进制 656e7673796e633a7265636f766572792d6b656b3a7631）,
+       ikm  = kek_raw
+   )
+
+   常量名 RECOVERY_KEK_DOMAIN。注意它在这里是 HKDF 的 salt，
+   不是 BLAKE3 的哈希域标签。
+
+③ kek = HKDF-SHA256-Expand(prk, info = header（第 2 节的 89 字节）, L = 32)
+
+④ ciphertext = ChaCha20Poly1305-Seal(kek, nonce, aad = header, payload)
+
+Argon2id 的输出再过一次 HKDF，是为了把**格式版本、套件与全部 KDF 参数**绑进
+最终密钥：即便有人改写包里记录的参数，派生出的密钥也会不同，解密直接失败。
+注意 info 与 aad 是同一串字节。
+
+
+4. 输出：完整对象的 canonical CBOR
+--------------------------------------------------------------------
+
+RecoveryPackage::to_canonical_vec()，136 字节：
+
+88017830455356315f5832353531395f484b44465f5348413235365f434841434841
+3230504f4c59313330355f454432353531391a000100000301501011121314151617
+18191a1b1c1d1e1f4c202122232425262728292a2b582d5738ea57411d21938dc1d6
+c8e51365ab2a04a7a6d9c4f3ffa048b26fc5b4aa84b84a51d35ae6630566e2f9c65b
+
+
+5. 字段拆解
+--------------------------------------------------------------------
+
+偏移        字节                                   含义
+--------    ---------------------------------      -----------------------------
+   0        88                                     8 元数组
+   1        01                                     [0] version = 1（uint）
+   2..3     7830                                   text，长度 0x30 = 48
+   4..51    455356315f58 …（48 字节）               [1] suite（text）
+  52..56    1a00010000                             [2] memory_kib = 65536（uint，
+                                                       主类型 0 + 附加信息 26
+                                                       → 后随 4 字节大端）
+  57        03                                     [3] time_cost = 3（uint）
+  58        01                                     [4] parallelism = 1（uint）
+  59        50                                     bytes，长度 0x10 = 16
+  60..75    101112131415161718191a1b1c1d1e1f       [5] salt（bytes 16）
+  76        4c                                     bytes，长度 0x0c = 12
+  77..88    202122232425262728292a2b               [6] nonce（bytes 12）
+  89..90    582d                                   bytes，长度 0x2d = 45
+  91..135   5738ea57411d2193 … 9c65b（45 字节）     [7] ciphertext（bytes）
+                                                       = 29 字节密文 + 16 字节 tag
+
+字段 [0]..[6] 即第 2 节的 header；字段 [7] 是唯一不进 AAD 的字段。
+
+memory_kib 的编码值得单独注意：65536 用最短形式编码为 `1a 00010000`
+（主类型 0、附加信息 26、4 字节大端），不是 `1b` 的 8 字节形式。
+canonical CBOR 要求最短整数编码；非最短形式在解码期就被拒绝。
+
+
+6. 参数边界（解码期即生效）
+--------------------------------------------------------------------
+
+RecoveryPackage::from_value 在解码时就调用 Argon2Params::new，因此：
+
+  memory_kib  ∈ [65536, 2097152]   低于 → KdfParametersTooWeak
+  time_cost   ∈ [3, 32]            高于 → KdfParametersTooLarge
+  parallelism ∈ [1, 16]
+
+**畸形包在任何 Argon2 分配之前就被拒绝**。测试
+malformed_package_never_requests_more_than_two_gib_or_endless_iterations
+不只断言「被拒绝」，还断言拒绝耗时 < 200 ms——否则说明真的开始跑 KDF 了。
+
+读取时也拒绝低于下限的包，理由见 docs/security/recovery.md §2.2：
+参数由包自己声明，而包来自不受信任的后端。
+
+
+7. 怎么核对
+--------------------------------------------------------------------
+
+a) 逐字节比对第 2、4 节：
+   cargo test -p envsync-crypto --test vectors recovery_package_wire_vector_is_frozen
+
+b) 独立复现：用任意 Argon2id 实现（Argon2id、v0x13、m=65536、t=3、p=1、
+   out=32）以 entropy 为 password、salt 为 salt 算出 kek_raw；
+   再用 HKDF-SHA256 按第 3 节的 ②③ 步算出 kek；
+   最后用 ChaCha20-Poly1305 以 (kek, nonce, header) 打开第 5 节的 ciphertext，
+   应得到 ASCII "test-vector-recovery-material"。
+   这一步不依赖 EnvSync 的任何代码。
+
+c) 攻击路径自检（对应 tests/recovery_package.rs）：
+   - 用错误的短语打开        → CryptoError::Authentication
+     （wrong_phrase_returns_the_same_authentication_failure）
+   - 把 memory_kib 改成 1    → 解码期 KdfParametersTooWeak
+   - 把 memory_kib 改成 4 GiB → 解码期 KdfParametersTooLarge
+   - 把 version 改成 42      → 解码失败（unknown_wire_version_is_rejected）
+   - 密文超过 1 MiB + tag    → 解码失败（oversized_ciphertext_is_rejected_at_decode）
+
+能证明什么：恢复包线格式、header 定义、KEK 派生链与冻结那天一致，
+            且与标准 Argon2id + HKDF-SHA256 + ChaCha20-Poly1305 兼容。
+不能证明什么：不能证明 64 MiB / 3 次这组下限对未来的算力仍然够用；
+            那是一个需要定期重新评估的参数选择。

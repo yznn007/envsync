@@ -13,6 +13,7 @@
 //! | [`capability`] | 授权根、相对目标校验、逐段 no-follow 路径解析 |
 //! | [`reader`] | 能力约束读取，产出 [`envsync_domain::Observation`] |
 //! | [`writer`] | 安全写入、备份、删除与回滚收据 |
+//! | [`secure_store`] | 系统凭据库（Keychain / Credential Manager / Secret Service） |
 //!
 //! ## 三条硬约束
 //!
@@ -55,6 +56,7 @@ use envsync_domain::Digest32;
 
 pub mod capability;
 pub mod reader;
+pub mod secure_store;
 pub mod writer;
 
 pub use capability::{
@@ -62,6 +64,13 @@ pub use capability::{
     DEFAULT_DIR_MODE, SECRET_DIR_MODE,
 };
 pub use reader::{FileReader, ReadOutcome, FILE_CONTENT_DOMAIN};
+/// 内存安全存储替身。**只在 `test-support` feature 打开时存在**，生产构建里没有这个符号。
+#[cfg(any(feature = "test-support", test))]
+pub use secure_store::fake::InMemorySecureStore;
+pub use secure_store::{
+    open_system_store, SecretBytes, SecureKey, SecurePurpose, SecureStore, SecureStoreDescriptor,
+    DEVICE_PLACEHOLDER, SERVICE_NAME,
+};
 pub use writer::{
     DeleteRequest, FaultInjection, Receipt, SafeWriter, WriteRequest, SECRET_DEFAULT_MODE,
     TEMP_FILE_PREFIX,
@@ -187,6 +196,52 @@ pub enum PlatformError {
         /// 被注入故障的阶段名。
         stage: &'static str,
     },
+
+    /// 当前环境没有可用的系统安全存储。
+    ///
+    /// 收到它就意味着**不能继续**：M2 不允许把设备私钥或数据密钥降级写到明文文件。
+    #[error("系统安全存储不可用：{detail}")]
+    SecureStoreUnavailable {
+        /// 不可用的原因。恒为 `&'static str`，不含任何来自后端的文本。
+        detail: &'static str,
+    },
+
+    /// 系统安全存储明确拒绝了本次访问（用户取消授权、ACL 拒绝等）。
+    #[error("系统安全存储拒绝访问（用途 {purpose}）")]
+    SecureStoreDenied {
+        /// 受影响的用途标记。**不含** workspace / device，因此不会泄露完整 account 名。
+        purpose: &'static str,
+    },
+
+    /// 系统安全存储处于锁定状态，且无法在当前上下文里解锁。
+    #[error("系统安全存储已锁定（用途 {purpose}）")]
+    SecureStoreLocked {
+        /// 受影响的用途标记。
+        purpose: &'static str,
+    },
+
+    /// 系统安全存储后端返回了其他失败。
+    #[error("系统安全存储{operation}失败（用途 {purpose}）：{class}")]
+    SecureStoreBackend {
+        /// 受影响的用途标记。
+        purpose: &'static str,
+        /// 正在执行的操作（中文短语）。
+        operation: &'static str,
+        /// 失败类别。这是一个固定词表，**不是**后端错误的转载。
+        class: &'static str,
+    },
+
+    /// 要写入安全存储的值不合法。
+    ///
+    /// 目前唯一的触发条件是空值：不同平台对零长度凭据的处理不一致，接受它会让
+    /// 「写过空值」与「从未写入」在某些后端上无法区分。
+    #[error("拒绝写入安全存储（用途 {purpose}）：{reason}")]
+    SecureStoreInvalidValue {
+        /// 受影响的用途标记。
+        purpose: &'static str,
+        /// 拒绝原因。恒为 `&'static str`，绝不含 value 本身。
+        reason: &'static str,
+    },
 }
 
 impl PlatformError {
@@ -208,6 +263,11 @@ impl PlatformError {
             PlatformError::VerificationFailed { .. } => "platform.verification_failed",
             PlatformError::RollbackRefused { .. } => "platform.rollback_refused",
             PlatformError::FaultInjected { .. } => "platform.fault_injected",
+            PlatformError::SecureStoreUnavailable { .. } => "platform.secure_store_unavailable",
+            PlatformError::SecureStoreDenied { .. } => "platform.secure_store_denied",
+            PlatformError::SecureStoreLocked { .. } => "platform.secure_store_locked",
+            PlatformError::SecureStoreBackend { .. } => "platform.secure_store_backend",
+            PlatformError::SecureStoreInvalidValue { .. } => "platform.secure_store_invalid_value",
         }
     }
 }

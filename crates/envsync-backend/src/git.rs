@@ -1118,7 +1118,7 @@ mod tests {
             ".envsync\\objects\\aa",
         ] {
             let err = validate_tree_path(path).expect_err(path);
-            assert_eq!(err.code(), "invalid_prefix", "{path}");
+            assert_eq!(err.code(), "backend.invalid_prefix", "{path}");
         }
     }
 

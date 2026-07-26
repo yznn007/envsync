@@ -9,6 +9,7 @@
 //! |---|---|
 //! | [`cbor`] | 严格 canonical CBOR 编解码，保证确定性与非 canonical 拒绝 |
 //! | [`id`] | 强类型标识符：随机 ID、派生 ID 与内容寻址 ID |
+//! | [`membership`] | 设备成员签名事件链：角色、动作、事件与回放后的成员状态 |
 //! | [`resource`] | 观察状态、期望处置、资源条目与写入策略 |
 //! | [`object`] | 内容寻址对象：Blob、State Root、Conflict |
 //! | [`profile`] | 设备 Profile、封闭选择器 AST、投影诊断与冲突解决方案 |
@@ -57,6 +58,7 @@
 
 pub mod cbor;
 pub mod id;
+pub mod membership;
 pub mod object;
 pub mod plan;
 pub mod profile;
@@ -67,6 +69,11 @@ pub use cbor::{CborCodec, CborError};
 pub use id::{
     BlobId, ConflictId, DeviceId, Digest32, IdError, OperationId, PlanId, ResourceId, SnapshotId,
     StateRootId, WorkspaceId,
+};
+pub use membership::{
+    DevicePublicBytes, MemberRecord, MemberRole, MembershipAction, MembershipEvent,
+    MembershipEventError, MembershipState, DEVICE_PUBLIC_LEN, GENESIS_EPOCH, MAX_MEMBERSHIP_EVENTS,
+    MEMBERSHIP_EVENT_FORMAT_VERSION,
 };
 pub use object::{
     Blob, Conflict, ConflictKind, ObjectId, ObjectKind, StateRoot, StateRootError,

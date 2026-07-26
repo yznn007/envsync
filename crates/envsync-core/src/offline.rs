@@ -141,7 +141,10 @@ mod tests {
                 .unwrap_err()
                 .code(),
         ] {
-            assert_eq!(code, "io", "每个方法都必须以 I/O 失败告终，绝不假装成功");
+            assert_eq!(
+                code, "backend.io",
+                "每个方法都必须以 I/O 失败告终，绝不假装成功"
+            );
         }
     }
 

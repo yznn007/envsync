@@ -656,7 +656,7 @@ fn cas_race_loser_exits_10_and_the_remote_keeps_the_winners_ref() {
 
     let loser = running.wait();
     loser.expect_code(10);
-    loser.expect_diagnostic("cas_conflict");
+    loser.expect_diagnostic("backend.cas_conflict");
     assert!(
         loser.json()["data"].is_null(),
         "失败的 sync 不应带 data：{}",
@@ -1010,7 +1010,7 @@ fn unreachable_remote_is_reported_loudly_instead_of_clean() {
     for command in [["fetch"], ["capture"], ["plan"]] {
         let run = alice.run_json(&command);
         run.expect_code(1);
-        run.expect_diagnostic("io");
+        run.expect_diagnostic("backend.io");
         assert!(
             run.json()["data"].is_null(),
             "失败的 `{command:?}` 不应带 data：{}",

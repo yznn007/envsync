@@ -1,0 +1,146 @@
+EnvSync M2 测试向量 —— 设备身份与域分隔签名
+====================================================================
+
+⚠️  以下全部私钥种子都是硬编码的测试专用假值，仅供测试，绝不用于生产。
+
+来源测试：crates/envsync-crypto/tests/vectors.rs
+          fn device_identity_vector_is_frozen()
+复现命令：cargo test -p envsync-crypto --test vectors device_identity_vector_is_frozen
+规范说明：docs/security/vault-format.md §1、§3
+          docs/security/device-membership.md §1.3
+
+
+1. 固定输入
+--------------------------------------------------------------------
+
+x25519_secret   5151515151515151515151515151515151515151515151515151515151515151
+                32 字节。测试常量 [0x51; 32]。
+                含义：设备的 X25519 私钥（只用于接收 HPKE 设备信封）。
+
+ed25519_secret  5252525252525252525252525252525252525252525252525252525252525252
+                32 字节。测试常量 [0x52; 32]。
+                含义：设备的 Ed25519 私钥种子（只用于签名）。
+
+                ⚠️ 两把私钥职责严格分离；生产环境它们只能存在于系统安全存储
+                   （SecurePurpose::DeviceKemKey / DeviceSigningKey）。
+
+domain          "membership-event"（16 字节 ASCII）
+                含义：签名的用途标签。它进入待签结构，因此一枚成员事件签名
+                      无法被复用成快照签名或信封签名。
+                常量：envsync_core::membership::MEMBERSHIP_SIGNATURE_DOMAIN
+
+workspace_id    11111111-1111-4111-8111-111111111111
+                线上编码：11111111111141118111111111111111（16 字节）
+
+payload         "test-vector-payload"（19 字节 ASCII）
+                含义：被签名的内容。在成员链里，这一项是
+                      MembershipEvent::signing_payload() 的输出。
+
+
+2. 派生的公开材料
+--------------------------------------------------------------------
+
+x25519_public   ad908a8a708aca07588cda7c4ed3e44d4966a80a9abb2f1e4bbac53c67414e34
+                = X25519(x25519_secret, basepoint)，32 字节
+
+ed25519_public  2012cb90ca60e8e5d8daf66e2272d2233e0486d557e8c66141ed8920177d7eb7
+                = Ed25519 公钥，32 字节
+
+device_id       e3009d665bf8f968e99bc47aa11152c3ab0c7c0cfb1d57d554628e1d912364ec
+                = BLAKE3_domain("envsync:device:v1", x25519_public ‖ ed25519_public)
+
+                其中 BLAKE3_domain(domain, payload) 的定义（Digest32::domain_hash）：
+                    BLAKE3( domain_utf8 ‖ 0x00 ‖ u64_be(len(payload)) ‖ payload )
+
+                这里 domain = "envsync:device:v1"（17 字节），
+                     payload = 64 字节（两把公钥拼接），
+                     长度前缀 = 0000000000000040
+
+                改动任意一把公钥的任意一位都会改变 device_id
+                （测试 flipping_any_public_key_bit_changes_device_id）。
+
+
+3. 派生的中间量：待签结构 signing_input
+--------------------------------------------------------------------
+
+payload_digest = BLAKE3_domain("envsync:device-signature-payload:v1",
+                               "test-vector-payload")
+               = 3bcbdddc2123bc8c922d0a0c1ae6653be456fe3a7aca002ce7fcf382ac9473ac
+
+signing_input = canonical_cbor([
+    "envsync:device-signature:v1",                       // 域前缀
+    1,                                                   // 签名格式版本
+    "ESV1_X25519_HKDF_SHA256_CHACHA20POLY1305_ED25519",  // 套件名
+    "membership-event",                                  // 用途标签（domain 参数）
+    workspace_id (bytes 16),
+    payload_digest (bytes 32),
+])
+
+signing_input（149 字节，十六进制）：
+
+86781b656e7673796e633a6465766963652d7369676e61747572653a763101783045
+5356315f5832353531395f484b44465f5348413235365f4348414348413230504f4c
+59313330355f45443235353139706d656d626572736869702d6576656e7450111111
+1111114111811111111111111158203bcbdddc2123bc8c922d0a0c1ae6653be456fe
+3a7aca002ce7fcf382ac9473ac
+
+Ed25519 覆盖的是这 149 字节，不是 payload 本身。
+
+
+4. 输出：签名
+--------------------------------------------------------------------
+
+signature   1b79f0414676e668652d52a419cabef324728c191cc206b6e5b4800fe582f19a
+            c7f4daa7ad6102677ac6d36e445137db4f33c3c51572942b658de473c875d10a
+            64 字节。
+
+Ed25519 是确定性签名（RFC 8032）：相同私钥 + 相同消息恒得相同签名，
+因此签名本身可以被冻结，不需要注入任何随机量。
+
+验签使用 ed25519_dalek 的 verify_strict，它额外拒绝小阶公钥与带扭转分量的
+签名，从而排除签名可塑性（同一条消息存在多枚都合法的签名）。
+
+
+5. 字段拆解：signing_input
+--------------------------------------------------------------------
+
+偏移       字节                                   含义
+-------    -----------------------------------    ------------------------------
+   0       86                                     CBOR 主类型 4，长度 6 → 6 元数组
+   1..2    781b                                   CBOR 主类型 3，长度 0x1b = 27
+   3..29   656e7673796e63 …（27 字节）             [0] 域前缀（text）
+                                                      ASCII: envsync:device-signature:v1
+  30       01                                     [1] 签名格式版本 = 1（uint）
+  31..32   7830                                   CBOR 主类型 3，长度 0x30 = 48
+  33..80   455356315f58 …（48 字节）               [2] suite（text）
+  81       70                                     CBOR 主类型 3，长度 0x10 = 16
+  82..97   6d656d626572736869702d6576656e74       [3] domain（text）
+                                                      ASCII: membership-event
+  98       50                                     CBOR 主类型 2，长度 0x10 = 16
+  99..114  11111111111141118111111111111111       [4] workspace_id（bytes 16）
+ 115..116  5820                                   CBOR 主类型 2，长度 0x20 = 32
+ 117..148  3bcbdddc … 9473ac（32 字节）            [5] payload_digest（bytes 32）
+
+
+6. 怎么核对
+--------------------------------------------------------------------
+
+a) 逐字节比对第 2、3、4 节：
+   cargo test -p envsync-crypto --test vectors device_identity_vector_is_frozen
+
+b) 独立复现 device_id：用任意 BLAKE3 实现算
+   BLAKE3("envsync:device:v1" ‖ 0x00 ‖ 0000000000000040 ‖ x_pub ‖ ed_pub)
+   结果应等于第 2 节的 device_id。
+
+c) 独立验签：用任意 Ed25519 实现，以 ed25519_public 验证第 4 节的签名
+   对第 3 节的 149 字节消息成立。这一步不依赖 EnvSync 的任何代码。
+
+d) 攻击路径自检（对应 tests/device_identity.rs）：
+   - 把 workspace_id 换掉 → 验签失败（cross_workspace_replay_is_rejected）
+   - 把 payload 改一位   → 验签失败（modified_payload_is_rejected）
+   - 把 domain 换掉      → 验签失败（different_domain_is_rejected）
+   - 用另一台设备的公钥  → 验签失败（wrong_signer_is_rejected）
+   - 翻转签名任意一位    → 验签失败（flipping_any_signature_bit_is_rejected）
+
+能证明什么：DeviceId 的派生规则、待签结构的字段与顺序、签名结果与冻结那天一致。
+不能证明什么：不能证明 Ed25519 本身正确——那由 ed25519-dalek 及其上游向量负责。
