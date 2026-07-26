@@ -16,6 +16,8 @@
 //! | [`planner`] | 由配置 + 目标状态 + 观察结果生成不可变计划 |
 //! | [`apply`] | 事务化应用引擎（preflight → publish → apply → verify → journal） |
 //! | [`mod@merge`] | 文本与结构化三方合并，只产出干净结果或显式 Conflict |
+//! | [`projection`] | Workspace 到 DeviceView 的纯函数投影 |
+//! | [`sync`] | fetch、合并基、三方合并与冲突裁决的编排 |
 //! | [`recovery`] | 崩溃恢复与显式回滚 |
 //! | [`service`] | CLI 与桌面端共用的应用服务门面 |
 //! | [`ports`] | 时钟、观察、文件变更三个端口抽象及其平台实现 |
@@ -33,12 +35,17 @@ pub mod error;
 pub mod merge;
 pub mod planner;
 pub mod ports;
+pub mod projection;
 pub mod recovery;
 pub mod render;
 pub mod service;
+pub mod sync;
 
 pub use apply::{ApplyEngine, ApplyOutcome};
-pub use config::{BackendConfig, ConfigError, DeviceConfig, ResourceConfig, WorkspaceConfig};
+pub use config::{
+    BackendConfig, ConfigError, DeviceConfig, DeviceProfileConfig, ResourceConfig,
+    ResourceOverride, WorkspaceConfig,
+};
 pub use error::{CoreError, CoreResult};
 pub use merge::{
     merge, merge_structured, merge_structured_with, merge_text, IniPolicy, MergeError, MergeInput,
@@ -47,11 +54,16 @@ pub use merge::{
 };
 pub use planner::{build_plan, BlobSource, PlanOutcome, PlanRequest};
 pub use ports::{ActionReceipt, Clock, FileMutator, FixedClock, Observer, SystemClock};
+pub use projection::{
+    project_workspace, project_workspace_with_rules, DeviceView, EntryOverride, ProjectionError,
+    ProjectionPolicy, ProjectionRules, ResourceRule,
+};
 pub use recovery::{
     PlanSource, RecoveryDiagnosis, RecoveryEngine, RecoveryReport, RecoverySuggestion,
 };
 pub use render::{render, RenderError, RenderInput, RenderedChange};
 pub use service::{
-    CaptureOutcome, DoctorFinding, DoctorReport, EnvSyncService, ResourceStatus, StatusReport,
-    WorkspaceState,
+    CaptureOutcome, DoctorFinding, DoctorReport, EnvSyncService, ProfileExplanation,
+    ResourceStatus, StatusReport, WorkspaceState,
 };
+pub use sync::{ConflictDetail, FetchOutcome, MergeContext, MergeKind, MergeOutcome};

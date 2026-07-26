@@ -13,10 +13,17 @@
 use serde::Serialize;
 use serde_json::Value;
 
-/// JSON 契约的 schema 版本。
+/// JSON 契约的**当前** schema 版本，也是 `--schema-version` 的默认值。
 ///
-/// 字段语义发生**不兼容**变化时才递增；新增可选字段不递增。
-pub const JSON_SCHEMA_VERSION: u32 = 1;
+/// M1 把它提升到 2：`status` 增加 `open_conflicts`、`plan` 增加 `device_view`，并新增
+/// `fetch` / `merge` / `conflicts` / `profile` 四组命令。
+pub const JSON_SCHEMA_VERSION: u32 = 2;
+
+/// 仍然可以被请求的最低 schema 版本。
+///
+/// 老脚本可以显式要求 v1：输出会退回 v1 的字段集合（v2 新增字段被剔除）。范围之外
+/// 的版本号一律报错——静默按某个版本输出会让调用方以为自己拿到了别的形状。
+pub const MIN_JSON_SCHEMA_VERSION: u32 = 1;
 
 /// 脱敏后的占位文本。
 pub const REDACTED: &str = "<redacted>";
@@ -100,16 +107,22 @@ struct Envelope<'a, T: Serialize> {
 
 /// 把结果渲染成**单行** JSON 并写 stdout。
 ///
+/// `schema_version` 为 1 时输出会退回 v1 形状：`v2_only` 列出的字段从 `data` 中移除。
+/// 这是**唯一**的降级手段——v1 与 v2 的差异只有「v2 多了哪些字段」，因此剔除即可，
+/// 不需要为每个命令维护两份结构体。
+///
 /// 序列化失败时不 panic，而是退化成一条 `internal.serialize` 错误信封——CLI 的
 /// 最后一步不应该因为格式化问题把整个进程炸掉。
 pub fn print_json<T: Serialize>(
     command: &str,
     status: Status,
+    schema_version: u32,
     data: Option<&T>,
     diagnostics: &[DiagnosticOut],
+    v2_only: &[&str],
 ) {
     let envelope = Envelope {
-        schema_version: JSON_SCHEMA_VERSION,
+        schema_version,
         command,
         status,
         data,
@@ -117,15 +130,28 @@ pub fn print_json<T: Serialize>(
     };
     let mut value = match serde_json::to_value(&envelope) {
         Ok(value) => value,
-        Err(error) => fallback_envelope(command, &error.to_string()),
+        Err(error) => fallback_envelope(command, schema_version, &error.to_string()),
     };
+    if schema_version < JSON_SCHEMA_VERSION {
+        downgrade(&mut value, v2_only);
+    }
     redact_json(&mut value);
     // `Value` 的 `Display` 是紧凑格式，天然保证「只有一行」。
     println!("{value}");
 }
 
+/// 把 `data` 降级到 v1 形状：移除 v2 才引入的字段。
+fn downgrade(envelope: &mut Value, v2_only: &[&str]) {
+    let Some(Value::Object(data)) = envelope.get_mut("data") else {
+        return;
+    };
+    for field in v2_only {
+        data.remove(*field);
+    }
+}
+
 /// 序列化失败时的兜底信封。
-fn fallback_envelope(command: &str, message: &str) -> Value {
+fn fallback_envelope(command: &str, schema_version: u32, message: &str) -> Value {
     let diagnostic = DiagnosticOut {
         severity: "blocking",
         code: "internal.serialize".to_owned(),
@@ -133,7 +159,7 @@ fn fallback_envelope(command: &str, message: &str) -> Value {
         message: message.to_owned(),
     };
     serde_json::json!({
-        "schema_version": JSON_SCHEMA_VERSION,
+        "schema_version": schema_version,
         "command": command,
         "status": "error",
         "data": Value::Null,

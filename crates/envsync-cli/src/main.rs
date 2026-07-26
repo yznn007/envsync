@@ -17,6 +17,7 @@
 //! | 10 | 后端 CAS 冲突，别的设备先发布了 |
 //! | 11 | 计划失效或不存在，需要重新 `plan` |
 //! | 12 | 策略阻塞，计划里有阻塞诊断 |
+//! | 13 | 存在未解决的合并冲突；本地文件与远端 Ref 都没有被改动 |
 //! | 20 | 已发布但本地未收敛，需要 `recover` 或 `rollback` |
 //!
 //! 退出码只由 [`envsync_core::CoreError`] 的判定方法派生，不看错误文本，因此错误
@@ -28,12 +29,12 @@ mod output;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use envsync_core::CoreError;
-use envsync_domain::{OperationId, PlanId};
+use envsync_domain::{ConflictId, OperationId, PlanId, ResolutionChoice};
 
 use crate::commands::{CommandData, CommandOutput};
-use crate::output::{DiagnosticOut, Status};
+use crate::output::{DiagnosticOut, Status, JSON_SCHEMA_VERSION, MIN_JSON_SCHEMA_VERSION};
 
 /// 一般错误。
 const EXIT_ERROR: u8 = 1;
@@ -43,6 +44,8 @@ const EXIT_CAS_CONFLICT: u8 = 10;
 const EXIT_STALE_PLAN: u8 = 11;
 /// 策略阻塞。
 const EXIT_POLICY_BLOCK: u8 = 12;
+/// 存在未解决的合并冲突。
+const EXIT_CONFLICTED: u8 = 13;
 /// 已发布但本地未收敛。
 const EXIT_PARTIAL_CONVERGENCE: u8 = 20;
 
@@ -66,6 +69,18 @@ struct Cli {
     /// 以单行 JSON 输出结果；日志与诊断一律写 stderr。
     #[arg(long, global = true)]
     json: bool,
+
+    /// JSON 契约版本：2（默认，含 M1 新字段）或 1（M0 字段集合）。
+    ///
+    /// 其他取值一律以用法错误（退出码 2）拒绝，绝不静默按某个版本输出。
+    #[arg(
+        long,
+        global = true,
+        value_name = "VERSION",
+        default_value_t = JSON_SCHEMA_VERSION,
+        value_parser = clap::value_parser!(u32).range(MIN_JSON_SCHEMA_VERSION as i64..=JSON_SCHEMA_VERSION as i64),
+    )]
+    schema_version: u32,
 
     /// 提高日志级别，可重复：-v 为 info，-vv 为 debug，-vvv 为 trace。
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
@@ -91,6 +106,14 @@ enum Command {
     Doctor(CommonArgs),
     /// 显式触发崩溃恢复（`sync` 启动时也会自动运行）。
     Recover(CommonArgs),
+    /// 读取远端引用与头快照，把可达对象拉进本地草稿库。
+    Fetch(CommonArgs),
+    /// 合并本地草稿头与远端头；有冲突时只登记冲突，不改任何文件。
+    Merge(CommonArgs),
+    /// 查看与裁决合并冲突。
+    Conflicts(ConflictsArgs),
+    /// 查看设备 Profile 相关信息。
+    Profile(ProfileArgs),
 }
 
 impl Command {
@@ -105,8 +128,128 @@ impl Command {
             Command::Rollback(_) => "rollback",
             Command::Doctor(_) => "doctor",
             Command::Recover(_) => "recover",
+            Command::Fetch(_) => "fetch",
+            Command::Merge(_) => "merge",
+            Command::Conflicts(args) => match args.command {
+                ConflictsCommand::List(_) => "conflicts.list",
+                ConflictsCommand::Show(_) => "conflicts.show",
+                ConflictsCommand::Resolve(_) => "conflicts.resolve",
+            },
+            Command::Profile(args) => match args.command {
+                ProfileCommand::Explain(_) => "profile.explain",
+            },
         }
     }
+
+    /// 该命令是否只存在于 schema v2。
+    ///
+    /// v1 里没有它们的形状，因此以 `--schema-version 1` 调用时必须**报错**，
+    /// 而不是输出一个 v1 读者无法解释的信封。
+    fn requires_v2(&self) -> bool {
+        matches!(
+            self,
+            Command::Fetch(_) | Command::Merge(_) | Command::Conflicts(_) | Command::Profile(_)
+        )
+    }
+}
+
+/// `conflicts` 的参数。
+#[derive(Debug, Args)]
+struct ConflictsArgs {
+    /// 要执行的子命令。
+    #[command(subcommand)]
+    command: ConflictsCommand,
+}
+
+/// `conflicts` 的子命令。
+#[derive(Debug, Subcommand)]
+enum ConflictsCommand {
+    /// 列出未解决的冲突。
+    List(CommonArgs),
+    /// 查看单个冲突的详情（三侧摘要与结构性诊断，不含文件正文）。
+    Show(ConflictShowArgs),
+    /// 裁决一个冲突：采用本地、远端或人工合并后的内容。
+    Resolve(ConflictResolveArgs),
+}
+
+/// `conflicts show` 的参数。
+#[derive(Debug, Args)]
+struct ConflictShowArgs {
+    /// 工作区配置文件路径（YAML）。
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+
+    /// 冲突标识，由 `envsync merge` 或 `envsync conflicts list` 输出。
+    #[arg(long, value_name = "CONFLICT-ID")]
+    conflict: ConflictId,
+}
+
+/// `conflicts resolve` 的参数。
+///
+/// 三种裁决互斥：要么采用一侧，要么给出人工合并后的文件。
+#[derive(Debug, Args)]
+struct ConflictResolveArgs {
+    /// 工作区配置文件路径（YAML）。
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+
+    /// 要裁决的冲突标识。
+    #[arg(long, value_name = "CONFLICT-ID")]
+    conflict: ConflictId,
+
+    /// 采用本地一侧的内容。
+    #[arg(long, group = "choice")]
+    ours: bool,
+
+    /// 采用远端一侧的内容。
+    #[arg(long, group = "choice")]
+    theirs: bool,
+
+    /// 采用该文件的内容（人工合并结果），会被存成新的 Blob。
+    #[arg(long, value_name = "PATH", group = "choice")]
+    file: Option<PathBuf>,
+
+    /// 确认删除该资源；这是唯一能让资源消失的裁决。
+    #[arg(long, group = "choice")]
+    delete: bool,
+}
+
+impl ConflictResolveArgs {
+    /// 由互斥开关得到裁决方式。
+    ///
+    /// clap 的 `group` 已经保证至多一个开关出现；一个都没有时必须报用法错误，
+    /// 而不是替用户挑一个默认值。
+    fn choice(&self) -> Result<ResolutionChoice, clap::Error> {
+        if self.ours {
+            Ok(ResolutionChoice::Ours)
+        } else if self.theirs {
+            Ok(ResolutionChoice::Theirs)
+        } else if self.file.is_some() {
+            Ok(ResolutionChoice::Manual)
+        } else if self.delete {
+            Ok(ResolutionChoice::Delete)
+        } else {
+            Err(Cli::command().error(
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "必须给出裁决方式之一：--ours、--theirs、--file <PATH> 或 --delete",
+            ))
+        }
+    }
+}
+
+/// `profile` 的参数。
+#[derive(Debug, Args)]
+struct ProfileArgs {
+    /// 要执行的子命令。
+    #[command(subcommand)]
+    command: ProfileCommand,
+}
+
+/// `profile` 的子命令。
+#[derive(Debug, Subcommand)]
+enum ProfileCommand {
+    /// 解释本设备 Profile 与每个资源的投影结论。
+    Explain(CommonArgs),
 }
 
 /// 只需要配置文件路径的命令。
@@ -163,21 +306,27 @@ fn main() -> ExitCode {
     init_tracing(cli.verbose);
 
     let command = cli.command.name();
-    match dispatch(&cli.command) {
+    match dispatch(&cli.command, cli.schema_version) {
         Ok(output) => {
-            emit_success(command, cli.json, &output);
+            emit_success(command, cli.json, cli.schema_version, &output);
             ExitCode::SUCCESS
         }
         Err(error) => {
             let diagnostics = vec![DiagnosticOut::from_error(&error)];
-            emit_failure(command, cli.json, &error, &diagnostics);
+            emit_failure(command, cli.json, cli.schema_version, &error, &diagnostics);
             ExitCode::from(exit_code_for(&error))
         }
     }
 }
 
 /// 把子命令分派到 [`crate::commands`]。
-fn dispatch(command: &Command) -> Result<CommandOutput, CoreError> {
+fn dispatch(command: &Command, schema_version: u32) -> Result<CommandOutput, CoreError> {
+    if command.requires_v2() && schema_version < JSON_SCHEMA_VERSION {
+        return Err(CoreError::ManualInterventionRequired(format!(
+            "命令 `{}` 只在 JSON schema v{JSON_SCHEMA_VERSION} 中定义；请去掉 `--schema-version {schema_version}`",
+            command.name()
+        )));
+    }
     match command {
         Command::Init(args) => commands::init(
             &args.config,
@@ -191,13 +340,39 @@ fn dispatch(command: &Command) -> Result<CommandOutput, CoreError> {
         Command::Rollback(args) => commands::rollback(&args.config, args.operation),
         Command::Doctor(args) => commands::doctor(&args.config),
         Command::Recover(args) => commands::recover(&args.config),
+        Command::Fetch(args) => commands::fetch(&args.config),
+        Command::Merge(args) => commands::merge(&args.config),
+        Command::Conflicts(args) => match &args.command {
+            ConflictsCommand::List(args) => commands::conflicts_list(&args.config),
+            ConflictsCommand::Show(args) => commands::conflicts_show(&args.config, args.conflict),
+            ConflictsCommand::Resolve(args) => {
+                // 裁决方式缺失是用法错误：交给 clap 退出（退出码 2）。
+                let choice = args.choice().unwrap_or_else(|error| error.exit());
+                commands::conflicts_resolve(
+                    &args.config,
+                    args.conflict,
+                    choice,
+                    args.file.as_deref(),
+                )
+            }
+        },
+        Command::Profile(args) => match &args.command {
+            ProfileCommand::Explain(args) => commands::profile_explain(&args.config),
+        },
     }
 }
 
 /// 输出成功结果。
-fn emit_success(command: &str, json: bool, output: &CommandOutput) {
+fn emit_success(command: &str, json: bool, schema_version: u32, output: &CommandOutput) {
     if json {
-        output::print_json(command, Status::Ok, Some(&output.data), &output.diagnostics);
+        output::print_json(
+            command,
+            Status::Ok,
+            schema_version,
+            Some(&output.data),
+            &output.diagnostics,
+            output.data.v2_only_fields(),
+        );
     } else {
         output::print_human(&output.data.render(), &output.diagnostics);
     }
@@ -207,9 +382,22 @@ fn emit_success(command: &str, json: bool, output: &CommandOutput) {
 ///
 /// `--json` 时信封照样写 stdout（`status` 为 `error`、`data` 为 `null`），这样调用方
 /// 无论成功失败都只需要解析同一个位置的同一种形状。
-fn emit_failure(command: &str, json: bool, error: &CoreError, diagnostics: &[DiagnosticOut]) {
+fn emit_failure(
+    command: &str,
+    json: bool,
+    schema_version: u32,
+    error: &CoreError,
+    diagnostics: &[DiagnosticOut],
+) {
     if json {
-        output::print_json(command, Status::Error, None::<&CommandData>, diagnostics);
+        output::print_json(
+            command,
+            Status::Error,
+            schema_version,
+            None::<&CommandData>,
+            diagnostics,
+            &[],
+        );
     } else {
         output::print_human_error(error, &[]);
     }
@@ -226,6 +414,8 @@ fn exit_code_for(error: &CoreError) -> u8 {
         EXIT_STALE_PLAN
     } else if error.is_policy_block() {
         EXIT_POLICY_BLOCK
+    } else if error.is_conflicted() {
+        EXIT_CONFLICTED
     } else if error.is_partial_convergence() {
         EXIT_PARTIAL_CONVERGENCE
     } else {
@@ -272,7 +462,20 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["init", "capture", "plan", "sync", "status", "rollback", "doctor", "recover"]
+            [
+                "init",
+                "capture",
+                "plan",
+                "sync",
+                "status",
+                "rollback",
+                "doctor",
+                "recover",
+                "fetch",
+                "merge",
+                "conflicts",
+                "profile"
+            ]
         );
     }
 
@@ -309,6 +512,10 @@ mod tests {
                 }
             )),
             EXIT_CAS_CONFLICT
+        );
+        assert_eq!(
+            exit_code_for(&CoreError::Conflicted { count: 2 }),
+            EXIT_CONFLICTED
         );
         assert_eq!(
             exit_code_for(&CoreError::Invariant("boom".to_owned())),

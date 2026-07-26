@@ -21,14 +21,15 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use envsync_backend::{Backend, BackendError, LocalBackend};
+use envsync_backend::{Backend, BackendError, GitBackend, GitConfig, LocalBackend};
 use envsync_domain::{
-    Blob, BlobId, CborCodec, DesiredDisposition, DeviceId, FileMode, ObjectId, ObjectKind,
-    Observation, ObservedState, OperationId, Plan, PlanId, ResourceEntry, ResourceId, SnapshotBody,
-    SnapshotId, SnapshotSignature, StateRoot, StateRootId, WorkspaceId, WorkspaceRef,
+    Blob, BlobId, CborCodec, Conflict, ConflictId, ConflictResolution, DesiredDisposition,
+    DeviceId, DeviceProfile, FileMode, ObjectId, ObjectKind, Observation, ObservedState,
+    OperationId, Plan, PlanId, ProjectionNote, ResolutionChoice, ResourceEntry, ResourceId,
+    SnapshotBody, SnapshotId, SnapshotSignature, StateRoot, StateRootId, WorkspaceId, WorkspaceRef,
 };
 use envsync_platform::{AuthorizedRoot, RelativeTarget, RootRegistry, SafeWriter};
-use envsync_storage::{DraftStore, Journal, OperationState};
+use envsync_storage::{ConflictRecord, ConflictStore, DraftStore, Journal, OperationState};
 
 use crate::apply::{ApplyEngine, ApplyOutcome};
 use crate::config::{BackendConfig, WorkspaceConfig};
@@ -36,8 +37,10 @@ use crate::error::{CoreError, CoreResult};
 use crate::planner::{self, BlobSource, PlanRequest};
 use crate::ports::platform::{PlatformMutator, PlatformObserver};
 use crate::ports::{Clock, FileMutator, Observer, SystemClock};
+use crate::projection::{self, DeviceView, ProjectionPolicy, ProjectionRules};
 use crate::recovery::{PlanSource, RecoveryDiagnosis, RecoveryEngine, RecoveryReport};
 use crate::render;
+use crate::sync::{self, ConflictDetail, FetchOutcome, MergeContext, MergeOutcome};
 
 /// capture 的结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +116,8 @@ pub struct StatusReport {
     pub unfinished: Vec<(OperationId, OperationState)>,
     /// 待应用动作数量。
     pub pending_actions: usize,
+    /// 未解决的合并冲突数量。
+    pub open_conflicts: usize,
     /// 诊断。
     pub diagnostics: Vec<envsync_domain::Diagnostic>,
 }
@@ -175,7 +180,20 @@ impl PlanSource for DraftStore {
     }
 }
 
-/// M0 应用服务。
+/// `profile explain` 的报告：本设备 Profile 与每个资源的投影结论。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileExplanation {
+    /// 本设备 Profile。
+    pub profile: DeviceProfile,
+    /// 被投影的完整状态；工作区还没有任何快照时为 `None`。
+    pub state_root: Option<StateRootId>,
+    /// 投影结果的标识。
+    pub device_view: StateRootId,
+    /// 逐资源的投影结论。
+    pub notes: Vec<ProjectionNote>,
+}
+
+/// 应用服务。
 pub struct EnvSyncService {
     config: WorkspaceConfig,
     backend: Box<dyn Backend>,
@@ -183,6 +201,7 @@ pub struct EnvSyncService {
     mutator: Box<dyn FileMutator>,
     journal: Journal,
     drafts: DraftStore,
+    conflicts: ConflictStore,
     clock: Arc<dyn Clock>,
 }
 
@@ -199,6 +218,15 @@ impl EnvSyncService {
 
         let backend: Box<dyn Backend> = match &config.backend {
             BackendConfig::Local { path } => Box::new(LocalBackend::open(path.clone())?),
+            BackendConfig::Git {
+                remote_url,
+                branch,
+                cache_dir,
+                auth,
+            } => Box::new(GitBackend::open(
+                GitConfig::new(remote_url.clone(), cache_dir.clone(), auth.clone())
+                    .with_branch(branch.clone()),
+            )?),
         };
 
         let mut registry = RootRegistry::new();
@@ -218,6 +246,8 @@ impl EnvSyncService {
 
         let journal = Journal::open(config.journal_path())?;
         let drafts = DraftStore::open(config.draft_dir())?;
+        // 与草稿库同库：解决冲突时要在 `objects` 表里确认结果 Blob 存在。
+        let conflicts = ConflictStore::open(config.conflict_db_path())?;
 
         Ok(EnvSyncService {
             config,
@@ -226,6 +256,7 @@ impl EnvSyncService {
             mutator,
             journal,
             drafts,
+            conflicts,
             clock,
         })
     }
@@ -467,6 +498,9 @@ impl EnvSyncService {
     // ---- plan ----------------------------------------------------------------
 
     /// 生成计划并保存到草稿库。
+    ///
+    /// 目标状态**先经 Profile 投影**再交给计划器：Snapshot 始终是全量期望状态，
+    /// 而本机只收敛它在这台设备上的投影。
     pub fn build_plan(&mut self) -> CoreResult<Plan> {
         let base_ref = self.current_ref()?;
         let draft_head = self.drafts.head_draft()?;
@@ -475,7 +509,9 @@ impl EnvSyncService {
                 "工作区尚无任何快照，请先运行 `envsync capture`".to_owned(),
             )
         })?;
-        let target_state = self.load_state_root_of(target_snapshot)?;
+        let full_state = self.load_state_root_of(target_snapshot)?;
+        let view = self.project(&full_state)?;
+        let target_state = view.state;
 
         let next_ref = if base_ref.head == Some(target_snapshot) {
             // 目标已经是后端当前头：本次只需要本地收敛，不再做一次 CAS。
@@ -484,8 +520,11 @@ impl EnvSyncService {
             base_ref.advance(target_snapshot)
         };
 
+        // device-id 覆盖里的 `target` 只改变本机落地位置，因此在这里套用，绝不
+        // 回写进共享 Snapshot。
+        let device_config = self.config.for_device(self.config.device.device_id());
         let request = PlanRequest {
-            config: &self.config,
+            config: &device_config,
             target_state: &target_state,
             target_snapshot,
             base_ref: &base_ref,
@@ -517,6 +556,13 @@ impl EnvSyncService {
     /// 启动时自动运行恢复流程（M0 任务 13 的要求），随后校验计划新鲜度：重新生成的
     /// 计划标识必须与提交的一致，否则返回 [`CoreError::StalePlan`]。
     pub fn apply_plan(&mut self, plan_id: PlanId) -> CoreResult<ApplyOutcome> {
+        // 未解决的冲突一票否决，而且必须排在最前面：此后的任何一步都会动本地文件
+        // 或远端 Ref，而「有冲突时两者都不变」是 M1 的硬性承诺。
+        let open = self.conflicts_list()?;
+        if !open.is_empty() {
+            return Err(CoreError::Conflicted { count: open.len() });
+        }
+
         let recovery_reports = self.recover()?;
         for report in &recovery_reports {
             tracing::info!(
@@ -595,6 +641,156 @@ impl EnvSyncService {
         Ok(())
     }
 
+    // ---- fetch / merge / 冲突 / profile ----------------------------------------
+
+    /// 读取远端 Ref 与头快照，把可达对象拉进本地草稿库。
+    ///
+    /// 只复制对象：不改 Ref、不生成快照、不碰任何用户文件。
+    pub fn fetch(&mut self) -> CoreResult<FetchOutcome> {
+        let reference = self.current_ref()?;
+        let context = self.merge_context();
+        sync::fetch(&context, reference.head, reference.revision)
+    }
+
+    /// 合并本地草稿头与远端头。
+    ///
+    /// 干净合并会生成 `parents = [local, remote]` 的合并快照并设为草稿头；出现冲突
+    /// 时只把冲突写进冲突索引，**不**生成快照，也不动任何用户文件。
+    pub fn merge_states(&mut self) -> CoreResult<MergeOutcome> {
+        let reference = self.current_ref()?;
+        let local = self.drafts.head_draft()?;
+        let context = self.merge_context();
+        sync::merge_states(&context, local, reference.head)
+    }
+
+    /// 列出本工作区尚未解决的冲突。
+    pub fn conflicts_list(&self) -> CoreResult<Vec<ConflictRecord>> {
+        Ok(self.conflicts.list_open(self.config.workspace_id)?)
+    }
+
+    /// 查看单个冲突的索引记录与不可变冲突对象。
+    pub fn conflicts_show(&self, conflict: ConflictId) -> CoreResult<ConflictDetail> {
+        let record = self
+            .conflicts
+            .get(conflict)?
+            .ok_or_else(|| CoreError::OperationNotFound(format!("冲突 {}", conflict.short())))?;
+        let bytes = self.read_object(ObjectId::from(conflict))?;
+        Ok(ConflictDetail {
+            record,
+            conflict: Conflict::from_canonical_slice(&bytes)?,
+        })
+    }
+
+    /// 记录用户对冲突的裁决。
+    ///
+    /// * `Ours` / `Theirs`：采用对应一侧的内容；
+    /// * `Manual`：采用 `content` 给出的字节（由 CLI 从 `--file` 读入）；
+    /// * `Delete`：确认删除该资源——这是**唯一**能让资源消失的裁决。
+    ///
+    /// 选定的内容一律以新 Blob 的形式写进草稿库，因此后续重新合并时一定取得到；
+    /// 冲突索引在写入前也会再确认一次该 Blob 存在。
+    pub fn conflicts_resolve(
+        &mut self,
+        conflict: ConflictId,
+        choice: ResolutionChoice,
+        content: Option<&[u8]>,
+    ) -> CoreResult<ConflictResolution> {
+        let detail = self.conflicts_show(conflict)?;
+        let blob = match choice {
+            ResolutionChoice::Ours => Some(self.side_blob(&detail, detail.record.ours, "ours")?),
+            ResolutionChoice::Theirs => {
+                Some(self.side_blob(&detail, detail.record.theirs, "theirs")?)
+            }
+            ResolutionChoice::Manual => {
+                let bytes = content.ok_or_else(|| {
+                    CoreError::ManualInterventionRequired(
+                        "manual 裁决必须提供内容（CLI 的 `--file`）".to_owned(),
+                    )
+                })?;
+                let blob = Blob::new(bytes.to_vec());
+                self.drafts.put(ObjectId::from(blob.id()), blob.bytes())?;
+                Some(blob.id())
+            }
+            ResolutionChoice::Delete => {
+                if content.is_some() {
+                    return Err(CoreError::ManualInterventionRequired(
+                        "delete 裁决不能同时提供内容".to_owned(),
+                    ));
+                }
+                None
+            }
+        };
+
+        let resolution = match blob {
+            Some(blob) => {
+                ConflictResolution::with_blob(conflict, choice, blob, self.clock.now_unix_ms())
+            }
+            None => ConflictResolution::delete(conflict, self.clock.now_unix_ms()),
+        };
+        self.conflicts.resolve(conflict, &resolution)?;
+        Ok(resolution)
+    }
+
+    /// 取某一侧的 Blob，并保证它确实存在于本地草稿库。
+    fn side_blob(
+        &self,
+        detail: &ConflictDetail,
+        side: Option<BlobId>,
+        label: &'static str,
+    ) -> CoreResult<BlobId> {
+        let blob = side.ok_or_else(|| {
+            CoreError::ManualInterventionRequired(format!(
+                "冲突 {} 的 {label} 一侧是删除，请改用 --file 或 delete 裁决",
+                detail.record.conflict.short()
+            ))
+        })?;
+        let bytes = self.read_object(ObjectId::from(blob))?;
+        self.drafts.put(ObjectId::from(blob), &bytes)?;
+        Ok(blob)
+    }
+
+    /// 解释本设备的 Profile 与每个资源的投影结论。
+    pub fn profile_explain(&mut self) -> CoreResult<ProfileExplanation> {
+        let base_ref = self.current_ref()?;
+        let target = self.drafts.head_draft()?.or(base_ref.head);
+        let full_state = match target {
+            Some(snapshot) => self.load_state_root_of(snapshot)?,
+            None => StateRoot::empty(),
+        };
+        let view = self.project(&full_state)?;
+        Ok(ProfileExplanation {
+            profile: self.config.device_profile(),
+            state_root: target.map(|_| full_state.id()),
+            device_view: view.id(),
+            notes: view.notes,
+        })
+    }
+
+    /// 按本设备 Profile、安全策略与配置规则投影一份状态。
+    pub fn project(&self, state: &StateRoot) -> CoreResult<DeviceView> {
+        let rules = ProjectionRules::from_config(&self.config)?;
+        let policy = ProjectionPolicy::from_config(&self.config);
+        Ok(projection::project_workspace_with_rules(
+            state,
+            &self.config.device_profile(),
+            &policy,
+            &rules,
+        )?)
+    }
+
+    /// 组装合并所需的协作者。
+    fn merge_context(&self) -> MergeContext<'_> {
+        MergeContext {
+            workspace: self.config.workspace_id,
+            device: self.config.device.device_id(),
+            device_name: &self.config.device.name,
+            drafts: &self.drafts,
+            backend: self.backend.as_ref(),
+            conflicts: &self.conflicts,
+            clock: self.clock.as_ref(),
+        }
+    }
+
     // ---- status / doctor -----------------------------------------------------
 
     /// 汇总当前状态。
@@ -638,14 +834,18 @@ impl EnvSyncService {
             }
         }
 
+        let open_conflicts = self.conflicts_list()?.len();
+
         let state = if unfinished
             .iter()
             .any(|(_, s)| *s == OperationState::PublishedNotConverged)
         {
             WorkspaceState::PublishedNotConverged
-        } else if diagnostics
-            .iter()
-            .any(|d| d.severity == envsync_domain::Severity::Blocking)
+        // 两种情况都需要人工裁决：未解决的合并冲突，或计划里的阻塞诊断。
+        } else if open_conflicts > 0
+            || diagnostics
+                .iter()
+                .any(|d| d.severity == envsync_domain::Severity::Blocking)
         {
             WorkspaceState::Conflicted
         } else if pending > 0 || draft_head.is_some() {
@@ -665,6 +865,7 @@ impl EnvSyncService {
             resources,
             unfinished,
             pending_actions: pending,
+            open_conflicts,
             diagnostics,
         })
     }

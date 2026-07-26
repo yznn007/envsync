@@ -773,6 +773,10 @@ pub fn resource(
         disposition,
         policy: ResourcePolicy::default(),
         comment_prefix: "# ".to_owned(),
+        // M1 新增：本夹具构造的是「所有设备都适用」的全局资源，因此不带 selector，
+        // 也没有设备级覆盖。Profile 投影的专项测试在 envsync-core/tests/projection.rs。
+        selector: None,
+        device_overrides: std::collections::BTreeMap::new(),
     }
 }
 
