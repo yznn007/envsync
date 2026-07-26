@@ -1,0 +1,217 @@
+EnvSync M2 测试向量 —— HPKE 设备信封（Key Envelope）
+====================================================================
+
+⚠️  以下全部私钥、临时私钥与数据密钥都是硬编码的测试专用假值，
+    仅供测试，绝不用于生产。
+
+来源测试：crates/envsync-crypto/tests/vectors.rs
+          fn key_envelope_wire_vector_is_frozen()
+复现命令：cargo test -p envsync-crypto --test vectors key_envelope_wire_vector_is_frozen
+规范说明：docs/security/vault-format.md §4
+
+⚠️  审计待办：本实现尚未与 RFC 9180 附录 A.3 的官方向量做互操作验证。
+    见 docs/security/test-vectors/README.md §6「TODO-for-audit」。
+    本文件是**回归向量**，只能证明「格式没漂移」，不能证明「符合 RFC 9180」。
+
+
+1. 固定输入
+--------------------------------------------------------------------
+
+收件设备（与 device-signature.txt 是同一台）
+
+  x25519_secret    5151515151515151515151515151515151515151515151515151515151515151
+  ed25519_secret   5252525252525252525252525252525252525252525252525252525252525252
+  x25519_public    ad908a8a708aca07588cda7c4ed3e44d4966a80a9abb2f1e4bbac53c67414e34
+                   = pkR，DHKEM 的收件公钥
+  ed25519_public   2012cb90ca60e8e5d8daf66e2272d2233e0486d557e8c66141ed8920177d7eb7
+  device_id        e3009d665bf8f968e99bc47aa11152c3ab0c7c0cfb1d57d554628e1d912364ec
+                   = BLAKE3_domain("envsync:device:v1", x25519_public ‖ ed25519_public)
+                   含义：信封的 recipient 字段。它绑定**两把**公钥，因此
+                         攻击者无法在保持标识不变的前提下把信封重定向到
+                         自己控制的 X25519 私钥。
+
+ephemeral_secret   5353535353535353535353535353535353535353535353535353535353535353
+                   32 字节。测试常量 [0x53; 32]。
+                   含义：DHKEM 的临时私钥 esk。
+                   ⚠️ 生产 API（envelope::seal_envelope）从 OsRng 内部生成 esk，
+                      调用者无法注入；本向量使用的
+                      seal_envelope_with_ephemeral_for_tests 只在
+                      test-vectors feature 下存在。固定 esk 会让同一收件人的
+                      两个信封复用同一对 AEAD key/nonce。
+
+data_key           3333333333333333333333333333333333333333333333333333333333333333
+                   32 字节。测试常量 [0x33; 32]。
+                   含义：被分发的工作区数据密钥（信封的明文）。
+
+workspace_id       11111111-1111-4111-8111-111111111111
+                   线上编码：11111111111141118111111111111111（16 字节）
+
+key_epoch          1
+
+算法标识           mode = 0x00（base）
+                   kem_id = 0x0020（DHKEM(X25519, HKDF-SHA256)）
+                   kdf_id = 0x0001（HKDF-SHA256）
+                   aead_id = 0x0003（ChaCha20-Poly1305）
+
+suite_id           KEM （5 字节） : 4b454d0020
+                                    = "KEM"  ‖ I2OSP(0x0020,2)
+                   HPKE（10 字节）: 48504b45002000010003
+                                    = "HPKE" ‖ I2OSP(0x0020,2)
+                                             ‖ I2OSP(0x0001,2) ‖ I2OSP(0x0003,2)
+
+
+2. 派生的中间量：HPKE info
+--------------------------------------------------------------------
+
+info = canonical_cbor([
+    "envsync:key-envelope:v1",   // 域标签 ENVELOPE_INFO_DOMAIN
+    1,                           // 信封格式版本
+    "ESV1_X25519_HKDF_SHA256_CHACHA20POLY1305_ED25519",
+    workspace_id (bytes 16),
+    recipient    (bytes 32) = device_id,
+    epoch        (uint),
+])
+
+info（128 字节，十六进制）：
+
+8677656e7673796e633a6b65792d656e76656c6f70653a7631017830455356315f58
+32353531395f484b44465f5348413235365f4348414348413230504f4c5931333035
+5f4544323535313950111111111111411181111111111111115820e3009d665bf8f9
+68e99bc47aa11152c3ab0c7c0cfb1d57d554628e1d912364ec01
+
+info 拆解：
+
+  偏移       字节                                  含义
+  -------    ----------------------------------    -----------------------------
+     0       86                                    6 元数组
+     1       77                                    text，长度 0x17 = 23
+     2..24   656e7673796e63 …（23 字节）            [0] ASCII: envsync:key-envelope:v1
+    25       01                                    [1] version = 1
+    26..27   7830                                  text，长度 48
+    28..75   455356315f58 …（48 字节）              [2] suite
+    76       50                                    bytes，长度 16
+    77..92   11111111111141118111111111111111      [3] workspace_id
+    93..94   5820                                  bytes，长度 32
+    95..126  e3009d66 … 2364ec                     [4] recipient = device_id
+   127       01                                    [5] epoch = 1
+
+info 经 key schedule 第 7 步进入 info_hash，再经第 8..11 步烙进 AEAD 密钥本身。
+
+
+3. 派生的中间量：AEAD 的 AAD
+--------------------------------------------------------------------
+
+aad = canonical_cbor([version, suite, workspace_id, recipient, epoch, enc])
+
+aad（138 字节，十六进制）：
+
+86017830455356315f5832353531395f484b44465f5348413235365f434841434841
+3230504f4c59313330355f4544323535313950111111111111411181111111111111
+115820e3009d665bf8f968e99bc47aa11152c3ab0c7c0cfb1d57d554628e1d912364
+ec015820261cd9cd2e935f9c2455876a80f02a4d6786b8ab877f07227737ca0b577b
+f161
+
+aad 与完整对象的区别：数组头 0x86 vs 0x87，且不含最后一项 ciphertext。
+
+info 与 aad 的分工：workspace_id / recipient / epoch 三项被**两次**绑定
+（一次经 info 进密钥，一次经 aad 进认证标签）；enc 只由 aad 绑定——它已经
+通过 kem_context 影响了 shared_secret，不需要再进 info。
+
+
+4. 密钥派生链（RFC 9180 §4.1 + §5.1，base 模式）
+--------------------------------------------------------------------
+
+记
+  LabeledExtract(salt, label, ikm)
+      = HKDF-SHA256-Extract(salt, "HPKE-v1" ‖ suite_id ‖ label ‖ ikm)
+  LabeledExpand(prk, label, info, L)
+      = HKDF-SHA256-Expand(prk, I2OSP(L,2) ‖ "HPKE-v1" ‖ suite_id ‖ label ‖ info, L)
+
+第一步 DHKEM 封装（suite_id = 4b454d0020）
+
+  1. esk           = ephemeral_secret（本向量为固定值；生产为 OsRng）
+     enc           = X25519(esk, basepoint)
+                   = 261cd9cd2e935f9c2455876a80f02a4d6786b8ab877f07227737ca0b577bf161
+  2. dh            = X25519(esk, pkR)，随后检查非全零（贡献性）
+  3. kem_context   = enc ‖ pkR                                  （64 字节）
+  4. eae_prk       = LabeledExtract("", "eae_prk", dh)          （32 字节）
+  5. shared_secret = LabeledExpand(eae_prk, "shared_secret", kem_context, 32)
+
+第二步 base 模式 key schedule（suite_id = 48504b45002000010003）
+
+  6.  psk_id_hash          = LabeledExtract("", "psk_id_hash", "")     （32 字节）
+  7.  info_hash            = LabeledExtract("", "info_hash", info)     （32 字节）
+  8.  key_schedule_context = 0x00 ‖ psk_id_hash ‖ info_hash            （65 字节）
+  9.  secret               = LabeledExtract(shared_secret, "secret", "")（32 字节）
+  10. key                  = LabeledExpand(secret, "key", key_schedule_context, 32)
+  11. base_nonce           = LabeledExpand(secret, "base_nonce", key_schedule_context, 12)
+
+第三步 AEAD（seq = 0，因此 nonce = base_nonce）
+
+  ciphertext = ChaCha20Poly1305-Seal(key, base_nonce, aad, data_key)
+
+导出接口（exporter_secret）在 M2 用不到，未派生。
+
+
+5. 输出：完整对象的 canonical CBOR
+--------------------------------------------------------------------
+
+KeyEnvelope::to_canonical_vec()，188 字节：
+
+87017830455356315f5832353531395f484b44465f5348413235365f434841434841
+3230504f4c59313330355f4544323535313950111111111111411181111111111111
+115820e3009d665bf8f968e99bc47aa11152c3ab0c7c0cfb1d57d554628e1d912364
+ec015820261cd9cd2e935f9c2455876a80f02a4d6786b8ab877f07227737ca0b577b
+f161583072cb3419df3055b2698f2f81c43ae31d47f8b33ae5fdedba3d2395bd9cd7
+d262fb9f6488ee3ac51d6027bb4d0301ebee
+
+
+6. 字段拆解
+--------------------------------------------------------------------
+
+偏移        字节                                   含义
+--------    ---------------------------------      -----------------------------
+   0        87                                     7 元数组
+   1        01                                     [0] version = 1（uint）
+   2..3     7830                                   text，长度 0x30 = 48
+   4..51    455356315f58 …（48 字节）               [1] suite（text）
+  52        50                                     bytes，长度 0x10 = 16
+  53..68    11111111111141118111111111111111       [2] workspace（bytes 16）
+  69..70    5820                                   bytes，长度 0x20 = 32
+  71..102   e3009d665bf8f968 … 912364ec            [3] recipient（bytes 32）= DeviceId
+ 103        01                                     [4] epoch = 1（uint）
+ 104..105   5820                                   bytes，长度 0x20 = 32
+ 106..137   261cd9cd2e935f9c … 577bf161            [5] enc（bytes 32）
+                                                       DHKEM 临时公钥
+ 138..139   5830                                   bytes，长度 0x30 = 48
+ 140..187   72cb3419df3055b2 … 0301ebee            [6] ciphertext（bytes 48）
+                                                       = 32 字节数据密钥 + 16 字节 tag
+                                                       长度恒为 ENVELOPE_CIPHERTEXT_LEN
+
+字段 [0]..[5] 即第 3 节的 aad 内容；字段 [6] 是唯一不进 aad 的字段。
+
+
+7. 怎么核对
+--------------------------------------------------------------------
+
+a) 逐字节比对第 2、3、5 节：
+   cargo test -p envsync-crypto --test vectors key_envelope_wire_vector_is_frozen
+
+b) 独立复现 enc：用任意 X25519 实现算 X25519([0x53; 32], basepoint)，
+   结果应等于第 6 节的 [5]。
+
+c) 独立复现整条派生链：按第 4 节逐步计算，最后用 ChaCha20-Poly1305 打开
+   第 6 节的 ciphertext，应得到 [0x33; 32]。这一步不依赖 EnvSync 的任何代码，
+   只需要 X25519 + HKDF-SHA256 + ChaCha20-Poly1305 三个标准原语。
+
+d) 攻击路径自检（对应 tests/device_envelope.rs）：
+   - 用另一台设备的私钥打开        → RecipientMismatch
+     （only_the_target_device_can_open）
+   - 交换两台设备的信封            → 失败（swapping_two_devices_envelopes_fails）
+   - 把 epoch 改成别的值           → 失败（epoch_downgrade_fails）
+   - 把 workspace 改成别的         → 失败（cross_workspace_replay_fails）
+   - 翻转 ciphertext / enc 任意一位 → 失败
+     （flipping_any_ciphertext_bit_fails、flipping_any_enc_bit_fails）
+
+能证明什么：信封线格式、info/aad 的字段与顺序、派生链的每一步与冻结那天一致。
+不能证明什么：**不能证明本实现与 RFC 9180 一致**。见 README.md §6 TODO-for-audit。

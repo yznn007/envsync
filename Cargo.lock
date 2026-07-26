@@ -510,14 +510,18 @@ dependencies = [
  "clap",
  "envsync-adapters",
  "envsync-backend",
+ "envsync-cli",
  "envsync-core",
+ "envsync-crypto",
  "envsync-domain",
+ "envsync-platform",
  "envsync-storage",
  "serde",
  "serde_json",
  "tempfile",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
@@ -530,6 +534,7 @@ dependencies = [
  "envsync-platform",
  "envsync-storage",
  "proptest",
+ "rand_core 0.6.4",
  "serde",
  "serde_json",
  "serde_yaml_ng",
@@ -538,6 +543,7 @@ dependencies = [
  "thiserror",
  "toml_edit",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]

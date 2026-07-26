@@ -1,4 +1,4 @@
-//! M2 存储层：迁移到 v4、成员索引与检查点审计副本。
+//! M2 存储层：迁移到 v5、成员索引、检查点审计副本与轮换 journal。
 //!
 //! 关注三件事：
 //!
@@ -195,15 +195,15 @@ fn table_exists(path: &Path, table: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn m1_database_upgrades_to_v4_without_losing_data() {
+fn m1_database_upgrades_to_v5_without_losing_data() {
     let dir = TempDir::new().expect("临时目录");
     let path = dir.path().join("journal.db");
     build_m1_database(&path);
     assert_eq!(raw_schema_version(&path), "2");
 
     let journal = Journal::open(&path).expect("升级并打开");
-    assert_eq!(SCHEMA_VERSION, 4);
-    assert_eq!(journal.schema_version().expect("版本"), 4);
+    assert_eq!(SCHEMA_VERSION, 5);
+    assert_eq!(journal.schema_version().expect("版本"), 5);
     assert!(journal.diagnostics().expect("诊断").is_durable());
 
     // M0 数据完好。
@@ -229,6 +229,7 @@ fn m1_database_upgrades_to_v4_without_losing_data() {
     assert!(table_exists(&path, "membership_events"));
     assert!(table_exists(&path, "membership_head"));
     assert!(table_exists(&path, "checkpoints"));
+    assert!(table_exists(&path, "rotations"));
     let index = MembershipIndex::open(&path).expect("打开成员索引");
     assert_eq!(index.head(workspace()).expect("链头"), None);
     let audit = CheckpointAudit::open(&path).expect("打开检查点");
@@ -236,7 +237,7 @@ fn m1_database_upgrades_to_v4_without_losing_data() {
 }
 
 #[test]
-fn a_brand_new_database_starts_at_v4_and_reopening_is_idempotent() {
+fn a_brand_new_database_starts_at_v5_and_reopening_is_idempotent() {
     let dir = TempDir::new().expect("临时目录");
     let path = dir.path().join("journal.db");
     for _ in 0..3 {

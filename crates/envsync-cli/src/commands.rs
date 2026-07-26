@@ -36,7 +36,7 @@ pub struct CommandOutput {
 
 impl CommandOutput {
     /// 构造一个没有诊断的结果。
-    fn plain(data: CommandData) -> Self {
+    pub(crate) fn plain(data: CommandData) -> Self {
         CommandOutput {
             data,
             diagnostics: Vec::new(),
@@ -81,6 +81,32 @@ pub enum CommandData {
     AdapterList(AdapterListData),
     /// `adapters discover` 的数据（schema v2 起）。
     AdapterDiscover(AdapterDiscoverData),
+    /// `device init` 的数据（M2）。
+    DeviceInit(crate::vault_cli::DeviceInitData),
+    /// `device list` 的数据（M2）。
+    DeviceList(crate::vault_cli::DeviceListData),
+    /// `device invite` 的数据（M2）。
+    DeviceInvite(crate::vault_cli::DeviceInviteData),
+    /// `device join` 的数据（M2）。
+    DeviceJoin(crate::vault_cli::DeviceJoinData),
+    /// `device revoke` 的数据（M2）。
+    DeviceRevoke(crate::vault_cli::DeviceRevokeData),
+    /// `vault create` 的数据（M2）。
+    VaultCreate(crate::vault_cli::VaultCreateData),
+    /// `vault set` 的数据（M2）。**不含秘密值。**
+    VaultSet(crate::vault_cli::VaultSetData),
+    /// `vault get` 的数据（M2）。**不含秘密值**——值走 `--output`。
+    VaultGet(crate::vault_cli::VaultGetData),
+    /// `vault list` 的数据（M2）。**只有元数据。**
+    VaultList(crate::vault_cli::VaultListData),
+    /// `vault delete` 的数据（M2）。
+    VaultDelete(crate::vault_cli::VaultDeleteData),
+    /// `recovery create` 的数据（M2）。**不含恢复短语**——短语只在 stderr 显示一次。
+    RecoveryCreate(crate::vault_cli::RecoveryCreateData),
+    /// `recovery restore` 的数据（M2）。
+    RecoveryRestore(crate::vault_cli::RecoveryRestoreData),
+    /// `security checkpoint` 的数据（M2）。
+    SecurityCheckpoint(crate::vault_cli::SecurityCheckpointData),
 }
 
 impl CommandData {
@@ -102,6 +128,12 @@ impl CommandData {
             CommandData::ProfileExplain(data) => data.render(),
             CommandData::AdapterList(data) => data.render(),
             CommandData::AdapterDiscover(data) => data.render(),
+            // M2 的四组命令集中在 `vault_cli` 里渲染，避免这个 match 变成一份两百行的
+            // 目录。渲染函数对未知形状返回 `None`，因此这里的 `expect` 只可能在
+            // 「新增了变体却忘了加渲染」时触发，而那属于编译期就该被发现的疏漏。
+            other => {
+                crate::vault_cli::render(other).expect("每个 CommandData 变体都必须有人类可读渲染")
+            }
         }
     }
 

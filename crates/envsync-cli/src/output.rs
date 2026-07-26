@@ -141,6 +141,25 @@ pub fn print_json<T: Serialize>(
     diagnostics: &[DiagnosticOut],
     v2_only: &[&str],
 ) {
+    println!(
+        "{}",
+        json_line(command, status, schema_version, data, diagnostics, v2_only)
+    );
+}
+
+/// 构造将要写进 stdout 的那一行 JSON，**不**打印。
+///
+/// [`print_json`] 只是它加一次 `println!`。把「渲染」与「打印」拆开，是为了让脱敏
+/// golden 测试可以断言**真正会被写出去的字节**——而不是断言一个「结构上看起来没问题」
+/// 的中间对象。两者的区别正是脱敏 bug 藏身的地方。
+pub fn json_line<T: Serialize>(
+    command: &str,
+    status: Status,
+    schema_version: u32,
+    data: Option<&T>,
+    diagnostics: &[DiagnosticOut],
+    v2_only: &[&str],
+) -> String {
     let envelope = Envelope {
         schema_version,
         command,
@@ -157,7 +176,7 @@ pub fn print_json<T: Serialize>(
     }
     redact_json(&mut value);
     // `Value` 的 `Display` 是紧凑格式，天然保证「只有一行」。
-    println!("{value}");
+    value.to_string()
 }
 
 /// 把 `data` 降级到 v1 形状：移除 v2 才引入的字段。
@@ -201,6 +220,36 @@ pub fn print_human(body: &str, diagnostics: &[DiagnosticOut]) {
         println!("{body}");
     }
     print_human_diagnostics(diagnostics);
+}
+
+/// 构造将要写进 stdout 的人类可读正文，**不**打印。
+///
+/// 与 [`json_line`] 同样的理由：golden 测试要断言真正会被写出去的字节。
+pub fn human_body(body: &str) -> String {
+    redact_text(body)
+}
+
+/// 构造将要写进 stderr 的诊断文本，**不**打印。
+pub fn human_diagnostics(diagnostics: &[DiagnosticOut]) -> String {
+    if diagnostics.is_empty() {
+        return String::new();
+    }
+    let mut text = format!("诊断（{} 条）：\n", diagnostics.len());
+    for diagnostic in diagnostics {
+        text.push_str(&redact_text(&diagnostic.render()));
+        text.push('\n');
+    }
+    text
+}
+
+/// 构造将要写进 stderr 的失败文本，**不**打印。
+pub fn human_error(error: &envsync_core::CoreError, diagnostics: &[DiagnosticOut]) -> String {
+    format!(
+        "错误：{}\n错误码：{}\n{}",
+        redact_text(&error.to_string()),
+        error.code(),
+        human_diagnostics(diagnostics)
+    )
 }
 
 /// 人类可读的失败输出：全部写 stderr。

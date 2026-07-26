@@ -1,0 +1,174 @@
+EnvSync M2 测试向量 —— 恢复短语（Base32-Crockford + BLAKE3 校验位）
+====================================================================
+
+⚠️  下面这串短语对应硬编码的测试熵，仅供测试，绝不用于生产。
+    任何在真实工作区里出现的相同短语，都意味着有人把测试常量当成了生产密钥。
+
+来源测试：crates/envsync-crypto/tests/vectors.rs
+          fn recovery_phrase_vector_is_frozen()
+复现命令：cargo test -p envsync-crypto --test vectors recovery_phrase_vector_is_frozen
+规范说明：docs/security/recovery.md §1
+
+
+1. 固定输入
+--------------------------------------------------------------------
+
+entropy   00112233445566778899aabbccddeeff
+          16 字节 = 128 bit。测试常量。
+          含义：恢复短语的全部熵。生产环境由 OsRng 生成
+                （RecoveryPhrase::generate）；本向量使用的
+                from_entropy_for_tests / render_for_tests 只在
+                test-vectors feature 下存在。
+
+
+2. 派生的中间量
+--------------------------------------------------------------------
+
+校验位计算：
+
+  checksum = BLAKE3_domain("envsync:recovery-phrase:v1", entropy)[0..4]
+
+其中 BLAKE3_domain(domain, payload)（Digest32::domain_hash）定义为
+
+  BLAKE3( domain_utf8 ‖ 0x00 ‖ u64_be(len(payload)) ‖ payload )
+
+代入本向量：
+
+  domain      = envsync:recovery-phrase:v1     （26 字节）
+  domain hex  = 656e7673796e633a7265636f766572792d7068726173653a7631
+  分隔符      = 00
+  长度前缀    = 0000000000000010                （payload 16 字节）
+  payload     = 00112233445566778899aabbccddeeff
+
+  checksum    = a113f7e2                        （摘要的前 4 字节）
+
+拼成 payload：
+
+  payload20 = entropy ‖ checksum
+            = 00112233445566778899aabbccddeeff a113f7e2
+            = 20 字节 = 160 bit
+
+160 恰好是 32 × 5，因此 Base32 编码**没有填充位**，编码是双射的。
+
+
+3. 输出：恢复短语
+--------------------------------------------------------------------
+
+字母表（Base32-Crockford，剔除易混淆的 I、L、O、U）：
+
+  索引  0123456789ABCDEFGHJKMNPQRSTVWXYZ
+  值    0..............................31
+
+展示形式（8 组 × 4 符号，`-` 分隔，共 39 个字符）：
+
+  008J-4CT4-ANK7-F24S-NAXW-SQFE-ZYGH-7XZ2
+
+去掉分隔符的 32 个符号：
+
+  008J4CT4ANK7F24SNAXWSQFEZYGH7XZ2
+
+
+4. 字段拆解：从 160 bit 到 32 个符号
+--------------------------------------------------------------------
+
+按大端从高位到低位每 5 bit 取一个符号，查 Crockford 字母表：
+
+  符号#   5-bit    值    字符    payload20 的位区间
+  -----   -----    --    ----    ------------------
+      0   00000     0     0      bit   0..  4
+      1   00000     0     0      bit   5..  9
+      2   01000     8     8      bit  10.. 14
+      3   10010    18     J      bit  15.. 19
+      4   00100     4     4      bit  20.. 24
+      5   01100    12     C      bit  25.. 29
+      6   11010    26     T      bit  30.. 34
+      7   00100     4     4      bit  35.. 39
+      8   01010    10     A      bit  40.. 44
+      9   10101    21     N      bit  45.. 49
+     10   10011    19     K      bit  50.. 54
+     11   00111     7     7      bit  55.. 59
+     12   01111    15     F      bit  60.. 64
+     13   00010     2     2      bit  65.. 69
+     14   00100     4     4      bit  70.. 74
+     15   11001    25     S      bit  75.. 79
+     16   10101    21     N      bit  80.. 84
+     17   01010    10     A      bit  85.. 89
+     18   11101    29     X      bit  90.. 94
+     19   11100    28     W      bit  95.. 99
+     20   11001    25     S      bit 100..104
+     21   10111    23     Q      bit 105..109
+     22   01111    15     F      bit 110..114
+     23   01110    14     E      bit 115..119
+     24   11111    31     Z      bit 120..124   ← 最后一个纯 entropy 符号
+     25   11110    30     Y      bit 125..129   ← 跨越 entropy/checksum 边界
+     26   10000    16     G      bit 130..134
+     27   10001    17     H      bit 135..139
+     28   00111     7     7      bit 140..144
+     29   11101    29     X      bit 145..149
+     30   11111    31     Z      bit 150..154
+     31   00010     2     2      bit 155..159
+
+entropy 占 bit 0..127，checksum 占 bit 128..159。因此符号 0..24 只由 entropy
+决定，符号 25 跨越边界，符号 26..31 只由 checksum 决定。
+
+**改动 entropy 的任意一位都会改变 checksum**，进而改变短语末尾的符号——
+这正是校验位能发现录入错误的原因。反过来，只改末尾符号（即只改 checksum）
+同样会被检出，因为解析时会用还原出的 entropy 重新计算校验位并比对。
+
+
+5. 解析规则
+--------------------------------------------------------------------
+
+RecoveryPhrase::parse 在解析前做归一化：
+
+  输入                              归一为
+  ------------------------------    --------
+  小写字母                           对应大写
+  O / o                              0
+  I / i / L / l                      1
+  `-` 与任意空白（任意位置、数量）    忽略
+
+因此下面这些输入都等价于第 3 节的短语：
+
+  008J-4CT4-ANK7-F24S-NAXW-SQFE-ZYGH-7XZ2      标准展示形式
+  008j-4ct4-ank7-f24s-naxw-sqfe-zygh-7xz2      全小写
+  008J4CT4ANK7F24SNAXWSQFEZYGH7XZ2             无分隔符
+  00 8J 4C T4 AN K7 F2 4S NA XW SQ FE ZY GH 7X Z2   空格分组
+  OO8J-4CT4-ANK7-F24S-NAXW-SQFE-ZYGH-7XZ2      把 0 抄成了 O
+
+对应测试：phrase_parsing_normalizes_case_separators_and_crockford_aliases、
+          phrase_round_trips_through_text、phrase_grouping_is_stable
+
+拒绝规则：
+
+  情况                              错误
+  ------------------------------    -------------------------------------
+  符号数 ≠ 32                        CryptoError::RecoveryPhraseMalformed
+  出现字母表外的字符                  CryptoError::RecoveryPhraseMalformed
+  格式合法但校验位不匹配              CryptoError::RecoveryPhraseChecksum
+
+  对应测试：malformed_phrases_are_rejected
+
+
+6. 怎么核对
+--------------------------------------------------------------------
+
+a) 逐字节比对第 3 节：
+   cargo test -p envsync-crypto --test vectors recovery_phrase_vector_is_frozen
+
+b) 独立复现校验位：用任意 BLAKE3 实现算第 2 节的输入，取摘要前 4 字节，
+   应等于 a113f7e2。
+
+c) 独立复现短语：把 entropy ‖ checksum 这 20 字节按每 5 bit 查
+   Crockford 字母表，应得到第 3 节的 32 个符号。
+
+d) 单字符替换检测：把第 3 节短语的任意一个符号换成字母表里的任意其他符号，
+   解析必须返回 RecoveryPhraseChecksum。测试
+   checksum_detects_every_single_character_substitution 对这个向量穷举了
+   全部 32 × 31 = 992 种替换，每一种都被检出——这不是抽样，是穷举。
+
+能证明什么：短语的编码规则、字母表、分组、校验位算法与冻结那天一致，
+            且对本向量而言所有单字符替换都能被检出。
+不能证明什么：不能证明 32-bit 校验位对**多字符**错误也总能检出——那是
+            概率性的，漏检概率约 2^-32。也不能证明这串短语属于你的工作区，
+            那只能由 RecoveryPackage::open 回答。

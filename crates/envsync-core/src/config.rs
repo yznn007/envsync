@@ -358,6 +358,15 @@ impl WorkspaceConfig {
         self.state_dir.join("backups")
     }
 
+    /// Vault 本地状态目录：`state_dir/vault`（M2）。
+    ///
+    /// 里面放的是 [`crate::vault::VaultService`] 的对象缓存与轮换 journal。刻意与
+    /// M0/M1 的草稿库分开：两者的生命周期不同——草稿可以随时清掉重来，轮换 journal
+    /// 清掉就等于丢失「上一次轮换做到哪儿了」。
+    pub fn vault_dir(&self) -> PathBuf {
+        self.state_dir.join("vault")
+    }
+
     /// 冲突索引数据库路径。
     ///
     /// 刻意与草稿库**同一个文件**：[`envsync_storage::ConflictStore::resolve`] 需要在

@@ -14,6 +14,7 @@ envsync-backend.workspace = true
 envsync-crypto.workspace = true
 envsync-platform.workspace = true
 envsync-storage.workspace = true
+rand_core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
@@ -21,7 +22,11 @@ similar.workspace = true
 toml_edit.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 proptest.workspace = true
+# 让测试目标拿到 `InMemorySecureStore`；`cargo build` 不会打开这个 feature，
+# 因此测试替身不可能泄漏进生产构建。
+envsync-platform = { workspace = true, features = ["test-support"] }

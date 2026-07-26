@@ -376,6 +376,140 @@ impl CheckpointStore for InMemoryCheckpointStore {
     }
 }
 
+/// 系统安全存储中的**权威副本**。
+///
+/// 这是生产路径应当使用的实现：条目落在操作系统托管的凭据库里
+/// （[`SecurePurpose::Checkpoint`]），由用户登录态保护。
+/// [`SqliteCheckpointStore`] 只是审计副本，两者不一致时以本实现为准。
+///
+/// # 编码
+///
+/// 值是一段 canonical CBOR 数组
+/// `[format_version, workspace, revision, snapshot, membership_digest,
+///   membership_sequence, key_epoch, updated_at_unix_ms]`。
+/// 里面**没有任何密钥材料**——检查点全部是公开元数据；把它放进安全存储不是为了保密，
+/// 而是为了**完整性**：安全存储至少要求用户账户已解锁且授予了访问权限，而
+/// `~/.envsync` 下的文件任何本地进程都能改写。
+///
+/// # 读不到 ≠ 没有
+///
+/// [`SecureStore::get`] 的 `Err`（凭据库锁定、访问被拒绝）会原样上抛，**绝不**被当成
+/// 「还没有检查点」。把两者混为一谈等于给攻击者一条免费的回滚通道：锁住凭据库就能让
+/// 设备接受任意旧状态。
+pub struct SecureCheckpointStore {
+    secure: std::sync::Arc<dyn envsync_platform::secure_store::SecureStore>,
+}
+
+/// 检查点在安全存储中的编码版本。
+pub const CHECKPOINT_RECORD_VERSION: u32 = 1;
+
+impl SecureCheckpointStore {
+    /// 由一个已打开的安全存储构造。
+    pub fn new(secure: std::sync::Arc<dyn envsync_platform::secure_store::SecureStore>) -> Self {
+        SecureCheckpointStore { secure }
+    }
+
+    /// 某个工作区的检查点坐标。
+    fn key(workspace: WorkspaceId) -> envsync_platform::secure_store::SecureKey {
+        envsync_platform::secure_store::SecureKey::workspace_scoped(
+            workspace,
+            envsync_platform::secure_store::SecurePurpose::Checkpoint,
+        )
+    }
+
+    /// 编码为 canonical CBOR。
+    fn encode(checkpoint: &Checkpoint) -> Vec<u8> {
+        use envsync_domain::cbor::{encode, CborCodec, Value};
+        encode(&Value::Array(vec![
+            Value::Uint(CHECKPOINT_RECORD_VERSION as u64),
+            checkpoint.workspace.to_value(),
+            Value::Uint(checkpoint.revision),
+            checkpoint.snapshot.to_value(),
+            checkpoint.membership_digest.to_value(),
+            Value::Uint(checkpoint.membership_sequence),
+            Value::Uint(checkpoint.key_epoch),
+            Value::Uint(checkpoint.updated_at_unix_ms),
+        ]))
+    }
+
+    /// 从 canonical CBOR 还原。
+    fn decode(bytes: &[u8]) -> Result<Checkpoint, CheckpointError> {
+        use envsync_domain::cbor::{decode_canonical, CborCodec};
+        let malformed = |detail: &str| {
+            CheckpointError::Storage(CheckpointStoreError::Corrupt(detail.to_owned()))
+        };
+        let value = decode_canonical(bytes).map_err(|_| malformed("检查点不是 canonical CBOR"))?;
+        let items = value.as_array().map_err(|_| malformed("检查点不是数组"))?;
+        if items.len() != 8 {
+            return Err(malformed("检查点字段数量不符"));
+        }
+        let version = u32::from_value(&items[0]).map_err(|_| malformed("版本号非法"))?;
+        if version != CHECKPOINT_RECORD_VERSION {
+            return Err(malformed("检查点编码版本不受支持"));
+        }
+        Ok(Checkpoint {
+            workspace: WorkspaceId::from_value(&items[1])
+                .map_err(|_| malformed("工作区标识非法"))?,
+            revision: items[2].as_uint().map_err(|_| malformed("revision 非法"))?,
+            snapshot: SnapshotId::from_value(&items[3]).map_err(|_| malformed("快照标识非法"))?,
+            membership_digest: Digest32::from_value(&items[4])
+                .map_err(|_| malformed("成员链头摘要非法"))?,
+            membership_sequence: items[5]
+                .as_uint()
+                .map_err(|_| malformed("membership_sequence 非法"))?,
+            key_epoch: items[6]
+                .as_uint()
+                .map_err(|_| malformed("key_epoch 非法"))?,
+            updated_at_unix_ms: items[7]
+                .as_uint()
+                .map_err(|_| malformed("updated_at_unix_ms 非法"))?,
+        })
+    }
+
+    /// 底层安全存储的自述信息，供 `envsync doctor` 判断这是不是真的系统存储。
+    pub fn describe(&self) -> envsync_platform::secure_store::SecureStoreDescriptor {
+        self.secure.describe()
+    }
+}
+
+impl std::fmt::Debug for SecureCheckpointStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecureCheckpointStore")
+            .field("backend", &self.secure.describe().backend)
+            .finish()
+    }
+}
+
+impl CheckpointStore for SecureCheckpointStore {
+    fn load(&self, workspace: WorkspaceId) -> Result<Option<Checkpoint>, CheckpointError> {
+        match self.secure.get(&Self::key(workspace)).map_err(|error| {
+            CheckpointError::Storage(CheckpointStoreError::Corrupt(error.code().to_owned()))
+        })? {
+            Some(bytes) => Ok(Some(Self::decode(bytes.expose())?)),
+            None => Ok(None),
+        }
+    }
+
+    fn save(&self, checkpoint: &Checkpoint) -> Result<(), CheckpointError> {
+        self.secure
+            .put(&Self::key(checkpoint.workspace), &Self::encode(checkpoint))
+            .map_err(|error| {
+                CheckpointError::Storage(CheckpointStoreError::Corrupt(error.code().to_owned()))
+            })
+    }
+
+    fn reset(&self, workspace: WorkspaceId) -> Result<(), CheckpointError> {
+        self.secure.delete(&Self::key(workspace)).map_err(|error| {
+            CheckpointError::Storage(CheckpointStoreError::Corrupt(error.code().to_owned()))
+        })?;
+        tracing::warn!(
+            workspace = %workspace,
+            "反回滚检查点（权威副本）已被删除：本设备将接受后端给出的任意状态"
+        );
+        Ok(())
+    }
+}
+
 /// SQLite 中的**审计副本**。
 ///
 /// # 这不是权威副本

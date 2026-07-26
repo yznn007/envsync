@@ -11,6 +11,7 @@
 //! | [`conflicts`] | 合并冲突的本地索引与状态 |
 //! | [`membership`] | 已验证成员事件的本地索引与链头（M2） |
 //! | [`checkpoints`] | 反回滚检查点的**审计副本**；权威副本在系统安全存储（M2） |
+//! | [`rotation`] | 密钥轮换 journal：让被中断的轮换可以幂等恢复（M2） |
 //! | [`migrations`] | 数据库打开、PRAGMA 与 schema 迁移 |
 //!
 //! ## 三条不变量
@@ -45,6 +46,7 @@ pub mod draft;
 pub mod journal;
 pub mod membership;
 pub mod migrations;
+pub mod rotation;
 
 pub use checkpoints::{CheckpointAudit, CheckpointRecord, CheckpointStoreError};
 pub use conflicts::{ConflictError, ConflictRecord, ConflictState, ConflictStore};
@@ -57,3 +59,4 @@ pub use membership::{
     MembershipEventRecord, MembershipHead, MembershipIndex, MembershipStoreError,
 };
 pub use migrations::{StorageDiagnostics, SCHEMA_VERSION};
+pub use rotation::{RotationJournal, RotationRecord, RotationStage, RotationStoreError};
