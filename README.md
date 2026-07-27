@@ -4,17 +4,19 @@ EnvSync 是一个本地优先、跨平台的开发环境同步工具。它面向
 Windows，统一管理 shell 配置、终端配置、Git 参数、包管理器期望状态、AI
 Agent/Skill 配置以及显式选择的凭据。
 
-项目状态：**M0、M1 已完成；M2 进行中。**
+项目状态：**M0、M1、M2、M3 已完成；M4 规划中。**
 
 - **M0（安全文件闭环）**：本地后端、Full File 与 Managed Block、确定性快照、不可变
   Plan、CAS 发布、安全写入、SQLite journal、验证、回滚与崩溃恢复、可脚本化 CLI。
 - **M1（可用同步）**：Git 后端、设备 Profile 投影、三方合并（文本 + JSON/YAML/TOML/
   INI/Git config）、冲突对象与裁决流程、首批 shell / 终端 / Git 内建适配器，
   以及 `fetch` / `merge` / `conflicts` / `profile explain` 四组新命令与 JSON 契约 v2。
-- **M2（Vault 与设备安全，进行中）**：密码学层（固定算法套件、设备身份与域分隔签名、
+- **M2（Vault 与设备安全，已完成）**：密码学层（固定算法套件、设备身份与域分隔签名、
   密封秘密对象、HPKE 设备信封、Argon2id 恢复包）、设备成员签名链、系统安全存储接入、
   反回滚检查点、可恢复的密钥轮换与 Vault 应用服务均已落地并有攻击路径测试；
-  `device` / `vault` / `recovery` / `security` 四组命令行入口仍在开发中。
+  `device` / `vault` / `recovery` / `security` 四组命令行入口已完成。
+- **M3（包管理器与 Agent Bundle，已完成）**：包期望状态、能力范围命令执行器、跨平台
+  包管理器适配器、策略引擎、Agent Bundle 签名与隔离、Skill/工具渲染和回滚验收均已完成。
 
 Linux / macOS / Windows 三平台 CI 全部就绪。
 
@@ -195,8 +197,8 @@ CI（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）在
 
 - **M0（已完成）**：本地后端、安全文件捕获、计划、应用、验证和回滚
 - **M1（已完成）**：Git 后端、Profile 投影、三方合并、冲突对象、首批内建适配器
-- **M2（进行中）**：Vault、设备身份、成员关系与恢复
-- M3：包管理器、Agent Bundle、Skill 和策略引擎
+- **M2（已完成）**：Vault、设备身份、成员关系与恢复
+- **M3（已完成）**：包管理器、Agent Bundle、Skill 和策略引擎
 - M4：Tauri 桌面端、Gist 后端、插件 SDK
 
 完整命令行和桌面端技术栈为 Rust、Tauri 2、Vue 3、TypeScript。

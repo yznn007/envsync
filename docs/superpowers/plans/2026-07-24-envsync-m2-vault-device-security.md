@@ -1,5 +1,7 @@
 # EnvSync M2 Vault 与设备安全实施计划
 
+> 状态：已完成（2026-07-27）。M2 已合并至 `main`，三平台 CI 与安全验收通过。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
 > superpowers:subagent-driven-development (recommended) or
 > superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox
