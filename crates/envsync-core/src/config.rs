@@ -18,7 +18,18 @@
 //! use std::path::Path;
 //! use envsync_core::config::WorkspaceConfig;
 //!
-//! let text = r#"
+//! let home_path = if cfg!(windows) {
+//!     r"C:\home\example"
+//! } else {
+//!     "/home/example"
+//! };
+//! let base_dir = if cfg!(windows) {
+//!     Path::new(r"C:\etc\envsync")
+//! } else {
+//!     Path::new("/etc/envsync")
+//! };
+//!
+//! let text = format!(r#"
 //! version: 1
 //! workspace_id: "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
 //! device:
@@ -28,19 +39,19 @@
 //!   kind: local
 //!   path: backend
 //! roots:
-//!   home: /home/example
+//!   home: {home_path}
 //! resources:
 //!   - id: shell/zsh/main
 //!     root: home
 //!     target: .zshrc
 //!     mode: managed_block
 //!     disposition: managed
-//! "#;
+//! "#);
 //!
-//! let config = WorkspaceConfig::parse_yaml(text, Path::new("/etc/envsync"))?;
+//! let config = WorkspaceConfig::parse_yaml(&text, base_dir)?;
 //! // 相对路径统一相对配置文件所在目录解析。
-//! assert_eq!(config.journal_path(), Path::new("/etc/envsync/.envsync/journal.db"));
-//! assert_eq!(config.root_path("home")?, Path::new("/home/example"));
+//! assert_eq!(config.journal_path(), base_dir.join(".envsync").join("journal.db"));
+//! assert_eq!(config.root_path("home")?, Path::new(home_path));
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
