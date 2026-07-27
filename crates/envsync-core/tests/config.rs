@@ -329,10 +329,7 @@ fn rule06_relative_root_resolves_against_absolute_base() {
     let text = replace_home(&yaml_with(""), "\"sandbox/home\"");
     let base = absolute_path("/opt/cfg");
     let config = WorkspaceConfig::parse_yaml(&text, &base).expect("配置合法");
-    assert_eq!(
-        config.root_path("home").unwrap(),
-        base.join("sandbox/home")
-    );
+    assert_eq!(config.root_path("home").unwrap(), base.join("sandbox/home"));
 }
 
 // ---------------------------------------------------------------------------
@@ -578,10 +575,8 @@ fn rule13_load_uses_config_directory_as_base() {
 #[test]
 fn rule14_relative_paths_resolve_against_base_dir() {
     let text = replace_home(
-        &yaml_with("state_dir: .envsync\n").replace(
-            &format!("\"{}\"", backend_yaml()),
-            "\"backend\"",
-        ),
+        &yaml_with("state_dir: .envsync\n")
+            .replace(&format!("\"{}\"", backend_yaml()), "\"backend\""),
         "\"home\"",
     );
     let base = absolute_path("/tmp/x");
@@ -608,19 +603,13 @@ fn rule14_absolute_paths_are_kept_as_is() {
 
 #[test]
 fn state_dir_defaults_to_dot_envsync_and_derives_subpaths() {
-    let config = WorkspaceConfig::parse_yaml(&yaml_with(""), &absolute_path("/tmp/x"))
-        .expect("配置合法");
+    let config =
+        WorkspaceConfig::parse_yaml(&yaml_with(""), &absolute_path("/tmp/x")).expect("配置合法");
     let base = absolute_path("/tmp/x");
     assert_eq!(config.state_dir, base.join(".envsync"));
-    assert_eq!(
-        config.journal_path(),
-        base.join(".envsync/journal.db")
-    );
+    assert_eq!(config.journal_path(), base.join(".envsync/journal.db"));
     assert_eq!(config.draft_dir(), base.join(".envsync/draft"));
-    assert_eq!(
-        config.backup_root(),
-        base.join(".envsync/backups")
-    );
+    assert_eq!(config.backup_root(), base.join(".envsync/backups"));
 }
 
 // ---------------------------------------------------------------------------
@@ -635,10 +624,7 @@ fn example_workspace_yaml_parses() {
         .expect("examples/workspace.yaml 必须始终可解析");
 
     assert_eq!(config.version, CONFIG_VERSION);
-    assert_eq!(
-        config.state_dir,
-        example_base().join(".envsync")
-    );
+    assert_eq!(config.state_dir, example_base().join(".envsync"));
     assert!(config.roots.contains_key("home"));
 
     // 两种模式都被示例覆盖到。
