@@ -14,6 +14,26 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
+  # 检测可选组件。hashFiles() 不能用于 job 级 if，因此先通过 job output
+  # 把文件是否存在传给后续桌面端 job。
+  # ---------------------------------------------------------------------------
+  detect:
+    name: 检测可选组件
+    runs-on: ubuntu-latest
+    outputs:
+      desktop_ui: ${{ steps.desktop-ui.outputs.present }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: desktop-ui
+        shell: bash
+        run: |
+          if test -f apps/desktop-ui/package.json; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ---------------------------------------------------------------------------
   # 格式与静态检查：只需在一个平台跑，失败即快速反馈。
   # ---------------------------------------------------------------------------
   lint:
@@ -62,7 +82,8 @@ jobs:
   desktop-ui:
     name: 桌面前端
     runs-on: ubuntu-latest
-    if: hashFiles('apps/desktop-ui/package.json') != ''
+    needs: detect
+    if: ${{ needs.detect.outputs.desktop_ui == 'true' }}
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
