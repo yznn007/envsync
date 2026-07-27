@@ -23,16 +23,54 @@ use envsync_domain::{
 /// 一个合法的 64 位小写十六进制设备种子。
 const SEED: &str = "3a7f1c92b4de5068a1cf23947db6e50f8c41a2937be05d6c1f83a4b72e90cd15";
 
-/// 示例配置的解析基准目录（不需要真实存在：解析纯粹是文本操作）。
-const EXAMPLE_BASE: &str = "/tmp/envsync-example";
-
 fn base_dir() -> PathBuf {
-    PathBuf::from("/tmp/envsync-test")
+    absolute_path("/tmp/envsync-test")
+}
+
+fn absolute_path(unix_path: &str) -> PathBuf {
+    if cfg!(windows) {
+        PathBuf::from(format!(
+            "C:{}",
+            unix_path.trim_start_matches('/').replace('/', "\\")
+        ))
+    } else {
+        PathBuf::from(unix_path)
+    }
+}
+
+fn yaml_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn home_yaml() -> String {
+    yaml_path(&absolute_path("/home/example"))
+}
+
+fn backend_yaml() -> String {
+    yaml_path(&absolute_path("/srv/backend"))
+}
+
+fn example_base() -> PathBuf {
+    absolute_path("/tmp/envsync-example")
+}
+
+fn portable_example(text: &str) -> String {
+    text.replace(
+        "\"/srv/YOUR_BACKEND/envsync\"",
+        &format!(
+            "\"{}\"",
+            yaml_path(&absolute_path("/srv/YOUR_BACKEND/envsync"))
+        ),
+    )
+    .replace(
+        "\"/home/YOUR_USER\"",
+        &format!("\"{}\"", yaml_path(&absolute_path("/home/YOUR_USER"))),
+    )
 }
 
 /// 组装一份最小合法配置，`extra` 追加在末尾（用于插入 resources 等片段）。
 fn yaml_with(extra: &str) -> String {
-    format!(
+    let text = format!(
         "version: 1\n\
          workspace_id: \"0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0\"\n\
          device:\n\
@@ -44,7 +82,13 @@ fn yaml_with(extra: &str) -> String {
          roots:\n\
          \x20 home: \"/home/example\"\n\
          {extra}"
-    )
+    );
+    text.replace("\"/srv/backend\"", &format!("\"{}\"", backend_yaml()))
+        .replace("\"/home/example\"", &format!("\"{}\"", home_yaml()))
+}
+
+fn replace_home(text: &str, replacement: &str) -> String {
+    text.replace(&format!("\"{}\"", home_yaml()), replacement)
 }
 
 /// 组装一份只含单个资源的配置，`resource` 是该资源的 YAML 片段（不含前导 `- `）。
@@ -200,7 +244,7 @@ fn rule04_root_path_lookup_reports_unknown_alias() {
     let config = parse(&yaml_with("")).expect("配置合法");
     assert_eq!(
         config.root_path("home").unwrap(),
-        Path::new("/home/example")
+        absolute_path("/home/example")
     );
     let error = config.root_path("nope").expect_err("未知别名必须报错");
     assert_eq!(error.code(), "config.unknown_root");
@@ -270,7 +314,7 @@ fn rule05_nested_target_is_accepted() {
 #[test]
 fn rule06_relative_root_without_absolute_base_is_rejected() {
     // 相对根会被相对 base_dir 解析；base_dir 本身是相对路径时无法得到绝对根，必须报错。
-    let text = yaml_with("").replace("\"/home/example\"", "\"relative/root\"");
+    let text = replace_home(&yaml_with(""), "\"relative/root\"");
     let error = WorkspaceConfig::parse_yaml(&text, Path::new("relative/base"))
         .expect_err("无法解析成绝对路径的根必须报错");
     assert_eq!(error.code(), "config.root_not_absolute");
@@ -282,11 +326,12 @@ fn rule06_relative_root_without_absolute_base_is_rejected() {
 
 #[test]
 fn rule06_relative_root_resolves_against_absolute_base() {
-    let text = yaml_with("").replace("\"/home/example\"", "\"sandbox/home\"");
-    let config = WorkspaceConfig::parse_yaml(&text, Path::new("/opt/cfg")).expect("配置合法");
+    let text = replace_home(&yaml_with(""), "\"sandbox/home\"");
+    let base = absolute_path("/opt/cfg");
+    let config = WorkspaceConfig::parse_yaml(&text, &base).expect("配置合法");
     assert_eq!(
         config.root_path("home").unwrap(),
-        Path::new("/opt/cfg/sandbox/home")
+        base.join("sandbox/home")
     );
 }
 
@@ -296,7 +341,7 @@ fn rule06_relative_root_resolves_against_absolute_base() {
 
 #[test]
 fn rule07_empty_roots_is_rejected() {
-    let text = yaml_with("").replace("  home: \"/home/example\"\n", "");
+    let text = yaml_with("").replace(&format!("  home: \"{}\"\n", home_yaml()), "");
     let error = parse(&text).expect_err("没有授权根必须报错");
     assert_eq!(error.code(), "config.no_roots");
 }
@@ -532,42 +577,49 @@ fn rule13_load_uses_config_directory_as_base() {
 
 #[test]
 fn rule14_relative_paths_resolve_against_base_dir() {
-    let text = yaml_with("state_dir: .envsync\n")
-        .replace("\"/srv/backend\"", "\"backend\"")
-        .replace("\"/home/example\"", "\"home\"");
-    let config = WorkspaceConfig::parse_yaml(&text, Path::new("/tmp/x")).expect("配置合法");
+    let text = replace_home(
+        &yaml_with("state_dir: .envsync\n").replace(
+            &format!("\"{}\"", backend_yaml()),
+            "\"backend\"",
+        ),
+        "\"home\"",
+    );
+    let base = absolute_path("/tmp/x");
+    let config = WorkspaceConfig::parse_yaml(&text, &base).expect("配置合法");
 
-    assert_eq!(config.state_dir, PathBuf::from("/tmp/x/.envsync"));
-    assert_eq!(config.root_path("home").unwrap(), Path::new("/tmp/x/home"));
+    assert_eq!(config.state_dir, base.join(".envsync"));
+    assert_eq!(config.root_path("home").unwrap(), base.join("home"));
     let BackendConfig::Local { path } = &config.backend;
-    assert_eq!(path, Path::new("/tmp/x/backend"));
+    assert_eq!(path, &base.join("backend"));
 }
 
 #[test]
 fn rule14_absolute_paths_are_kept_as_is() {
+    let absolute_state = yaml_path(&absolute_path("/var/lib/envsync"));
     let config = WorkspaceConfig::parse_yaml(
-        &yaml_with("state_dir: /var/lib/envsync\n"),
-        Path::new("/tmp/x"),
+        &yaml_with(&format!("state_dir: \"{absolute_state}\"\n")),
+        &absolute_path("/tmp/x"),
     )
     .expect("配置合法");
-    assert_eq!(config.state_dir, PathBuf::from("/var/lib/envsync"));
+    assert_eq!(config.state_dir, absolute_path("/var/lib/envsync"));
     let BackendConfig::Local { path } = &config.backend;
-    assert_eq!(path, Path::new("/srv/backend"));
+    assert_eq!(path, &absolute_path("/srv/backend"));
 }
 
 #[test]
 fn state_dir_defaults_to_dot_envsync_and_derives_subpaths() {
-    let config =
-        WorkspaceConfig::parse_yaml(&yaml_with(""), Path::new("/tmp/x")).expect("配置合法");
-    assert_eq!(config.state_dir, PathBuf::from("/tmp/x/.envsync"));
+    let config = WorkspaceConfig::parse_yaml(&yaml_with(""), &absolute_path("/tmp/x"))
+        .expect("配置合法");
+    let base = absolute_path("/tmp/x");
+    assert_eq!(config.state_dir, base.join(".envsync"));
     assert_eq!(
         config.journal_path(),
-        PathBuf::from("/tmp/x/.envsync/journal.db")
+        base.join(".envsync/journal.db")
     );
-    assert_eq!(config.draft_dir(), PathBuf::from("/tmp/x/.envsync/draft"));
+    assert_eq!(config.draft_dir(), base.join(".envsync/draft"));
     assert_eq!(
         config.backup_root(),
-        PathBuf::from("/tmp/x/.envsync/backups")
+        base.join(".envsync/backups")
     );
 }
 
@@ -577,14 +629,15 @@ fn state_dir_defaults_to_dot_envsync_and_derives_subpaths() {
 
 #[test]
 fn example_workspace_yaml_parses() {
-    let text = include_str!("../../../examples/workspace.yaml");
-    let config = WorkspaceConfig::parse_yaml(text, Path::new(EXAMPLE_BASE))
+    let source = include_str!("../../../examples/workspace.yaml");
+    let text = portable_example(source);
+    let config = WorkspaceConfig::parse_yaml(&text, &example_base())
         .expect("examples/workspace.yaml 必须始终可解析");
 
     assert_eq!(config.version, CONFIG_VERSION);
     assert_eq!(
         config.state_dir,
-        PathBuf::from("/tmp/envsync-example/.envsync")
+        example_base().join(".envsync")
     );
     assert!(config.roots.contains_key("home"));
 
@@ -603,10 +656,10 @@ fn example_workspace_yaml_parses() {
     assert!(!zsh.policy.secret);
 
     // 示例里绝不能出现真实用户路径或疑似凭据的内容。
-    assert!(text.contains("/home/YOUR_USER"));
+    assert!(source.contains("/home/YOUR_USER"));
     for forbidden in ["token", "password", "secret_key", "/home/claude", "/root/"] {
         assert!(
-            !text.to_ascii_lowercase().contains(forbidden),
+            !source.to_ascii_lowercase().contains(forbidden),
             "示例不得包含 {forbidden}"
         );
     }
@@ -614,8 +667,9 @@ fn example_workspace_yaml_parses() {
 
 #[test]
 fn example_resource_without_policy_uses_defaults() {
-    let text = include_str!("../../../examples/workspace.yaml");
-    let config = WorkspaceConfig::parse_yaml(text, Path::new(EXAMPLE_BASE)).expect("示例可解析");
+    let source = include_str!("../../../examples/workspace.yaml");
+    let text = portable_example(source);
+    let config = WorkspaceConfig::parse_yaml(&text, &example_base()).expect("示例可解析");
     let git = config
         .resource(&ResourceId::parse("git/config/global").unwrap())
         .expect("示例应包含 git/config/global");
@@ -646,7 +700,7 @@ fn scaffold_round_trips_through_yaml() {
 
     // 换一个 base_dir 也应得到同样结果：序列化写出的是解析后的绝对路径。
     let elsewhere =
-        WorkspaceConfig::parse_yaml(&yaml, Path::new("/somewhere/else")).expect("仍可解析");
+        WorkspaceConfig::parse_yaml(&yaml, &absolute_path("/somewhere/else")).expect("仍可解析");
     assert_eq!(elsewhere, scaffolded);
 }
 
@@ -656,7 +710,7 @@ fn scaffold_produces_valid_minimal_config() {
     let config = WorkspaceConfig::scaffold(
         WorkspaceId::generate(),
         "laptop",
-        Path::new("/srv/backend"),
+        &absolute_path("/srv/backend"),
         &base,
     );
     assert_eq!(config.version, CONFIG_VERSION);
@@ -666,7 +720,7 @@ fn scaffold_produces_valid_minimal_config() {
     assert_eq!(config.state_dir, base.join(".envsync"));
     assert!(config.root_path("home").is_ok());
     let BackendConfig::Local { path } = &config.backend;
-    assert_eq!(path, Path::new("/srv/backend"));
+    assert_eq!(path, &absolute_path("/srv/backend"));
 }
 
 #[test]
