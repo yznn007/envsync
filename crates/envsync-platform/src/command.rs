@@ -1258,9 +1258,19 @@ mod tests {
 
     #[test]
     fn absolute_path_values_reject_traversal() {
-        assert!(ValueClass::AbsolutePath.validate(0, "/tmp/x.txt").is_ok());
+        let absolute = if cfg!(windows) {
+            "C:/tmp/x.txt"
+        } else {
+            "/tmp/x.txt"
+        };
+        let traversal = if cfg!(windows) {
+            "C:/tmp/../etc"
+        } else {
+            "/tmp/../etc"
+        };
+        assert!(ValueClass::AbsolutePath.validate(0, absolute).is_ok());
         assert!(ValueClass::AbsolutePath.validate(0, "tmp/x.txt").is_err());
-        assert!(ValueClass::AbsolutePath.validate(0, "/tmp/../etc").is_err());
+        assert!(ValueClass::AbsolutePath.validate(0, traversal).is_err());
     }
 
     #[test]
