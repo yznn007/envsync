@@ -30,7 +30,7 @@ fn base_dir() -> PathBuf {
 fn absolute_path(unix_path: &str) -> PathBuf {
     if cfg!(windows) {
         PathBuf::from(format!(
-            "C:{}",
+            "C:\\{}",
             unix_path.trim_start_matches('/').replace('/', "\\")
         ))
     } else {
