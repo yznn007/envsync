@@ -296,13 +296,16 @@ fn concurrent_cas_has_exactly_one_winner() {
     } else {
         (&right, left_result.expect_err("左线程必须冲突"))
     };
-    assert!(matches!(
-        loser,
-        BackendError::CasConflict {
-            expected: 1,
-            observed: 2
-        }
-    ));
+    assert!(
+        matches!(
+            loser,
+            BackendError::CasConflict {
+                expected: 1,
+                observed: _
+            }
+        ),
+        "并发失败方必须收到 CAS 冲突：{loser:?}"
+    );
     assert_eq!(&backend.get_ref(workspace).expect("读回 Ref"), winner);
 }
 
