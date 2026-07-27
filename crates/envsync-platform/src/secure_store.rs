@@ -70,6 +70,7 @@ pub const DEVICE_PLACEHOLDER: &str = "-";
 ///
 /// 刻意与真实条目的命名空间同形（`<workspace>/<device>/<purpose>`），但 workspace
 /// 段是不可能出现的 `-`，因此永远不会与真实条目冲突。
+#[cfg(target_os = "linux")]
 const PROBE_ACCOUNT: &str = "-/-/availability-probe";
 
 /// 安全存储中一条记录的用途。
@@ -544,6 +545,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn probe_account_cannot_collide_with_real_keys() {
         // 真实 account 的首段一定是 UUID，不可能是 `-`。
         assert!(PROBE_ACCOUNT.starts_with("-/"));
