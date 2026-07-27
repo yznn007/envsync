@@ -21,6 +21,8 @@
 //! | [`vault`] | Vault application service：端到端加密的秘密存取（M2） |
 //! | [`device_admin`] | 设备身份、邀请、加入、清单与工作区恢复（M2） |
 //! | [`rotation`] | 撤销设备后的可恢复密钥轮换编排（M2） |
+//! | [`bundles`] | Agent Bundle 的 quarantine、验签、审核、启用与撤销（M3） |
+//! | [`packages`] | 包计划、策略判定、逐条确认与收敛（M3） |
 //! | [`mod@merge`] | 文本与结构化三方合并，只产出干净结果或显式 Conflict |
 //! | [`projection`] | Workspace 到 DeviceView 的纯函数投影 |
 //! | [`sync`] | fetch、合并基、三方合并与冲突裁决的编排 |
@@ -39,6 +41,7 @@
 
 pub mod apply;
 pub mod attestation;
+pub mod bundles;
 pub mod checkpoint;
 pub mod config;
 pub mod device_admin;
@@ -47,6 +50,7 @@ pub mod last_known;
 pub mod membership;
 pub mod merge;
 pub mod offline;
+pub mod packages;
 pub mod planner;
 pub mod ports;
 pub mod projection;
@@ -61,6 +65,12 @@ pub use apply::{ApplyEngine, ApplyOutcome};
 pub use attestation::{
     sign_index_attestation, verify_index_attestation, AttestationError, ATTESTATION_ALGORITHM,
     ATTESTATION_ALGORITHM_NONE, VAULT_ATTESTATION_DOMAIN,
+};
+pub use bundles::{
+    approve as approve_bundle, block as block_bundle, enable as enable_bundle,
+    inspect as inspect_bundle, review_update, revoke as revoke_bundle, verify_bundle_signature,
+    ApprovalGap, BundleApproval, BundleContext, BundleError, BundleTransition, PublisherRegistry,
+    PublisherStatus, QuarantineRoot, StagedBundle, UpdateReview, BUNDLE_SIGNATURE_DOMAIN,
 };
 pub use checkpoint::{
     advance as advance_checkpoint, check_advance, Checkpoint, CheckpointError, CheckpointStore,
@@ -90,6 +100,13 @@ pub use merge::{
     MAX_PARSE_DEPTH,
 };
 pub use offline::UnreachableBackend;
+pub use packages::{
+    adapters_in_plan, apply_packages, evaluate_action, evaluate_plan, operation_for,
+    ActionAuthorization, ActionConfirmer, Confirmation, ConfirmedPlan, DeclinedAction,
+    InMemoryPackagePlanStore, PackageActionReceipt, PackageApplyOutcome, PackageDecision,
+    PackageError, PackageMutator, PackageMutatorRegistry, PackagePlan, PackagePlanStore,
+    PlannedPackageAction, PACKAGE_PLAN_FORMAT_VERSION,
+};
 pub use planner::{build_plan, BlobSource, PlanOutcome, PlanRequest};
 pub use ports::{ActionReceipt, Clock, FileMutator, FixedClock, Observer, SystemClock};
 pub use projection::{

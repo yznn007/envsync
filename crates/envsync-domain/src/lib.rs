@@ -12,9 +12,11 @@
 //! | [`membership`] | 设备成员签名事件链：角色、动作、事件与回放后的成员状态 |
 //! | [`resource`] | 观察状态、期望处置、资源条目与写入策略 |
 //! | [`object`] | 内容寻址对象：Blob、State Root、Conflict |
+//! | [`package`] | 包身份、来源、版本策略、期望状态与动作推导（M3） |
 //! | [`profile`] | 设备 Profile、封闭选择器 AST、投影诊断与冲突解决方案 |
 //! | [`snapshot`] | 快照主体、签名与工作区引用 |
 //! | [`plan`] | 绑定观察结果的不可变计划 |
+//! | [`agent_bundle`] | Agent Bundle manifest、发布者签名与隔离状态机（M3） |
 //!
 //! ## 三条不可动摇的不变量
 //!
@@ -56,15 +58,22 @@
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 
+pub mod agent_bundle;
 pub mod cbor;
 pub mod id;
 pub mod membership;
 pub mod object;
+pub mod package;
 pub mod plan;
 pub mod profile;
 pub mod resource;
 pub mod snapshot;
 
+pub use agent_bundle::{
+    BundleEntryKind, BundleFileEntry, BundleId, BundleManifest, BundleManifestError,
+    BundleSignature, BundleState, BUNDLE_MANIFEST_FORMAT_VERSION, BUNDLE_SIGNATURE_FORMAT_VERSION,
+    MAX_BUNDLE_TOTAL_BYTES, SECRET_REF_SCHEME,
+};
 pub use cbor::{CborCodec, CborError};
 pub use id::{
     BlobId, ConflictId, DeviceId, Digest32, IdError, OperationId, PlanId, ResourceId, SnapshotId,
@@ -78,6 +87,13 @@ pub use membership::{
 pub use object::{
     Blob, Conflict, ConflictKind, ObjectId, ObjectKind, StateRoot, StateRootError,
     CONFLICT_FORMAT_VERSION, STATE_ROOT_FORMAT_VERSION,
+};
+pub use package::{
+    InstalledPackage, NameCase, NameRules, PackageAction, PackageActionKind, PackageDisposition,
+    PackageIdentity, PackageIntent, PackageIntentError, PackageIntentSet, PackageManagerId,
+    PackageObservation, PackageObservationSet, PackageState, SeparatorRule, VersionPolicy,
+    VersionVerdict, MAX_PACKAGE_INTENTS, PACKAGE_INTENT_SET_DOMAIN,
+    PACKAGE_INTENT_SET_FORMAT_VERSION, PACKAGE_OBSERVATION_SET_FORMAT_VERSION,
 };
 pub use plan::{
     Action, ActionKind, ActionTarget, BackupPolicy, Diagnostic, Plan, Risk, RollbackCapability,

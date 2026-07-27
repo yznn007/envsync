@@ -11,6 +11,7 @@ members = [
     # 端到端验收套件：只依赖真实 CLI 二进制，不被其他 crate 依赖。
     "crates/envsync-e2e",
     "crates/envsync-crypto",
+    "crates/envsync-policy",
 ]
 
 [workspace.package]
@@ -30,12 +31,14 @@ envsync-storage = { path = "crates/envsync-storage", version = "0.1.0" }
 envsync-core = { path = "crates/envsync-core", version = "0.1.0" }
 envsync-adapters = { path = "crates/envsync-adapters", version = "0.1.0" }
 envsync-crypto = { path = "crates/envsync-crypto", version = "0.1.0" }
+envsync-policy = { path = "crates/envsync-policy", version = "0.1.0" }
 
 blake3 = "1"
 cap-std = "3"
 clap = { version = "4", features = ["derive"] }
 git2 = { version = "0.20", default-features = false, features = ["vendored-libgit2"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
+semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml_ng = "0.10"

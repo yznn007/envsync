@@ -40,6 +40,8 @@
 //! | [`shell`] | Bash / Zsh RC 与 PowerShell Profile |
 //! | [`wezterm`] | WezTerm Lua（Generated Include） |
 //! | [`git_config`] | 用户级 Git 配置（结构化合并）与系统级 Git 配置（只观察） |
+//! | [`packages`] | 包管理器适配器契约、注册表与内存测试替身（M3） |
+//! | [`agents`] | 统一 Agent/Skill/MCP 模型与 Claude、Codex、OpenCode 渲染器（M3） |
 
 use std::collections::BTreeMap;
 
@@ -47,10 +49,17 @@ use envsync_domain::id::ResourceId;
 use envsync_domain::profile::{DeviceProfile, Os, Selector};
 use envsync_domain::resource::{DesiredDisposition, FileMode, ResourcePolicy};
 
+pub mod agents;
 pub mod file;
 pub mod git_config;
+pub mod packages;
 pub mod shell;
 pub mod wezterm;
+
+pub use packages::{
+    AdapterMutator, ApplyContext, ObserveContext, PackageAdapter, PackageAdapterError,
+    PackageAdapterRegistry, PackageManagerDescriptor, PackageReceipt, VerifyResult,
+};
 
 /// 用户主目录授权根的约定别名。
 ///

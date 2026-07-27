@@ -1,6 +1,6 @@
 [package]
-name = "envsync-domain"
-description = "EnvSync 领域模型：强类型 ID、资源状态、确定性对象、快照与不可变计划"
+name = "envsync-policy"
+description = "EnvSync 可解释安全策略引擎：封闭规则 AST、deny-first 求值与可审计解释"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,13 +9,11 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-blake3.workspace = true
-semver.workspace = true
+envsync-domain.workspace = true
 serde.workspace = true
+serde_yaml_ng.workspace = true
 thiserror.workspace = true
-uuid.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
-uuid.workspace = true
-serde_json.workspace = true

@@ -486,7 +486,9 @@ dependencies = [
  "envsync-core",
  "envsync-domain",
  "envsync-platform",
+ "envsync-policy",
  "proptest",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tracing",
@@ -532,6 +534,7 @@ dependencies = [
  "envsync-crypto",
  "envsync-domain",
  "envsync-platform",
+ "envsync-policy",
  "envsync-storage",
  "proptest",
  "rand_core 0.6.4",
@@ -570,6 +573,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "proptest",
+ "semver",
  "serde",
  "serde_json",
  "thiserror",
@@ -607,6 +611,18 @@ dependencies = [
  "tracing",
  "uuid",
  "zeroize",
+]
+
+[[package]]
+name = "envsync-policy"
+version = "0.1.0"
+dependencies = [
+ "envsync-domain",
+ "proptest",
+ "serde",
+ "serde_yaml_ng",
+ "thiserror",
+ "tracing",
 ]
 
 [[package]]

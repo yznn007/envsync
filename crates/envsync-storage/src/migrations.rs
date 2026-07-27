@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use crate::journal::JournalError;
 
 /// 本版本支持的 schema 版本号。
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// `schema_meta` 中记录 schema 版本的键名。
 pub const SCHEMA_VERSION_KEY: &str = "schema_version";
@@ -59,6 +59,9 @@ const MIGRATION_0004: &str = include_str!("../migrations/0004_checkpoints.sql");
 
 /// 0005 迁移脚本：可恢复的密钥轮换 journal。
 const MIGRATION_0005: &str = include_str!("../migrations/0005_rotation.sql");
+
+/// 0006 迁移脚本：Agent Bundle 的隔离状态与文件清单。
+const MIGRATION_0006: &str = include_str!("../migrations/0006_bundles.sql");
 
 /// 迁移后校验用的探针：`(表名, 该版本必须存在的列)`。
 ///
@@ -111,6 +114,12 @@ const SCHEMA_PROBES: &[(&str, &str)] = &[
         "workspace_id, from_epoch, to_epoch, revoked_device, stage, recipients, envelopes, \
          pending_rewrap, event_created_at_unix_ms, started_at_unix_ms, updated_at_unix_ms",
     ),
+    (
+        "bundles",
+        "bundle_id, version, manifest_digest, publisher_key, state, \
+         approved_capabilities, approved_at, blocked_reason, updated_at_unix_ms",
+    ),
+    ("bundle_files", "bundle_id, path, digest"),
 ];
 
 /// 连接层运行时诊断，供 `envsync doctor` 与测试断言使用。
@@ -249,6 +258,9 @@ fn migrate(connection: &Connection) -> Result<(), JournalError> {
     }
     if current < 5 {
         transaction.execute_batch(MIGRATION_0005)?;
+    }
+    if current < 6 {
+        transaction.execute_batch(MIGRATION_0006)?;
     }
     verify_schema(&transaction)?;
     transaction.execute(

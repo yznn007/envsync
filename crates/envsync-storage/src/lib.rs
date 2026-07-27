@@ -12,6 +12,7 @@
 //! | [`membership`] | 已验证成员事件的本地索引与链头（M2） |
 //! | [`checkpoints`] | 反回滚检查点的**审计副本**；权威副本在系统安全存储（M2） |
 //! | [`rotation`] | 密钥轮换 journal：让被中断的轮换可以幂等恢复（M2） |
+//! | [`bundles`] | Agent Bundle 的隔离状态与文件清单（M3） |
 //! | [`migrations`] | 数据库打开、PRAGMA 与 schema 迁移 |
 //!
 //! ## 三条不变量
@@ -40,6 +41,7 @@
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 
+pub mod bundles;
 pub mod checkpoints;
 pub mod conflicts;
 pub mod draft;
@@ -48,6 +50,7 @@ pub mod membership;
 pub mod migrations;
 pub mod rotation;
 
+pub use bundles::{BundleRecord, BundleStore, BundleStoreError};
 pub use checkpoints::{CheckpointAudit, CheckpointRecord, CheckpointStoreError};
 pub use conflicts::{ConflictError, ConflictRecord, ConflictState, ConflictStore};
 pub use draft::{DraftError, DraftStore, DATABASE_FILE_NAME};
