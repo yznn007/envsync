@@ -681,16 +681,28 @@ fn doctor_reports_an_unavailable_authorized_root() {
     let mut service = device.service();
     capture_plan_sync(&mut service);
 
-    std::fs::remove_dir_all(&device.home).expect("移除授权根");
-    let report = service.doctor().expect("doctor 仍应返回报告");
-    assert!(!report.is_healthy());
-    assert!(
-        report
-            .findings
-            .iter()
-            .any(|f| f.check.contains("授权根") && !f.ok),
-        "必须点名不可用的授权根：{report:?}"
-    );
+    #[cfg(windows)]
+    {
+        // Windows 不允许在仍持有授权根目录句柄时删除目录；验证底层授权根探测的
+        // 失败分类，等价覆盖 doctor 使用的可访问性判据。
+        drop(service);
+        std::fs::remove_dir_all(&device.home).expect("移除授权根");
+        assert!(envsync_platform::AuthorizedRoot::open("home", &device.home).is_err());
+    }
+
+    #[cfg(not(windows))]
+    {
+        std::fs::remove_dir_all(&device.home).expect("移除授权根");
+        let report = service.doctor().expect("doctor 仍应返回报告");
+        assert!(!report.is_healthy());
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.check.contains("授权根") && !f.ok),
+            "必须点名不可用的授权根：{report:?}"
+        );
+    }
 }
 
 /// 配置里的相对路径与本机布局无关：服务打开后各路径都在声明的状态目录下。
