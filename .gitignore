@@ -22,3 +22,6 @@ blob-report/
 *.envsync-local/
 /tmp-workspace/
 .envsync-transfer.bundle
+
+# 本地 Git 工作树
+/.worktrees/
