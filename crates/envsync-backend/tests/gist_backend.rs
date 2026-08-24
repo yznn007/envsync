@@ -3,11 +3,13 @@ mod support {
 }
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::time::Duration;
 
-use envsync_backend::gist::{GistBackend, GistCredentials};
+use envsync_backend::gist::{GistBackend, GistCredentials, GistId};
 use envsync_backend::gist_bundle::{
     gist_bundle_filename, inspect as gist_inspect, pack, GistBundleObject, GistBundleSigner,
+    MAX_ENCODED_BUNDLE_LEN,
 };
 use envsync_crypto::device::DeviceKeypair;
 use envsync_crypto::sealed::SecretId;
@@ -15,6 +17,7 @@ use envsync_crypto::suite::{DataKey, KeyEpoch, Plaintext};
 use envsync_domain::{CborCodec, ObjectId, SnapshotBody, StateRoot, WorkspaceId, WorkspaceRef};
 use serde_json::{json, Value};
 use support::mock_github::{MockGithub, ResponseSpec};
+use tempfile::NamedTempFile;
 
 fn sealed_bundles() -> (WorkspaceId, String, String) {
     let workspace = WorkspaceId::generate();
@@ -96,8 +99,242 @@ fn gist_response(gist_id: &str, filename: &str, encoded: &str) -> String {
     .to_string()
 }
 
+fn truncated_gist_response(gist_id: &str, filename: &str, raw_url: &str, encoded: &str) -> String {
+    json!({
+        "id": gist_id,
+        "files": {
+            filename: {
+                "truncated": true,
+                "raw_url": raw_url,
+                "content": encoded,
+            }
+        }
+    })
+    .to_string()
+}
+
+fn gist_id() -> GistId {
+    GistId::parse("gist-123").expect("合法 Gist ID")
+}
+
+fn assert_safe_error(
+    error: envsync_backend::gist::GistError,
+    expected_code: &'static str,
+    forbidden: &str,
+) {
+    assert_eq!(error.code(), expected_code);
+    assert!(
+        !error.to_string().contains(forbidden),
+        "错误 Display 不得回显受控内容"
+    );
+    assert!(
+        !format!("{error:?}").contains(forbidden),
+        "错误 Debug 不得回显受控内容"
+    );
+}
+
 fn request_json(request: &support::mock_github::RequestRecord) -> Value {
     serde_json::from_slice(&request.body).expect("请求必须是 JSON")
+}
+
+#[test]
+fn read_maps_auth_forbidden_and_not_found_to_safe_codes() {
+    for (status, expected_code) in [
+        (401, "gist.authentication"),
+        (403, "gist.forbidden"),
+        (404, "gist.not_found"),
+    ] {
+        let mock = MockGithub::start().expect("启动 GitHub mock");
+        let sentinel = "error-body-must-not-appear";
+        mock.enqueue(ResponseSpec::new(status).body(sentinel));
+        let backend = GistBackend::with_api_base(mock.base_url(), Duration::from_millis(100))
+            .expect("构造 Gist 后端");
+
+        let error = backend
+            .read(&credentials(), &gist_id(), WorkspaceId::generate())
+            .expect_err("认证与状态错误必须被读取操作返回");
+
+        assert_safe_error(error, expected_code, sentinel);
+    }
+}
+
+#[test]
+fn read_rejects_missing_etag_before_returning_unusable_revision() {
+    let mock = MockGithub::start().expect("启动 GitHub mock");
+    let (workspace, bundle, _) = sealed_bundles();
+    let filename = gist_bundle_filename(workspace);
+    mock.enqueue(ResponseSpec::new(200).body(gist_response("gist-123", &filename, &bundle)));
+    let backend = GistBackend::with_api_base(mock.base_url(), Duration::from_millis(100))
+        .expect("构造 Gist 后端");
+
+    let error = backend
+        .read(&credentials(), &gist_id(), workspace)
+        .expect_err("缺少 ETag 的读取不得返回 revision");
+
+    assert_safe_error(error, "gist.missing_etag", &bundle);
+}
+
+#[test]
+fn read_timeout_is_reported_without_echoing_endpoint() {
+    let mock = MockGithub::start().expect("启动 GitHub mock");
+    let endpoint = mock.base_url();
+    let (workspace, bundle, _) = sealed_bundles();
+    let filename = gist_bundle_filename(workspace);
+    mock.enqueue(
+        ResponseSpec::new(200)
+            .body(gist_response("gist-123", &filename, &bundle))
+            .delay(Duration::from_millis(200)),
+    );
+    let backend =
+        GistBackend::with_api_base(&endpoint, Duration::from_millis(25)).expect("构造 Gist 后端");
+
+    let error = backend
+        .read(&credentials(), &gist_id(), workspace)
+        .expect_err("超过超时的读取必须失败");
+
+    assert_safe_error(error, "gist.timeout", &endpoint);
+}
+
+#[test]
+fn read_rejects_oversized_response_before_json_parsing() {
+    let mock = MockGithub::start().expect("启动 GitHub mock");
+    let (workspace, bundle, _) = sealed_bundles();
+    let filename = gist_bundle_filename(workspace);
+    let sentinel = "oversized-body-must-not-appear";
+    let oversized = sentinel.repeat((MAX_ENCODED_BUNDLE_LEN + 128 * 1024) / sentinel.len() + 1);
+    mock.enqueue(
+        ResponseSpec::new(200).body(
+            json!({
+                "id": "gist-123",
+                "files": {
+                    filename: {
+                        "truncated": false,
+                        "content": bundle,
+                    }
+                },
+                "padding": oversized,
+            })
+            .to_string(),
+        ),
+    );
+    let backend = GistBackend::with_api_base(mock.base_url(), Duration::from_millis(100))
+        .expect("构造 Gist 后端");
+
+    let error = backend
+        .read(&credentials(), &gist_id(), workspace)
+        .expect_err("超出接收上限的响应必须被拒绝");
+
+    assert_safe_error(error, "gist.response_too_large", sentinel);
+}
+
+#[test]
+fn truncated_gist_file_uses_allowed_uncredentialed_raw_url() {
+    let mock = MockGithub::start().expect("启动 GitHub mock");
+    let (workspace, bundle, _) = sealed_bundles();
+    let filename = gist_bundle_filename(workspace);
+    let raw_url = format!("{}/raw/gist-123/{}", mock.base_url(), filename);
+    let mut raw_file = NamedTempFile::new().expect("创建临时 raw bundle 文件");
+    raw_file
+        .write_all(bundle.as_bytes())
+        .expect("写入临时 raw bundle 文件");
+    mock.enqueue(
+        ResponseSpec::new(200)
+            .header("etag", "\"v1\"")
+            .body(truncated_gist_response(
+                "gist-123", &filename, &raw_url, &bundle,
+            )),
+    );
+    mock.enqueue(ResponseSpec::new(200).body_file(raw_file.path()));
+    let backend = GistBackend::with_api_base(mock.base_url(), Duration::from_millis(100))
+        .expect("构造 Gist 后端");
+
+    let record = backend
+        .read(&credentials(), &gist_id(), workspace)
+        .expect("允许的 raw URL 必须返回完整 bundle");
+    let expected_header = gist_inspect(&bundle).expect("读取测试 bundle header");
+
+    assert!(
+        record.encoded().as_bytes() == bundle.as_bytes(),
+        "raw 响应必须保留完整 bundle 字节"
+    );
+    assert!(
+        record.revision().header() == &expected_header,
+        "raw 响应必须产生正确的 bundle header"
+    );
+    let requests = mock.wait_for_requests(2, Duration::from_millis(200));
+    assert!(
+        requests.len() == 2,
+        "截断文件必须恰好发出 API 与 raw 两个请求"
+    );
+    assert!(
+        requests[0].header("authorization") == Some("Bearer test-token"),
+        "初始 API 请求必须携带 Authorization"
+    );
+    assert!(
+        requests[1].header("authorization").is_none(),
+        "raw 请求不得携带 Authorization"
+    );
+}
+
+#[test]
+fn truncated_gist_rejects_untrusted_raw_url_without_following_it() {
+    let raw_url_suffixes = [
+        "http://127.0.0.1:9/other-origin",
+        "{base}/raw/gist-123?query=controlled",
+        "{base}/raw/gist-123#fragment",
+        "http://user@127.0.0.1:9/raw/gist-123",
+    ];
+
+    for suffix in raw_url_suffixes {
+        let mock = MockGithub::start().expect("启动 GitHub mock");
+        let (workspace, bundle, _) = sealed_bundles();
+        let filename = gist_bundle_filename(workspace);
+        let raw_url = suffix.replace("{base}", &mock.base_url());
+        mock.enqueue(ResponseSpec::new(200).header("etag", "\"v1\"").body(
+            truncated_gist_response("gist-123", &filename, &raw_url, &bundle),
+        ));
+        let backend = GistBackend::with_api_base(mock.base_url(), Duration::from_millis(100))
+            .expect("构造 Gist 后端");
+
+        let error = backend
+            .read(&credentials(), &gist_id(), workspace)
+            .expect_err("不受信 raw URL 必须被拒绝");
+
+        assert_safe_error(error, "gist.invalid_raw_url", &raw_url);
+        let requests = mock.wait_for_requests(1, Duration::from_millis(100));
+        assert!(requests.len() == 1, "不受信 raw URL 不得触发第二个请求");
+    }
+}
+
+#[test]
+fn read_transport_failure_is_safe() {
+    let mock = MockGithub::start().expect("启动 GitHub mock");
+    let endpoint = mock.base_url();
+    mock.enqueue(ResponseSpec::new(200).disconnect());
+    let backend =
+        GistBackend::with_api_base(&endpoint, Duration::from_millis(100)).expect("构造 Gist 后端");
+
+    let error = backend
+        .read(&credentials(), &gist_id(), WorkspaceId::generate())
+        .expect_err("连接断开必须作为传输错误返回");
+
+    assert_eq!(error.code(), "gist.transport");
+    assert!(
+        !error.to_string().contains("test-token"),
+        "传输错误 Display 不得回显 token"
+    );
+    assert!(
+        !format!("{error:?}").contains("test-token"),
+        "传输错误 Debug 不得回显 token"
+    );
+    assert!(
+        !error.to_string().contains(&endpoint),
+        "传输错误 Display 不得回显 endpoint"
+    );
+    assert!(
+        !format!("{error:?}").contains(&endpoint),
+        "传输错误 Debug 不得回显 endpoint"
+    );
 }
 
 #[test]
