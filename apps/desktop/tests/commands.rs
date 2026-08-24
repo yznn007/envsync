@@ -3,8 +3,8 @@
 use envsync_core::ApiRequest;
 use envsync_desktop::{
     commands::{
-        is_allowed_command, ApplyPlanRequest, CreateWorkspaceRequest, OperationRequest,
-        WorkspaceRequest, ALLOWED_COMMANDS,
+        is_allowed_command, ApplyPlanRequest, ConflictResolutionRequest, CreateWorkspaceRequest,
+        OperationRequest, RollbackExecutionRequest, WorkspaceRequest, ALLOWED_COMMANDS,
     },
     parse_safe_deep_link, SafeDeepLinkAction,
 };
@@ -20,9 +20,15 @@ fn only_reviewed_application_commands_are_exposed() {
             "onboarding_open_workspace",
             "workspace_status",
             "workspace_plan",
+            "plan_diff",
             "workspace_apply",
-            "operation_rollback",
             "conflict_list",
+            "conflict_show",
+            "conflict_resolve",
+            "operation_history",
+            "operation_detail",
+            "operation_rollback_review",
+            "operation_rollback",
             "vault_metadata",
             "bundle_review",
             "operation_cancel",
@@ -162,6 +168,35 @@ fn mutating_command_payloads_only_accept_registered_ids() {
     assert!(
         serde_json::from_value::<ApiRequest<OperationRequest>>(unsafe_cancel).is_err(),
         "取消只能引用 operation ID，不能传入 shell 参数"
+    );
+
+    let unsafe_resolution = serde_json::json!({
+        "schema_version": 1,
+        "request_id": "req-resolution-path-injection",
+        "data": {
+            "workspace_id": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+            "conflict_id": "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
+            "choice": "manual",
+            "manual_content": "key = value",
+            "path": "/Users/alice/.ssh/id_ed25519"
+        }
+    });
+    assert!(
+        serde_json::from_value::<ApiRequest<ConflictResolutionRequest>>(unsafe_resolution).is_err(),
+        "冲突裁决不得带入路径或额外高权限字段"
+    );
+
+    let direct_rollback = serde_json::json!({
+        "schema_version": 1,
+        "request_id": "req-direct-rollback",
+        "data": {
+            "workspace_id": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+            "operation_id": operation_id
+        }
+    });
+    assert!(
+        serde_json::from_value::<ApiRequest<RollbackExecutionRequest>>(direct_rollback).is_err(),
+        "回滚必须携带原生审核 token 与逐项确认，不能从 UI 直接执行"
     );
 }
 

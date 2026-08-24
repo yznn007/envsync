@@ -303,6 +303,40 @@ pub fn merge_structured_with(
     }
 }
 
+/// 严格校验一份准备作为手动冲突裁决的结构化文档。
+///
+/// 该函数复用实际合并器使用的解析器、深度和节点预算，因此 UI 不能通过“先本地解析、
+/// 后 core 宽松接受”的差异绕过资源策略。它只验证语法与安全子集，不读取路径、不加载
+/// include，也不会回显文档正文。
+pub fn validate_structured_document(
+    bytes: &[u8],
+    format: StructuredFormat,
+) -> Result<(), MergeError> {
+    let actual = bytes.len() as u64;
+    if actual > MAX_INPUT_BYTES {
+        return Err(MergeError::TooLarge {
+            limit: MAX_INPUT_BYTES,
+            actual,
+        });
+    }
+    match format {
+        StructuredFormat::Json => json::parse_strict(bytes).map(|_| ()),
+        StructuredFormat::Yaml => yaml::parse_strict(bytes).map(|_| ()),
+        StructuredFormat::Toml => toml::parse_strict(bytes).map(|_| ()),
+        StructuredFormat::Ini => {
+            ini::parse(bytes, ini::Dialect::Ini, IniPolicy::default()).map(|_| ())
+        }
+        StructuredFormat::GitConfig => ini::parse(
+            bytes,
+            ini::Dialect::GitConfig,
+            IniPolicy {
+                multi_value: MultiValuePolicy::Append,
+            },
+        )
+        .map(|_| ()),
+    }
+}
+
 /// 按资源模式选择合并器：给了格式就走语义合并，否则退化为文本合并。
 pub fn merge(
     input: &MergeInput<'_>,

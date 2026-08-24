@@ -104,9 +104,9 @@ pub use membership::{
     verify_membership_chain, MembershipError, VerifiedHead, MEMBERSHIP_SIGNATURE_DOMAIN,
 };
 pub use merge::{
-    merge, merge_structured, merge_structured_with, merge_text, IniPolicy, MergeError, MergeInput,
-    MergeOptions, MergeProvenance, MergeResult, MultiValuePolicy, MAX_INPUT_BYTES, MAX_NODES,
-    MAX_PARSE_DEPTH,
+    merge, merge_structured, merge_structured_with, merge_text, validate_structured_document,
+    IniPolicy, MergeError, MergeInput, MergeOptions, MergeProvenance, MergeResult,
+    MultiValuePolicy, MAX_INPUT_BYTES, MAX_NODES, MAX_PARSE_DEPTH,
 };
 pub use offline::UnreachableBackend;
 pub use packages::{
@@ -139,7 +139,10 @@ pub use vault::{
     WORKSPACE_METADATA_PREFIX,
 };
 pub use view::{
-    ApplyStartView, ApplyView, CancellationView, ConflictListView, ConflictView, DiffView,
-    OperationStatusView, OperationView, PlanActionView, PlanView, ResourceStatusView,
-    RootCapabilityView, StatusView, ViewDiagnostic, WorkspaceRegistrationView, WorkspaceSummary,
+    ApplyStartView, ApplyView, CancellationView, ConflictDetailView, ConflictListView,
+    ConflictResolutionView, ConflictView, DiffListView, DiffView, OperationActionView,
+    OperationDetailView, OperationHistoryView, OperationReceiptView, OperationStatusView,
+    OperationView, PlanActionView, PlanView, ResourceStatusView, RollbackActionView,
+    RollbackReviewView, RootCapabilityView, StatusView, ViewDiagnostic, WorkspaceRegistrationView,
+    WorkspaceSummary,
 };

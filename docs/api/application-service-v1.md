@@ -76,16 +76,22 @@ View：
 | `WorkspaceRegistrationView` | 已注册工作区与其根能力 | 配置路径、状态目录、后端 URL、凭据 |
 | `StatusView` | 状态、ref、资源摘要、未完成操作计数 | 文件内容、诊断正文 |
 | `PlanView` | 计划与动作审核 | Blob ID、文件正文、绝对路径 |
-| `DiffView` | 变化摘要 | 敏感资源的摘要与任何内容 |
+| `DiffView` / `DiffListView` | 变化类别、大小与摘要列表 | 文件正文、Blob、绝对路径；敏感资源的摘要与大小 |
 | `ConflictView` | 冲突状态与已选策略 | base/ours/theirs/resolved Blob |
 | `ConflictListView` | 一个工作区的开放冲突 | 冲突正文、Blob、绝对路径 |
+| `ConflictDetailView` | 可用裁决方式、资源模式和手动裁决上限 | 三侧正文、Blob、原始冲突诊断 |
+| `ConflictResolutionView` | 已保存的裁决方式和时刻 | 手动提交的正文、合并或同步成功暗示 |
 | `OperationView` | journal 操作状态 | 原始错误消息、收据内容 |
+| `OperationHistoryView` / `OperationDetailView` | 操作状态机、动作进度、收据保证与恢复可用性 | 备份路径、摘要、原始错误消息 |
+| `RollbackReviewView` | 一次性逆向计划审核与逐项确认要求 | 备份路径、文件内容、可重放审核能力 |
 | `ApplyStartView` | 已交给后台 worker 的 apply | 文件内容、路径、后端 URL |
 | `CancellationView` | 已送达 worker 的取消请求 | 是否跨过发布边界之外的内部状态 |
 | `ApplyView` | apply 的最终 no-op 或完成结果 | 文件内容、收据、错误正文 |
 
 敏感动作的 `DiffView` 仅报告 `sensitive: true` 与变化类型；`before_digest`、
-`after_digest` 均为 `null`。
+`after_digest`、`content_bytes` 均为 `null`。`presentation` 只决定 UI 显示“文本、结构化、
+二进制、受管区块或摘要”哪种**无内容**说明，不能用来请求文件正文。大型内容通过
+`preview_truncated` 明确保持摘要模式，宿主不得以此为由扩展 Blob 或路径读取权限。
 
 ## 长操作、事件与取消
 
@@ -142,8 +148,16 @@ preflight 后和后端 Ref 发布前检查令牌。若在这些边界采纳取�
 worker 随后发出 `operation.cancelled` 错误事件。发布后或 worker 已结束时响应
 `operation.not_cancellable`，避免伪造一个不安全的“已取消”。
 
-`operation_rollback` 仍同步返回并发送 `OperationView` 事件；窗口关闭只会隐藏主窗口，
-不会终止仍持有后台 operation lease 的 worker。
+回滚采用两步式协议，避免一个点击直接启动恢复：
+
+1. `operation_rollback_review` 只读取 journal，返回 `RollbackReviewView`。其中列出已有
+   收据的逆向动作（逆序），并由 Rust 进程发放一个不透明、一次性的 `review_token`。
+2. `operation_rollback` 必须回传同一 `operation_id`、该 token，以及**恰好全部**逆向动作
+   序号。桌面 state 校验后立即消费 token，core/recovery 仍会重新核对现场摘要；任何失败都
+   要重新生成逆向计划，不能重放旧审核。
+
+`operation_rollback` 同步返回并发送 `OperationView` 事件；窗口关闭只会隐藏主窗口，不会
+终止仍持有后台 operation lease 的 worker。
 
 ## 宿主边界
 
@@ -168,3 +182,14 @@ shell 命令、HTTP 请求或 Vault 明文参数。实际 command allowlist、Ta
 首次创建或打开成功后返回 `WorkspaceRegistrationView`；它只有工作区/设备/后端摘要与一个
 不透明根 token。即使 native 或远端组件返回了额外字段，Vue 端也会只投影该 View 的已审核
 字段，并把失败收敛为稳定诊断码。
+
+### Plan、冲突与历史恢复扩展
+
+- `plan_diff` 的负载只含 `{ workspace_id, plan_id }`，返回 `DiffListView`。它只允许查看
+  已保存的不可变计划；客户端不得用“最新状态”替换正在审核的 Plan ID。
+- `conflict_show` 返回 `ConflictDetailView`；`conflict_resolve` 只接受
+  `{ workspace_id, conflict_id, choice, manual_content? }`。`manual_content` 只在
+  `choice=manual` 时允许，core 会拒绝秘密、二进制、非文本、超限和结构化语法无效的内容，
+  且响应不会回显该内容。保存裁决不等于重新 merge 或同步成功。
+- `operation_history` 与 `operation_detail` 只返回状态、稳定错误码、动作进度与收据保证；
+  它们不提供备份路径、对象摘要、任意文件读取或错误正文。

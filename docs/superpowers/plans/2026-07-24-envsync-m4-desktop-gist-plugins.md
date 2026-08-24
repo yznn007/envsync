@@ -189,27 +189,27 @@ git commit -am "feat(ui): 添加首次使用与工作区状态"
 - Create: `apps/desktop-ui/src/pages/HistoryPage.vue`
 - Test: `apps/desktop-ui/src/components/DiffViewer.test.ts`
 
-- [ ] **Step 1: Diff 测试**
+- [x] **Step 1: Diff 测试**
 
 支持文本、structured key diff、binary summary、create/delete、Managed Block 边界；秘密只
 显示“值已更改”。大文件虚拟滚动并有截断提示。
 
-- [ ] **Step 2: Plan 审核**
+- [x] **Step 2: Plan 审核**
 
 按风险分组 action，显示 source/target、备份和 rollback guarantee。High risk 逐项确认；
 apply 按钮只发送当前 Plan ID，stale 后强制重新加载。
 
-- [ ] **Step 3: Conflict 解决**
+- [x] **Step 3: Conflict 解决**
 
 ours/theirs/manual 三种选择，manual 编辑器只处理非秘密文本并在提交前解析/验证。冲突未
 解决时不出现误导性的“同步成功”。
 
-- [ ] **Step 4: History 与回滚**
+- [x] **Step 4: History 与回滚**
 
 展示 operation 状态机、receipt、失败点和 recovery action。回滚先生成逆向 Plan 并再次
 审核。
 
-- [ ] **Step 5: 验证并提交**
+- [x] **Step 5: 验证并提交**
 
 ```bash
 pnpm --dir apps/desktop-ui test

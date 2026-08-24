@@ -4,14 +4,19 @@
 //! 诊断文本。错误文案由宿主按稳定诊断码本地化，避免把外部输入重新带到 UI 输出面。
 
 use envsync_domain::{
-    Action, ActionKind, BackupPolicy, ConflictKind, DesiredDisposition, DeviceId, Diagnostic,
-    OperationId, Plan, ResolutionChoice, Risk, RollbackCapability, Severity, WorkspaceId,
+    Action, ActionKind, BackupPolicy, ConflictKind, ConflictResolution, DesiredDisposition,
+    DeviceId, Diagnostic, FileMode, OperationId, Plan, ResolutionChoice, Risk, RollbackCapability,
+    Severity, StructuredFormat, WorkspaceId,
 };
-use envsync_storage::{ConflictRecord, OperationRecord};
+use envsync_storage::{
+    ActionRecord, ConflictRecord, OperationRecord, OperationState, ReceiptRecord,
+};
 use serde::Serialize;
 
 use crate::api::{private, ViewData};
+use crate::config::ResourceConfig;
 use crate::service::{ResourceStatus, StatusReport};
+use crate::sync::ConflictDetail;
 
 /// 一个工作区的无内容摘要。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -267,6 +272,15 @@ pub struct DiffView {
     pub kind: String,
     /// 是否属于敏感资源。
     pub sensitive: bool,
+    /// 可显示的差异类别；只描述渲染策略，不包含任何文件正文。
+    ///
+    /// 取值为 `secret`、`text`、`structured`、`managed_block`、`binary` 或
+    /// `content_summary`。宿主不得根据该字段尝试读取任意路径或 Blob。
+    pub presentation: String,
+    /// 非敏感一侧的已知内容大小；删除前内容没有安全可得的大小时为 `null`。
+    pub content_bytes: Option<usize>,
+    /// 内容过大时 UI 必须继续保持摘要模式，不能为了展示而请求正文。
+    pub preview_truncated: bool,
     /// 变更前摘要；敏感资源始终为 `null`。
     pub before_digest: Option<String>,
     /// 变更后摘要；敏感资源始终为 `null`。
@@ -290,8 +304,51 @@ impl DiffView {
             resource: action.resource.to_string(),
             kind: diff_kind_name(action.kind).to_owned(),
             sensitive: action.secret,
+            presentation: if action.secret {
+                "secret".to_owned()
+            } else {
+                "content_summary".to_owned()
+            },
+            content_bytes: None,
+            preview_truncated: action.secret,
             before_digest,
             after_digest,
+        }
+    }
+
+    /// 加入经 core 判定的显示类别和大小摘要。
+    ///
+    /// 这仍不携带正文：宿主只能根据它选择“文本 / 结构化 / 二进制 / 受管区块”的说明。
+    pub fn with_presentation(
+        mut self,
+        presentation: &'static str,
+        content_bytes: Option<usize>,
+        preview_truncated: bool,
+    ) -> Self {
+        if !self.sensitive {
+            self.presentation = presentation.to_owned();
+            self.content_bytes = content_bytes;
+            self.preview_truncated = preview_truncated;
+        }
+        self
+    }
+}
+
+/// 一个已保存 Plan 的无内容差异列表。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DiffListView {
+    /// 被审核的不可变计划标识。
+    pub plan: String,
+    /// 逐动作的差异摘要。
+    pub diffs: Vec<DiffView>,
+}
+
+impl DiffListView {
+    /// 用已保存计划及其安全差异摘要构造列表。
+    pub fn new(plan: &Plan, diffs: Vec<DiffView>) -> Self {
+        DiffListView {
+            plan: plan.id().to_string(),
+            diffs,
         }
     }
 }
@@ -352,6 +409,81 @@ impl ConflictListView {
     }
 }
 
+/// 单个冲突的可裁决元数据。
+///
+/// 与 [`ConflictView`] 一样，这个 View 不返回任何一侧的 Blob、正文或原始诊断。手动裁决
+/// 只在资源明确标记为非秘密文本时开放，内容仍会在 core 中按资源策略重新校验。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConflictDetailView {
+    /// 已脱敏的冲突摘要。
+    pub conflict: ConflictView,
+    /// 资源模式：`full_file`、`managed_block`、`structured_merge` 或 `generated_include`。
+    pub mode: String,
+    /// 结构化资源的格式；其他资源为 `null`。
+    pub structured_format: Option<String>,
+    /// 本地一侧是否存在可采用的内容；这不是 Blob 标识。
+    pub ours_available: bool,
+    /// 远端一侧是否存在可采用的内容；这不是 Blob 标识。
+    pub theirs_available: bool,
+    /// 是否可以提交手动文本裁决。
+    pub manual_allowed: bool,
+    /// 手动文本裁决允许的最大字节数；不允许时为 `0`。
+    pub manual_max_bytes: u64,
+}
+
+impl ConflictDetailView {
+    /// 从冲突索引、不可变冲突对象与本机资源策略构造安全裁决元数据。
+    pub fn from_detail(
+        detail: &ConflictDetail,
+        resource: &ResourceConfig,
+        manual_limit: u64,
+    ) -> Self {
+        let manual_allowed = !resource.policy.secret
+            && matches!(
+                resource.mode,
+                FileMode::FullFile | FileMode::ManagedBlock | FileMode::StructuredMerge
+            )
+            && !matches!(detail.conflict.kind, ConflictKind::BinaryBoth);
+        ConflictDetailView {
+            conflict: ConflictView::from_record(&detail.record),
+            mode: file_mode_name(resource.mode).to_owned(),
+            structured_format: resource
+                .policy
+                .structured_format
+                .map(structured_format_name)
+                .map(str::to_owned),
+            ours_available: detail.conflict.ours.is_some(),
+            theirs_available: detail.conflict.theirs.is_some(),
+            manual_allowed,
+            manual_max_bytes: if manual_allowed { manual_limit } else { 0 },
+        }
+    }
+}
+
+/// 提交冲突裁决后的安全回执。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConflictResolutionView {
+    /// 已裁决的冲突标识。
+    pub conflict: String,
+    /// 固定为 `resolved`；不暗示同步已经完成。
+    pub state: String,
+    /// 使用的裁决方式。
+    pub choice: String,
+    /// 裁决写入本地索引的时刻。
+    pub resolved_at_unix_ms: u64,
+}
+
+impl From<&ConflictResolution> for ConflictResolutionView {
+    fn from(resolution: &ConflictResolution) -> Self {
+        ConflictResolutionView {
+            conflict: resolution.conflict.to_string(),
+            state: "resolved".to_owned(),
+            choice: resolution_choice_name(resolution.choice).to_owned(),
+            resolved_at_unix_ms: resolution.resolved_at_unix_ms,
+        }
+    }
+}
+
 /// 一次 journal 操作的无内容摘要。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OperationView {
@@ -389,6 +521,174 @@ impl OperationView {
             updated_at_unix_ms: record.updated_at_unix_ms,
             error_code: record.error.as_ref().map(|error| error.code.clone()),
         }
+    }
+}
+
+/// 一个工作区的 journal 操作历史。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OperationHistoryView {
+    /// 所属工作区标识。
+    pub workspace: String,
+    /// 按最近更新时间倒序排列的操作摘要。
+    pub operations: Vec<OperationView>,
+}
+
+impl OperationHistoryView {
+    /// 从已排序的 journal 操作记录构造历史列表。
+    pub fn from_records(workspace: WorkspaceId, records: &[OperationRecord]) -> Self {
+        OperationHistoryView {
+            workspace: workspace.to_string(),
+            operations: records.iter().map(OperationView::from_record).collect(),
+        }
+    }
+}
+
+/// history 中单个动作的无路径、无内容执行进度。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OperationActionView {
+    /// 动作在原计划中的稳定序号。
+    pub ordinal: u32,
+    /// 关联资源。
+    pub resource: String,
+    /// 原动作种类。
+    pub kind: String,
+    /// 授权根别名与相对路径。
+    pub target: String,
+    /// 动作状态。
+    pub state: String,
+    /// 稳定错误码；不会输出原始错误信息。
+    pub error_code: Option<String>,
+}
+
+impl From<&ActionRecord> for OperationActionView {
+    fn from(action: &ActionRecord) -> Self {
+        OperationActionView {
+            ordinal: action.ordinal,
+            resource: action.resource.to_string(),
+            kind: action_kind_name(action.kind).to_owned(),
+            target: action.target.display_path(),
+            state: action.state.as_str().to_owned(),
+            error_code: action.error.as_ref().map(|error| error.code.clone()),
+        }
+    }
+}
+
+/// 不泄漏备份位置或摘要的回滚收据摘要。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OperationReceiptView {
+    /// 对应的原计划动作序号。
+    pub ordinal: u32,
+    /// 关联资源。
+    pub resource: String,
+    /// 可提供的回滚保证。
+    pub guarantee: String,
+    /// 收据持久化时刻。
+    pub created_at_unix_ms: u64,
+}
+
+impl From<&ReceiptRecord> for OperationReceiptView {
+    fn from(receipt: &ReceiptRecord) -> Self {
+        OperationReceiptView {
+            ordinal: receipt.receipt.ordinal,
+            resource: receipt.receipt.resource.to_string(),
+            guarantee: rollback_name(receipt.receipt.guarantee).to_owned(),
+            created_at_unix_ms: receipt.created_at_unix_ms,
+        }
+    }
+}
+
+/// 单次历史操作的安全详情。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OperationDetailView {
+    /// 操作状态与关联计划。
+    pub operation: OperationView,
+    /// 逐动作执行状态。
+    pub actions: Vec<OperationActionView>,
+    /// 已实际持久化的回滚收据摘要。
+    pub receipts: Vec<OperationReceiptView>,
+    /// 是否可以申请一次新的逆向计划审核。
+    pub rollback_available: bool,
+}
+
+impl OperationDetailView {
+    /// 从 journal 记录构造详情；只要 recovery 支持该状态，就允许申请 rollback review。
+    pub fn from_records(
+        operation: &OperationRecord,
+        actions: &[ActionRecord],
+        receipts: &[ReceiptRecord],
+    ) -> Self {
+        OperationDetailView {
+            operation: OperationView::from_record(operation),
+            actions: actions.iter().map(OperationActionView::from).collect(),
+            receipts: receipts.iter().map(OperationReceiptView::from).collect(),
+            rollback_available: rollback_state_supported(operation.state) && !receipts.is_empty(),
+        }
+    }
+}
+
+/// 逆向计划中一项需要逐项确认的动作摘要。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RollbackActionView {
+    /// 对应的原计划动作序号；提交确认时使用该序号，不传文件路径。
+    pub ordinal: u32,
+    /// 关联资源。
+    pub resource: String,
+    /// 原目标的安全显示名。
+    pub target: String,
+    /// 原动作种类；逆向写入细节只在 core/recovery 内部决定。
+    pub original_kind: String,
+    /// 收据声称的回滚保证。
+    pub guarantee: String,
+}
+
+/// 回滚执行前必须重新审核的逆向计划摘要。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RollbackReviewView {
+    /// 进程内一次性审核 token；不能反推出路径或内容。
+    pub review_token: String,
+    /// 将被恢复的 operation。
+    pub operation: OperationView,
+    /// 仅包含已有回滚收据的逆向动作，按执行顺序倒序排列。
+    pub actions: Vec<RollbackActionView>,
+    /// 固定为 `true`：每一项都要由 UI 明确确认后才能请求执行。
+    pub requires_individual_confirmation: bool,
+}
+
+impl RollbackReviewView {
+    /// 从 journal 记录生成尚未分配 token 的逆向计划摘要。
+    pub fn from_records(
+        operation: &OperationRecord,
+        actions: &[ActionRecord],
+        receipts: &[ReceiptRecord],
+    ) -> Option<Self> {
+        if !rollback_state_supported(operation.state) || receipts.is_empty() {
+            return None;
+        }
+        let mut inverse_actions = Vec::new();
+        for receipt in receipts.iter().rev() {
+            let action = actions
+                .iter()
+                .find(|action| action.ordinal == receipt.receipt.ordinal)?;
+            inverse_actions.push(RollbackActionView {
+                ordinal: action.ordinal,
+                resource: action.resource.to_string(),
+                target: action.target.display_path(),
+                original_kind: action_kind_name(action.kind).to_owned(),
+                guarantee: rollback_name(receipt.receipt.guarantee).to_owned(),
+            });
+        }
+        Some(RollbackReviewView {
+            review_token: String::new(),
+            operation: OperationView::from_record(operation),
+            actions: inverse_actions,
+            requires_individual_confirmation: true,
+        })
+    }
+
+    /// 将 Rust 进程状态发放的一次性审核 token 绑定到响应。
+    pub fn with_review_token(mut self, review_token: String) -> Self {
+        self.review_token = review_token;
+        self
     }
 }
 
@@ -478,9 +778,15 @@ impl private::Sealed for WorkspaceRegistrationView {}
 impl private::Sealed for StatusView {}
 impl private::Sealed for PlanView {}
 impl private::Sealed for DiffView {}
+impl private::Sealed for DiffListView {}
 impl private::Sealed for ConflictView {}
 impl private::Sealed for ConflictListView {}
+impl private::Sealed for ConflictDetailView {}
+impl private::Sealed for ConflictResolutionView {}
 impl private::Sealed for OperationView {}
+impl private::Sealed for OperationHistoryView {}
+impl private::Sealed for OperationDetailView {}
+impl private::Sealed for RollbackReviewView {}
 impl private::Sealed for ApplyStartView {}
 impl private::Sealed for CancellationView {}
 impl private::Sealed for ApplyView {}
@@ -490,9 +796,15 @@ impl ViewData for WorkspaceRegistrationView {}
 impl ViewData for StatusView {}
 impl ViewData for PlanView {}
 impl ViewData for DiffView {}
+impl ViewData for DiffListView {}
 impl ViewData for ConflictView {}
 impl ViewData for ConflictListView {}
+impl ViewData for ConflictDetailView {}
+impl ViewData for ConflictResolutionView {}
 impl ViewData for OperationView {}
+impl ViewData for OperationHistoryView {}
+impl ViewData for OperationDetailView {}
+impl ViewData for RollbackReviewView {}
 impl ViewData for ApplyStartView {}
 impl ViewData for CancellationView {}
 impl ViewData for ApplyView {}
@@ -528,6 +840,35 @@ fn diff_kind_name(kind: ActionKind) -> &'static str {
         ActionKind::DeleteFile => "removed",
         ActionKind::ReplaceFile | ActionKind::UpdateManagedBlock => "modified",
     }
+}
+
+fn file_mode_name(mode: FileMode) -> &'static str {
+    match mode {
+        FileMode::FullFile => "full_file",
+        FileMode::ManagedBlock => "managed_block",
+        FileMode::StructuredMerge => "structured_merge",
+        FileMode::GeneratedInclude => "generated_include",
+    }
+}
+
+fn structured_format_name(format: StructuredFormat) -> &'static str {
+    match format {
+        StructuredFormat::Json => "json",
+        StructuredFormat::Yaml => "yaml",
+        StructuredFormat::Toml => "toml",
+        StructuredFormat::Ini => "ini",
+        StructuredFormat::GitConfig => "git_config",
+    }
+}
+
+fn rollback_state_supported(state: OperationState) -> bool {
+    matches!(
+        state,
+        OperationState::Completed
+            | OperationState::Applying
+            | OperationState::PublishedNotConverged
+            | OperationState::RollingBack
+    )
 }
 
 fn risk_name(risk: Risk) -> &'static str {

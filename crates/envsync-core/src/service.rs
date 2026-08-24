@@ -26,10 +26,11 @@ use std::sync::Arc;
 use envsync_backend::git_auth::validate_remote_url;
 use envsync_backend::{Backend, BackendError, GitBackend, GitConfig, LocalBackend};
 use envsync_domain::{
-    Blob, BlobId, CborCodec, Conflict, ConflictId, ConflictResolution, DesiredDisposition,
-    DeviceId, DeviceProfile, FileMode, ObjectId, ObjectKind, Observation, ObservedState,
-    OperationId, Plan, PlanId, ProjectionNote, ResolutionChoice, ResourceEntry, ResourceId,
-    SnapshotBody, SnapshotId, SnapshotSignature, StateRoot, StateRootId, WorkspaceId, WorkspaceRef,
+    Blob, BlobId, CborCodec, Conflict, ConflictId, ConflictKind, ConflictResolution,
+    DesiredDisposition, DeviceId, DeviceProfile, FileMode, ObjectId, ObjectKind, Observation,
+    ObservedState, OperationId, Plan, PlanId, ProjectionNote, ResolutionChoice, ResourceEntry,
+    ResourceId, SnapshotBody, SnapshotId, SnapshotSignature, StateRoot, StateRootId, WorkspaceId,
+    WorkspaceRef,
 };
 use envsync_platform::{AuthorizedRoot, RelativeTarget, RootRegistry, SafeWriter};
 use envsync_storage::{ConflictRecord, ConflictStore, DraftStore, Journal, OperationState};
@@ -47,6 +48,20 @@ use crate::projection::{self, DeviceView, ProjectionPolicy, ProjectionRules};
 use crate::recovery::{PlanSource, RecoveryDiagnosis, RecoveryEngine, RecoveryReport};
 use crate::render;
 use crate::sync::{self, ConflictDetail, FetchOutcome, MergeContext, MergeOutcome};
+use crate::view::{
+    ConflictDetailView, ConflictResolutionView, DiffListView, DiffView, OperationDetailView,
+    OperationHistoryView, RollbackReviewView,
+};
+
+/// 桌面端单次手动冲突裁决正文的硬上限。
+///
+/// 这与资源自身 `max_bytes` 共同生效，防止 WebView 通过一个本来允许较大文件的资源把
+/// 无界正文塞进 IPC、SQLite 或日志路径。正文只在非秘密组件本地存在，并在提交后交由
+/// core 转为 Blob；不会进入 View/API 响应。
+pub const DESKTOP_MANUAL_RESOLUTION_MAX_BYTES: u64 = 256 * 1024;
+
+/// 用于差异摘要的内容大小阈值；超过它仍只显示无内容摘要。
+pub const DIFF_SUMMARY_PREVIEW_BYTES: usize = 96 * 1024;
 
 /// capture 的结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -753,6 +768,67 @@ impl EnvSyncService {
         Ok(outcome.plan)
     }
 
+    /// 读取一个此前由 [`EnvSyncService::build_plan`] 保存的不可变计划。
+    ///
+    /// 桌面端只能用此路径查看或申请应用计划；它不能合成 Action、绕过草稿库，或用路径
+    /// 替代计划标识。
+    pub fn saved_plan(&self, plan_id: PlanId) -> CoreResult<Plan> {
+        self.drafts
+            .get_plan(plan_id)?
+            .ok_or(CoreError::PlanNotFound(plan_id))
+    }
+
+    /// 返回一个已保存计划的无内容差异摘要。
+    ///
+    /// 即使资源不是秘密，这里也只返回类别、大小和摘要，不返回 Blob 正文。这样 Diff UI
+    /// 可以区分文本、结构化、二进制和受管区块，而不把用户文件变成 application-service
+    /// 的通用读取接口。
+    pub fn plan_diffs(&self, plan_id: PlanId) -> CoreResult<DiffListView> {
+        let plan = self.saved_plan(plan_id)?;
+        let mut diffs = Vec::with_capacity(plan.actions.len());
+        for action in &plan.actions {
+            let resource = self
+                .config
+                .resource(&action.resource)
+                .ok_or_else(|| CoreError::UnknownResource(action.resource.clone()))?;
+            let presentation = self.diff_presentation(action, resource)?;
+            diffs.push(presentation);
+        }
+        Ok(DiffListView::new(&plan, diffs))
+    }
+
+    fn diff_presentation(
+        &self,
+        action: &envsync_domain::Action,
+        resource: &crate::config::ResourceConfig,
+    ) -> CoreResult<DiffView> {
+        let view = DiffView::from_action(action);
+        if action.secret {
+            return Ok(view);
+        }
+        let bytes = action
+            .content
+            .map(|content| self.drafts.get(ObjectId::from(content)))
+            .transpose()?
+            .flatten();
+        let content_bytes = bytes.as_ref().map(Vec::len);
+        let is_binary = bytes.as_deref().is_some_and(is_binary_content);
+        let presentation = if is_binary {
+            "binary"
+        } else {
+            match resource.mode {
+                FileMode::ManagedBlock => "managed_block",
+                FileMode::StructuredMerge => "structured",
+                FileMode::FullFile | FileMode::GeneratedInclude => "text",
+            }
+        };
+        Ok(view.with_presentation(
+            presentation,
+            content_bytes,
+            content_bytes.is_some_and(|size| size > DIFF_SUMMARY_PREVIEW_BYTES),
+        ))
+    }
+
     // ---- sync ----------------------------------------------------------------
 
     /// 应用指定计划。
@@ -911,6 +987,65 @@ impl EnvSyncService {
             record,
             conflict: Conflict::from_canonical_slice(&bytes)?,
         })
+    }
+
+    /// 返回一个冲突的安全裁决元数据。
+    ///
+    /// Blob、三侧正文和原始冲突诊断都留在 core；桌面端只能据此选择 `ours`、`theirs`、
+    /// `delete`，或在明确允许时提交一段非秘密文本供 core 验证。
+    pub fn conflict_detail_view(&self, conflict: ConflictId) -> CoreResult<ConflictDetailView> {
+        let detail = self.conflicts_show(conflict)?;
+        let resource = self
+            .config
+            .resource(&detail.record.resource)
+            .ok_or_else(|| CoreError::UnknownResource(detail.record.resource.clone()))?;
+        let manual_limit = resource
+            .policy
+            .max_bytes
+            .min(DESKTOP_MANUAL_RESOLUTION_MAX_BYTES);
+        Ok(ConflictDetailView::from_detail(
+            &detail,
+            resource,
+            manual_limit,
+        ))
+    }
+
+    /// 以桌面端允许的受限意图裁决冲突。
+    ///
+    /// 普通 `conflicts_resolve` 仍服务 CLI（可从受控文件读取人工内容）；桌面 WebView 必须
+    /// 走此方法，使 `policy.secret`、文本语义、结构化语法和字节上限都在跨 IPC 前重新
+    /// 生效。非手动裁决也拒绝携带内容，避免无意把正文送进审计/错误路径。
+    pub fn conflicts_resolve_for_desktop(
+        &mut self,
+        conflict: ConflictId,
+        choice: ResolutionChoice,
+        manual_content: Option<&str>,
+    ) -> CoreResult<ConflictResolutionView> {
+        let detail = self.conflicts_show(conflict)?;
+        let resource = self
+            .config
+            .resource(&detail.record.resource)
+            .ok_or_else(|| CoreError::UnknownResource(detail.record.resource.clone()))?;
+        match choice {
+            ResolutionChoice::Manual => {
+                let content =
+                    manual_content.ok_or_else(|| CoreError::ManualResolutionInvalidText {
+                        resource: resource.id.clone(),
+                    })?;
+                validate_desktop_manual_resolution(resource, detail.conflict.kind, content)?;
+            }
+            ResolutionChoice::Ours | ResolutionChoice::Theirs | ResolutionChoice::Delete => {
+                if manual_content.is_some() {
+                    return Err(CoreError::ManualResolutionNotAllowed {
+                        resource: resource.id.clone(),
+                        reason: "content_only_allowed_for_manual",
+                    });
+                }
+            }
+        }
+        let resolution =
+            self.conflicts_resolve(conflict, choice, manual_content.map(str::as_bytes))?;
+        Ok(ConflictResolutionView::from(&resolution))
     }
 
     /// 记录用户对冲突的裁决。
@@ -1270,6 +1405,44 @@ impl EnvSyncService {
         engine.recover_all()
     }
 
+    /// 返回已注册工作区的完整 journal 历史（无原始错误、收据路径或内容）。
+    pub fn operation_history_view(&self) -> CoreResult<OperationHistoryView> {
+        let records = self.journal.list_all()?;
+        Ok(OperationHistoryView::from_records(
+            self.config.workspace_id,
+            &records,
+        ))
+    }
+
+    /// 返回单个 operation 的动作、收据与恢复可用性摘要。
+    pub fn operation_detail_view(&self, operation: OperationId) -> CoreResult<OperationDetailView> {
+        let record = self
+            .journal
+            .operation(operation)?
+            .ok_or_else(|| CoreError::OperationNotFound(operation.to_string()))?;
+        let actions = self.journal.actions(operation)?;
+        let receipts = self.journal.receipts(operation)?;
+        Ok(OperationDetailView::from_records(
+            &record, &actions, &receipts,
+        ))
+    }
+
+    /// 生成一次回滚前的逆向计划审核摘要，但**绝不执行回滚**。
+    ///
+    /// 仅返回已经具备收据、且 recovery 支持的 operation；desktop 层随后发放一次性审核
+    /// token，并要求每项 inverse action 明确确认。真正执行时 recovery 仍会重新核对目标
+    /// 摘要，因此审核不能绕过外部并发修改保护。
+    pub fn rollback_review_view(&self, operation: OperationId) -> CoreResult<RollbackReviewView> {
+        let record = self
+            .journal
+            .operation(operation)?
+            .ok_or_else(|| CoreError::OperationNotFound(operation.to_string()))?;
+        let actions = self.journal.actions(operation)?;
+        let receipts = self.journal.receipts(operation)?;
+        RollbackReviewView::from_records(&record, &actions, &receipts)
+            .ok_or_else(|| CoreError::Rollback("操作当前状态或收据不支持生成逆向计划".to_owned()))
+    }
+
     /// 显式回滚一次操作。
     pub fn rollback(&mut self, operation: OperationId) -> CoreResult<RecoveryReport> {
         let EnvSyncService {
@@ -1443,6 +1616,68 @@ impl EnvSyncService {
     }
 }
 
+/// 判定内容是否不适合文本差异或桌面手动编辑。
+///
+/// 这里不尝试“修复”编码：任何 NUL、非 UTF-8 或不允许的控制字符都会被保守地当作
+/// 二进制。这样不会把二进制或终端控制序列带进 WebView 文本控件。
+fn is_binary_content(bytes: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return true;
+    };
+    text.chars().any(|character| {
+        character == '\0' || (character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+    })
+}
+
+/// 对 WebView 提交的手动冲突内容实施资源策略。
+fn validate_desktop_manual_resolution(
+    resource: &crate::config::ResourceConfig,
+    kind: ConflictKind,
+    content: &str,
+) -> CoreResult<()> {
+    if resource.policy.secret {
+        return Err(CoreError::ManualResolutionNotAllowed {
+            resource: resource.id.clone(),
+            reason: "secret_resource",
+        });
+    }
+    if matches!(kind, ConflictKind::BinaryBoth) {
+        return Err(CoreError::ManualResolutionNotAllowed {
+            resource: resource.id.clone(),
+            reason: "binary_conflict",
+        });
+    }
+    if !matches!(
+        resource.mode,
+        FileMode::FullFile | FileMode::ManagedBlock | FileMode::StructuredMerge
+    ) {
+        return Err(CoreError::ManualResolutionNotAllowed {
+            resource: resource.id.clone(),
+            reason: "unsupported_resource_mode",
+        });
+    }
+    let limit = resource
+        .policy
+        .max_bytes
+        .min(DESKTOP_MANUAL_RESOLUTION_MAX_BYTES);
+    if content.len() as u64 > limit {
+        return Err(CoreError::ManualResolutionTooLarge {
+            resource: resource.id.clone(),
+            limit,
+        });
+    }
+    if is_binary_content(content.as_bytes()) {
+        return Err(CoreError::ManualResolutionInvalidText {
+            resource: resource.id.clone(),
+        });
+    }
+    if let Some(format) = resource.policy.structured_format {
+        crate::merge::validate_structured_document(content.as_bytes(), format)
+            .map_err(CoreError::Merge)?;
+    }
+    Ok(())
+}
+
 /// 只保留文件名用于错误信息，避免泄露绝对路径。
 fn file_label(path: &Path) -> String {
     path.file_name()
@@ -1453,4 +1688,75 @@ fn file_label(path: &Path) -> String {
 /// 便于外部构造备份根路径。
 pub fn backup_root_of(state_dir: &Path) -> PathBuf {
     state_dir.join("backups")
+}
+
+#[cfg(test)]
+mod manual_resolution_tests {
+    use std::collections::BTreeMap;
+
+    use envsync_domain::{
+        ConflictKind, DesiredDisposition, FileMode, ResourceId, ResourcePolicy, StructuredFormat,
+    };
+
+    use crate::config::ResourceConfig;
+
+    use super::validate_desktop_manual_resolution;
+
+    fn resource(
+        secret: bool,
+        mode: FileMode,
+        structured_format: Option<StructuredFormat>,
+    ) -> ResourceConfig {
+        ResourceConfig {
+            id: ResourceId::parse("desktop/manual").expect("测试资源标识有效"),
+            root: "home".to_owned(),
+            target: "manual.conf".to_owned(),
+            mode,
+            disposition: DesiredDisposition::Managed,
+            policy: ResourcePolicy {
+                secret,
+                structured_format,
+                max_bytes: 1024,
+                ..ResourcePolicy::default()
+            },
+            comment_prefix: "# ".to_owned(),
+            selector: None,
+            device_overrides: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn desktop_manual_resolution_never_accepts_secret_or_binary_content() {
+        let secret = resource(true, FileMode::FullFile, None);
+        let error =
+            validate_desktop_manual_resolution(&secret, ConflictKind::TextOverlap, "token=canary")
+                .expect_err("秘密资源不得进入手动编辑通道");
+        assert_eq!(error.code(), "conflict.manual_not_allowed");
+        assert!(!error.to_string().contains("canary"));
+
+        let text = resource(false, FileMode::FullFile, None);
+        let error =
+            validate_desktop_manual_resolution(&text, ConflictKind::TextOverlap, "text\0binary")
+                .expect_err("含 NUL 的内容不得进入文本编辑通道");
+        assert_eq!(error.code(), "conflict.manual_invalid_text");
+    }
+
+    #[test]
+    fn desktop_manual_resolution_reuses_the_structured_parser() {
+        let json = resource(
+            false,
+            FileMode::StructuredMerge,
+            Some(StructuredFormat::Json),
+        );
+        validate_desktop_manual_resolution(
+            &json,
+            ConflictKind::StructuredKey,
+            "{\"safe\": true}\n",
+        )
+        .expect("合法 JSON 应可作为手动裁决");
+        let error =
+            validate_desktop_manual_resolution(&json, ConflictKind::StructuredKey, "{broken")
+                .expect_err("core 必须拒绝 UI 未能解析的结构化内容");
+        assert_eq!(error.code(), "merge.parse");
+    }
 }

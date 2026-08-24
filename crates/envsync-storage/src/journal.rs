@@ -788,6 +788,18 @@ impl Journal {
         self.query_operations(&sql, [])
     }
 
+    /// 列出当前 journal 中的全部操作，按最近状态变化时间倒序。
+    ///
+    /// History UI 只把结果再投影为无内容 View；这里仍保留完整记录给 core 的恢复与审计
+    /// 逻辑。以 `operation_id` 作为稳定次级排序键，避免同一毫秒的记录出现不确定顺序。
+    pub fn list_all(&self) -> Result<Vec<OperationRecord>, JournalError> {
+        let sql = format!(
+            "SELECT {OPERATION_COLUMNS} FROM operations \
+             ORDER BY updated_at_unix_ms DESC, operation_id DESC"
+        );
+        self.query_operations(&sql, [])
+    }
+
     /// 列出处于指定状态的操作。
     pub fn list_by_state(
         &self,

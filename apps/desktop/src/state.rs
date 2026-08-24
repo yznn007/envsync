@@ -5,7 +5,7 @@
 //! 线程），因此每个 command 或后台 worker 都在持有工作区锁时就地打开、使用并销毁
 //! service；WebView 不能把任意配置路径或后端连接塞进状态层。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -33,6 +33,10 @@ pub enum DesktopStateError {
     InvalidRootCapability,
     /// 进程内锁已因其他线程 panic 而不可再安全使用。
     Unavailable,
+    /// 回滚没有经过当前进程发放的一次性逆向计划审核。
+    UnknownRollbackReview,
+    /// 逆向计划中的动作尚未全部逐项确认。
+    IncompleteRollbackReview,
 }
 
 impl DesktopStateError {
@@ -46,6 +50,8 @@ impl DesktopStateError {
             DesktopStateError::UnknownRootCapability => "desktop.root_capability_unknown",
             DesktopStateError::InvalidRootCapability => "desktop.root_capability_invalid",
             DesktopStateError::Unavailable => "desktop.workspace_unavailable",
+            DesktopStateError::UnknownRollbackReview => "rollback.review_required",
+            DesktopStateError::IncompleteRollbackReview => "rollback.review_incomplete",
         }
     }
 }
@@ -129,6 +135,16 @@ impl ApplyCancellation for CancellationToken {
 struct ActiveBackgroundOperation {
     workspace: WorkspaceId,
     cancellation: CancellationToken,
+}
+
+/// 一次逆向计划审核的进程内授权。
+///
+/// 它不是持久化能力，也不含路径、收据或内容；只把「哪个工作区的哪个 operation 已经完成
+/// 哪些序号的逐项确认」绑定到随机 token。执行后立即消费，避免 UI 或恶意页面重放旧审核。
+struct RollbackReviewGrant {
+    workspace: WorkspaceId,
+    operation: OperationId,
+    required_confirmations: BTreeSet<u32>,
 }
 
 /// 后台 operation 注册表。
@@ -216,6 +232,8 @@ pub struct DesktopState {
     active_operations: AtomicUsize,
     /// 长操作的后台 worker 与取消令牌。
     background_operations: Arc<OperationRegistry>,
+    /// 已生成、尚未消费的一次性回滚审核 token。
+    rollback_reviews: Mutex<BTreeMap<String, RollbackReviewGrant>>,
 }
 
 impl DesktopState {
@@ -332,6 +350,73 @@ impl DesktopState {
             .request_cancel(workspace, operation)
     }
 
+    /// 为已经由 core 生成的逆向计划审核摘要发放一次性 token。
+    pub(crate) fn issue_rollback_review(
+        &self,
+        workspace: WorkspaceId,
+        operation: OperationId,
+        required_confirmations: impl IntoIterator<Item = u32>,
+    ) -> Result<String, DesktopStateError> {
+        self.registration(workspace)?;
+        let required_confirmations: BTreeSet<u32> = required_confirmations.into_iter().collect();
+        if required_confirmations.is_empty() {
+            return Err(DesktopStateError::UnknownRollbackReview);
+        }
+        let token = OperationId::generate().to_string();
+        let mut reviews = self
+            .rollback_reviews
+            .lock()
+            .map_err(|_| DesktopStateError::Unavailable)?;
+        // 审核 token 只应是短暂 UI 状态。超过这个保守上限时全部失效，调用方重新审核而不是
+        // 让长期运行进程积累无限 token。
+        if reviews.len() >= 64 {
+            reviews.clear();
+        }
+        reviews.insert(
+            token.clone(),
+            RollbackReviewGrant {
+                workspace,
+                operation,
+                required_confirmations,
+            },
+        );
+        Ok(token)
+    }
+
+    /// 核验并消费一次逆向计划审核。
+    ///
+    /// 所有确认必须和 review 返回的序号完全一致；多余、遗漏或重复确认都会被拒绝。token
+    /// 只在确认完整时删除，用户因漏选被拒绝后仍可在当前页面补齐再提交。
+    pub(crate) fn consume_rollback_review(
+        &self,
+        workspace: WorkspaceId,
+        operation: OperationId,
+        token: &str,
+        confirmations: &[u32],
+    ) -> Result<(), DesktopStateError> {
+        if !is_root_capability_token(token) {
+            return Err(DesktopStateError::UnknownRollbackReview);
+        }
+        let mut reviews = self
+            .rollback_reviews
+            .lock()
+            .map_err(|_| DesktopStateError::Unavailable)?;
+        let Some(grant) = reviews.get(token) else {
+            return Err(DesktopStateError::UnknownRollbackReview);
+        };
+        if grant.workspace != workspace || grant.operation != operation {
+            return Err(DesktopStateError::UnknownRollbackReview);
+        }
+        let confirmations_set: BTreeSet<u32> = confirmations.iter().copied().collect();
+        if confirmations.len() != confirmations_set.len()
+            || confirmations_set != grant.required_confirmations
+        {
+            return Err(DesktopStateError::IncompleteRollbackReview);
+        }
+        reviews.remove(token);
+        Ok(())
+    }
+
     /// 验证 workspace 已由 Rust 注册。
     pub fn contains(&self, workspace: WorkspaceId) -> Result<bool, DesktopStateError> {
         let workspaces = self
@@ -434,12 +519,13 @@ impl Drop for ActiveOperationGuard<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::fs;
 
     use envsync_core::ApplyCancellation;
     use envsync_domain::{OperationId, WorkspaceId};
 
-    use super::{DesktopState, DesktopStateError, OperationRegistry};
+    use super::{DesktopState, DesktopStateError, OperationRegistry, RollbackReviewGrant};
 
     #[test]
     fn active_operation_guard_keeps_exit_gate_open_until_completion() {
@@ -503,6 +589,39 @@ mod tests {
             state.root_capability("/Users/alice/.ssh/id_ed25519"),
             Err(DesktopStateError::UnknownRootCapability),
             "路径绝不能被误当作根能力 token"
+        );
+    }
+
+    #[test]
+    fn rollback_review_requires_each_confirmation_and_is_single_use() {
+        let state = DesktopState::default();
+        let workspace = WorkspaceId::generate();
+        let operation = OperationId::generate();
+        let token = OperationId::generate().to_string();
+        state.rollback_reviews.lock().expect("测试锁可用").insert(
+            token.clone(),
+            RollbackReviewGrant {
+                workspace,
+                operation,
+                required_confirmations: BTreeSet::from([1, 3]),
+            },
+        );
+
+        assert_eq!(
+            state.consume_rollback_review(workspace, operation, &token, &[1]),
+            Err(DesktopStateError::IncompleteRollbackReview),
+            "遗漏逆向动作不能执行回滚"
+        );
+        assert!(
+            state
+                .consume_rollback_review(workspace, operation, &token, &[3, 1])
+                .is_ok(),
+            "任意顺序完成全部确认后允许执行"
+        );
+        assert_eq!(
+            state.consume_rollback_review(workspace, operation, &token, &[1, 3]),
+            Err(DesktopStateError::UnknownRollbackReview),
+            "审核 token 必须在首次成功执行后被消费"
         );
     }
 }

@@ -11,11 +11,13 @@ use envsync_backend::git_auth::validate_remote_url;
 use envsync_backend::GitAuth;
 use envsync_core::{
     ApiEvent, ApiRequest, ApiRequestId, ApiResponse, ApplyCancellation, ApplyOutcome,
-    ApplyStartView, ApplyView, CancellationView, ConflictListView, CoreError, CoreResult,
-    EnvSyncService, OperationView, PlanView, RootCapabilityView, StatusView, ViewData,
-    ViewDiagnostic, WorkspaceConfig, WorkspaceRegistrationView, WorkspaceSummary,
+    ApplyStartView, ApplyView, CancellationView, ConflictDetailView, ConflictListView,
+    ConflictResolutionView, CoreError, CoreResult, DiffListView, EnvSyncService,
+    OperationDetailView, OperationHistoryView, OperationView, PlanView, RollbackReviewView,
+    RootCapabilityView, StatusView, ViewData, ViewDiagnostic, WorkspaceConfig,
+    WorkspaceRegistrationView, WorkspaceSummary,
 };
-use envsync_domain::{ConflictId, OperationId, PlanId, WorkspaceId};
+use envsync_domain::{ConflictId, OperationId, PlanId, ResolutionChoice, WorkspaceId};
 use envsync_platform::AuthorizedRoot;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -30,15 +32,21 @@ pub const OPERATION_EVENT: &str = "envsync://operation";
 ///
 /// 此列表也会写入 Tauri build manifest；新增 command 必须先添加安全测试、明确输入 View
 /// 和最小 capability，不能通过插件自动扩展。
-pub const ALLOWED_COMMANDS: [&str; 11] = [
+pub const ALLOWED_COMMANDS: [&str; 17] = [
     "onboarding_select_root",
     "onboarding_create_workspace",
     "onboarding_open_workspace",
     "workspace_status",
     "workspace_plan",
+    "plan_diff",
     "workspace_apply",
-    "operation_rollback",
     "conflict_list",
+    "conflict_show",
+    "conflict_resolve",
+    "operation_history",
+    "operation_detail",
+    "operation_rollback_review",
+    "operation_rollback",
     "vault_metadata",
     "bundle_review",
     "operation_cancel",
@@ -135,6 +143,16 @@ pub struct ApplyPlanRequest {
     pub plan_id: PlanId,
 }
 
+/// 请求读取某个已保存计划的无内容差异摘要。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanDiffRequest {
+    /// 已注册工作区标识。
+    pub workspace_id: WorkspaceId,
+    /// 已保存、由 UI 正在审核的计划标识。
+    pub plan_id: PlanId,
+}
+
 /// 请求回滚或取消已登记操作的负载。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -153,6 +171,40 @@ pub struct ConflictRequest {
     pub workspace_id: WorkspaceId,
     /// 已登记冲突标识。
     pub conflict_id: ConflictId,
+}
+
+/// 提交一个受限冲突裁决。
+///
+/// `manual_content` 只在 `choice=manual` 时可出现。Rust core 会再次检查资源是否非秘密、
+/// 是否为文本以及结构化格式/字节上限；WebView 无法凭此字段提交路径或 Blob 标识。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConflictResolutionRequest {
+    /// 已注册工作区标识。
+    pub workspace_id: WorkspaceId,
+    /// 已登记冲突标识。
+    pub conflict_id: ConflictId,
+    /// `ours`、`theirs`、`manual` 或 `delete`。
+    pub choice: ResolutionChoice,
+    /// 临时手动文本；绝不写入 Pinia、日志或 response。
+    pub manual_content: Option<String>,
+}
+
+/// 请求生成某次 operation 的逆向计划审核。
+pub type RollbackReviewRequest = OperationRequest;
+
+/// 执行已经逐项审核过的逆向计划。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RollbackExecutionRequest {
+    /// 已注册工作区标识。
+    pub workspace_id: WorkspaceId,
+    /// 将被回滚的 operation。
+    pub operation_id: OperationId,
+    /// Rust 进程发放的一次性审核 token。
+    pub review_token: String,
+    /// 必须与审核响应中所有 inverse action 的序号一一对应。
+    pub confirmations: Vec<u32>,
 }
 
 /// 让用户通过系统目录选择器授予一个目录能力。
@@ -372,6 +424,27 @@ pub fn workspace_plan(
     }
 }
 
+/// 读取已保存 Plan 的无内容差异摘要。
+///
+/// UI 只能按当前 `plan_id` 请求，无法以路径、Blob ID 或“最新状态”替代它。Plan 失效后
+/// 必须重新生成并重新审核；此 command 本身绝不会帮 UI 修补旧计划。
+#[tauri::command]
+pub fn plan_diff(
+    state: State<'_, DesktopState>,
+    request: ApiRequest<PlanDiffRequest>,
+) -> ApiResponse<DiffListView> {
+    let request_id = request.request_id().clone();
+    if let Some(response) = schema_error(&request) {
+        return response;
+    }
+    match call_service(state.inner(), request.data().workspace_id, |service| {
+        service.plan_diffs(request.data().plan_id)
+    }) {
+        Ok(view) => ApiResponse::ok(request_id, view, Vec::new()),
+        Err(error) => command_error(request_id, error),
+    }
+}
+
 /// 应用一个已保存的 Plan。
 ///
 /// core 会在写入前重新观察并检查 Plan ID；桌面层不会也不能自行绕过该新鲜度检查。
@@ -440,20 +513,141 @@ pub fn conflict_list(
     }
 }
 
-/// 为一次已登记 operation 请求回滚。
+/// 读取单个冲突的无内容裁决元数据。
+#[tauri::command]
+pub fn conflict_show(
+    state: State<'_, DesktopState>,
+    request: ApiRequest<ConflictRequest>,
+) -> ApiResponse<ConflictDetailView> {
+    let request_id = request.request_id().clone();
+    if let Some(response) = schema_error(&request) {
+        return response;
+    }
+    match call_service(state.inner(), request.data().workspace_id, |service| {
+        service.conflict_detail_view(request.data().conflict_id)
+    }) {
+        Ok(view) => ApiResponse::ok(request_id, view, Vec::new()),
+        Err(error) => command_error(request_id, error),
+    }
+}
+
+/// 保存一个冲突裁决，但不执行同步、不触碰用户文件。
+///
+/// 对于 `manual`，内容只在这个调用栈内暂存。core 会拒绝秘密、二进制、结构化解析失败或
+/// 超限内容；响应也不会回显用户提交的任何正文。
+#[tauri::command]
+pub fn conflict_resolve(
+    state: State<'_, DesktopState>,
+    request: ApiRequest<ConflictResolutionRequest>,
+) -> ApiResponse<ConflictResolutionView> {
+    let request_id = request.request_id().clone();
+    if let Some(response) = schema_error(&request) {
+        return response;
+    }
+    let workspace = request.data().workspace_id;
+    let conflict = request.data().conflict_id;
+    let choice = request.data().choice;
+    let manual_content = request.data().manual_content.as_deref();
+    match call_service(state.inner(), workspace, |service| {
+        service.conflicts_resolve_for_desktop(conflict, choice, manual_content)
+    }) {
+        Ok(view) => ApiResponse::ok(request_id, view, Vec::new()),
+        Err(error) => command_error(request_id, error),
+    }
+}
+
+/// 列出当前工作区的 journal 历史。
+#[tauri::command]
+pub fn operation_history(
+    state: State<'_, DesktopState>,
+    request: ApiRequest<WorkspaceRequest>,
+) -> ApiResponse<OperationHistoryView> {
+    let request_id = request.request_id().clone();
+    if let Some(response) = schema_error(&request) {
+        return response;
+    }
+    match call_service(state.inner(), request.data().workspace_id, |service| {
+        service.operation_history_view()
+    }) {
+        Ok(view) => ApiResponse::ok(request_id, view, Vec::new()),
+        Err(error) => command_error(request_id, error),
+    }
+}
+
+/// 查看单个历史操作的状态机、动作进度与收据摘要。
+#[tauri::command]
+pub fn operation_detail(
+    state: State<'_, DesktopState>,
+    request: ApiRequest<OperationRequest>,
+) -> ApiResponse<OperationDetailView> {
+    let request_id = request.request_id().clone();
+    if let Some(response) = schema_error(&request) {
+        return response;
+    }
+    match call_service(state.inner(), request.data().workspace_id, |service| {
+        service.operation_detail_view(request.data().operation_id)
+    }) {
+        Ok(view) => ApiResponse::ok(request_id, view, Vec::new()),
+        Err(error) => command_error(request_id, error),
+    }
+}
+
+/// 生成一次回滚前必须查看的逆向计划审核。
+#[tauri::command]
+pub fn operation_rollback_review(
+    state: State<'_, DesktopState>,
+    request: ApiRequest<RollbackReviewRequest>,
+) -> ApiResponse<RollbackReviewView> {
+    let request_id = request.request_id().clone();
+    if let Some(response) = schema_error(&request) {
+        return response;
+    }
+    let workspace = request.data().workspace_id;
+    let operation = request.data().operation_id;
+    let review = match call_service(state.inner(), workspace, |service| {
+        service.rollback_review_view(operation)
+    }) {
+        Ok(review) => review,
+        Err(error) => return command_error(request_id, error),
+    };
+    let token = match state.inner().issue_rollback_review(
+        workspace,
+        operation,
+        review.actions.iter().map(|action| action.ordinal),
+    ) {
+        Ok(token) => token,
+        Err(error) => return state_error(request_id, error),
+    };
+    ApiResponse::ok(request_id, review.with_review_token(token), Vec::new())
+}
+
+/// 为已经审核的逆向计划请求回滚。
+///
+/// `review_token` 必须由 `operation_rollback_review` 在当前进程发放，且全部动作序号必须被
+/// 单独确认。token 校验通过即被消费；若回滚因现场摘要变化等原因失败，用户必须重新生成
+/// 逆向计划，而不能重放旧审核。
 #[tauri::command]
 pub fn operation_rollback(
     app: AppHandle,
     state: State<'_, DesktopState>,
-    request: ApiRequest<OperationRequest>,
+    request: ApiRequest<RollbackExecutionRequest>,
 ) -> ApiResponse<OperationView> {
     let request_id = request.request_id().clone();
     if let Some(response) = schema_error(&request) {
         return response;
     }
-    let _operation_guard = state.inner().begin_operation();
+    let workspace = request.data().workspace_id;
     let operation_id = request.data().operation_id;
-    match call_service(state.inner(), request.data().workspace_id, |service| {
+    if let Err(error) = state.inner().consume_rollback_review(
+        workspace,
+        operation_id,
+        &request.data().review_token,
+        &request.data().confirmations,
+    ) {
+        return state_error(request_id, error);
+    }
+    let _operation_guard = state.inner().begin_operation();
+    match call_service(state.inner(), workspace, |service| {
         let report = service.rollback(operation_id)?;
         let record = service
             .journal()

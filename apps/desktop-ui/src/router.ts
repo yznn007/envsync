@@ -1,6 +1,9 @@
 import { defineComponent, h } from 'vue'
 import { createRouter, createWebHashHistory } from 'vue-router'
 
+import ChangesPage from './pages/ChangesPage.vue'
+import ConflictsPage from './pages/ConflictsPage.vue'
+import HistoryPage from './pages/HistoryPage.vue'
 import WorkspacePage from './pages/WorkspacePage.vue'
 
 export const navigationItems = [
@@ -38,9 +41,24 @@ function sectionPage(label: string, key: NavigationKey) {
 const routes = navigationItems.map((item) => ({
   path: item.path,
   name: item.key,
-  component: item.key === 'workspace' ? WorkspacePage : sectionPage(item.label, item.key),
+  component: pageFor(item.key, item.label),
   meta: { label: item.label },
 }))
+
+function pageFor(key: NavigationKey, label: string) {
+  switch (key) {
+    case 'workspace':
+      return WorkspacePage
+    case 'changes':
+      return ChangesPage
+    case 'conflicts':
+      return ConflictsPage
+    case 'history':
+      return HistoryPage
+    default:
+      return sectionPage(label, key)
+  }
+}
 
 const router = createRouter({
   history: createWebHashHistory(),
