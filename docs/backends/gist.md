@@ -14,6 +14,31 @@ envsync-<workspace-uuid>.bundle
 实现位于 `crates/envsync-backend/src/gist_bundle.rs`。本格式只负责 pack/unpack；GitHub
 HTTP、ETag 与 CAS 在后续 Gist backend 中处理。
 
+## HTTP 与凭据
+
+Gist 后端只发布一个工作区唯一的 `envsync-<workspace-uuid>.bundle` 文件，并且创建的 Gist
+永远是 private。用于此后端的 fine-grained personal access token 仅授予 **Gists: write** 权限。
+token 只能由 Vault `SecretRef` 注入 HTTP 客户端；它不得写入配置、日志、诊断或错误消息。
+
+EnvSync 自己的 encoded bundle 上限为 5 MiB；超过该上限立即拒绝，绝不将内容克隆、缓存或
+转交给其他位置。GitHub Gist API 的读取响应中，每个文件最多提供 1 MiB 的 `content`；若
+响应标记 `truncated`，客户端仅可从该文件受限的 `raw_url` 取得完整内容。这是**读取响应的
+内容提供限制**，不是创建 Gist 时的 API 大小限制。
+
+`raw_url` 必须经过受限来源校验：自定义或测试 API base 时只允许与 API 同源；公共 GitHub API
+时只允许 `https://gist.githubusercontent.com` 这一 allow-list 来源。请求 raw 内容时不发送
+`Authorization`。这既避免将 token 发送到未经允许的端点，也不把 raw URL 当作可执行的重定向能力。
+
+ETag 仅是检测竞争的弱并发提示，不构成强 CAS。发布时带上读取到的 ETag，写入成功后必须再
+读取并以完整 bytes 验证目标文件，验证通过才确认发布；检测到冲突由上层重新同步。PATCH 的
+结果未知时只做 GET 判定，绝不盲目重写。受控重试只适用于 GET 的限流情形；POST 与 PATCH
+不会自动重放。
+
+测试仅访问 loopback GitHub mock，不访问真实 GitHub，也不读取或使用真实凭据。
+
+GitHub 的响应截断行为及 `raw_url` 的用法见 [Gist REST API 文档](https://docs.github.com/en/rest/gists/gists)；
+条件请求和限流处理遵循 [REST API 最佳实践](https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api)。
+
 ## 前提与信任边界
 
 Gist 只允许 M2 已初始化的工作区使用。调用方必须向 bundle 层注入：

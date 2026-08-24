@@ -103,6 +103,7 @@ cargo test -p envsync-backend --test gist_backend
 **文件：**
 
 - 修改：`crates/envsync-backend/src/gist.rs`
+- 修改：`crates/envsync-backend/Cargo.toml`
 
 1. 用 `Url::path_segments_mut()` 构造 `/gists` 和 `/gists/<id>`，不拼接 user 输入；客户端设置
    `reqwest::retry::never()`，先禁用 reqwest 对 protocol NACK 的隐式重放，再由本模块显式控制
@@ -110,8 +111,9 @@ cargo test -p envsync-backend --test gist_backend
    请求固定 `Accept: application/vnd.github+json`、`X-GitHub-Api-Version: 2022-11-28`、
    `User-Agent: envsync` 和 `Authorization: Bearer <vault token>`。
 2. POST body 固定为 `public: false`、稳定 description 与从已检查 header 派生的唯一文件名。
-   POST 成功后只从结构化 JSON 取 id，再调用 `read()` 取得 authoritative ETag、bundle bytes
-   和 header；创建未知结果绝不重试。
+   POST 成功后只从结构化 JSON 取 id，返回由候选 bundle 构造的**待确认**记录；调用方须显式
+   `read()` 取得 authoritative ETag、bundle bytes 和 header。这样 `create` 不会隐式增加一次
+   GET，且未确认记录不得作为 `compare_and_swap` 的 expected revision。创建未知结果绝不重试。
 3. 读取 JSON 时最多读取 `MAX_ENCODED_BUNDLE_LEN + 128 KiB`；只从预期文件名取 `content`。
    `truncated: false` 但 content 缺失、文件不存在、非 UTF-8、超过 bundle 上限或结构不合法
    都返回不回显正文的安全错误。
@@ -125,12 +127,28 @@ cargo test -p envsync-backend --test gist_backend
    `gist.timeout`、大 body→`gist.response_too_large`，其余 status→`gist.http_status`。为每种
    错误实现稳定 `code()`。
 
-## Task 4: 实现弱 CAS 与受控重试
+## Task 4: 先补弱 CAS、限流与不确定结果的红灯合约
+
+**文件：**
+
+- 修改：`crates/envsync-backend/tests/gist_backend.rs`
+
+1. 在不改生产实现的前提下，为 `compare_and_swap()` 增加本地 mock 合约：成功 PATCH 后必须
+   GET 验证且返回新 ETag；PATCH 返回 412、断线或 5xx 后均只能 GET 一次；验证读到候选的
+   **完整相同 bytes** 时成功，读到旧/其他 bundle 时为 `gist.cas_conflict`，验证请求本身失败
+   时为 `gist.update_outcome_unknown`。每个失败路径都断言 PATCH 恰好一次，绝不盲重发。
+2. 增加 GET 429 + `Retry-After: 0` 后重试一次的合约；零延迟确保红灯测试不真实 sleep。
+   增加 POST 429 和 PATCH 429 合约，二者必须返回 `gist.rate_limited` 且不重放写请求。
+3. 覆盖 PATCH 的 `If-Match`、private 单文件 body、验证读得到的新 ETag，以及错误 `Debug`/
+   `Display` 不回显 mock 的 response body、URL 或 token。测试只使用 `MockGithub` 的回环端口。
+4. 运行 `cargo test -p envsync-backend --test gist_backend`，记录当前预期红灯；测试不得用
+   `#[ignore]`、sleep、真实 GitHub 或伪造 bundle 绕过 `gist_bundle::inspect()`。
+
+## Task 5: 实现弱 CAS 与受控重试
 
 **文件：**
 
 - 修改：`crates/envsync-backend/src/gist.rs`
-- 修改：`crates/envsync-backend/tests/gist_backend.rs`
 
 1. `read()` 在成功响应中保存 ETag；缺少 ETag 返回 `gist.missing_etag`，不能把无版本读取带入
    发布流程。
@@ -147,11 +165,12 @@ cargo test -p envsync-backend --test gist_backend
 3. 抽出内部 `Sleeper`，生产实现调用 `thread::sleep`，测试注入记录 duration 的假实现。
    仅 `GET` 可对 429 或带 `Retry-After`/`X-RateLimit-Remaining: 0` 的限流响应重试，最多两次；
    优先 `Retry-After`，其次 `X-RateLimit-Reset`，不确定或超出 60 秒时返回
-   `gist.rate_limited` 让调度层稍后再试。POST/PATCH 永不自动重试。
-4. 添加测试断言：PUT/PATCH 与 POST 的限流不重试、unknown PATCH 只 GET 一次、验证读取的
-   `ETag` 更新为新值、失败没有任何 `GistBackend` 内部可变缓存可被误当成已发布状态。
+   `gist.rate_limited` 让调度层稍后再试。POST/PATCH 永不自动重试。实现时用内部单元测试
+   向 Sleeper 注入记录 duration 的 fake，避免集成测试依赖真实等待。
+4. 让 Task 4 的全部合约转绿；失败没有任何 `GistBackend` 内部可变缓存可被误当成已发布状态。
+   一并修正 Task 3 遗留的 `create` 过时注释。
 
-## Task 5: 更新文档、运行全量门禁并提交
+## Task 6: 更新文档、运行全量门禁并提交
 
 **文件：**
 

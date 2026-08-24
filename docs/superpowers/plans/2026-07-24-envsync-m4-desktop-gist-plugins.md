@@ -293,32 +293,35 @@ git commit -m "feat(backend): 添加可引导的密封 Gist bundle"
 - Test: `crates/envsync-backend/tests/gist_backend.rs`
 - Create: `crates/envsync-backend/tests/support/mock_github.rs`
 
-- [ ] **Step 1: 写 HTTP contract tests**
+- [x] **Step 1: 写 HTTP contract tests**
 
 mock API 覆盖 create/read/update、ETag/If-Match、rate limit、401/403/404、超时、截断响应和
 服务端返回旧 revision。
 
-- [ ] **Step 2: 实现 CAS**
+- [x] **Step 2: 实现 CAS**
 
 读取保存 ETag 与 revision；更新同时发送 If-Match，并在响应后重读验证 revision/head。
 GitHub 不保证的条件不能被描述为强 CAS；检测竞争后返回 conflict 并保持本地零变更。
 
-- [ ] **Step 3: Token 集成**
+- [x] **Step 3: Token 集成**
 
 Token 只来自 Vault SecretRef，最小 scope，日志只显示 GitHub request ID。URL、header 和
 错误 body 统一 redaction。
 
-- [ ] **Step 4: rate-limit/backoff**
+- [x] **Step 4: rate-limit/backoff**
 
 尊重 Retry-After 和 rate headers；重试只用于幂等 GET。未知 PATCH 结果先 GET 判定，不能
 盲目重复发布。
 
-- [ ] **Step 5: 验证并提交**
+- [x] **Step 5: 验证并提交**
 
 ```bash
 cargo test -p envsync-backend --test gist_backend
 git commit -am "feat(backend): 添加 GitHub Gist 后端"
 ```
+
+Gist 后端不接入通用 `Backend` trait：该 trait 要求对象级强 CAS 语义，而 Gist 只有单文件
+更新和写后完整 bytes 验证的弱 CAS；将二者等同会错误承诺服务端并不提供的原子性。
 
 ### Task 9: 插件 manifest 与版本化 RPC
 
