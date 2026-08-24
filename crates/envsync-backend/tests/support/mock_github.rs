@@ -32,7 +32,7 @@ impl fmt::Debug for RequestRecord {
         let header_names: Vec<&str> = self.headers.keys().map(|name| name.as_str()).collect();
         f.debug_struct("RequestRecord")
             .field("method", &self.method)
-            .field("path", &self.path)
+            .field("path", &"<redacted path>")
             .field("headers", &header_names)
             .field("body_len", &self.body.len())
             .finish()
@@ -410,5 +410,30 @@ fn status_text(status: u16) -> &'static str {
         503 => "Service Unavailable",
         412 => "Precondition Failed",
         _ => "OK",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_record_debug_redacts_path() {
+        let record = RequestRecord {
+            method: "GET".to_owned(),
+            path: "/secret/orgs/acme/repos/private".to_owned(),
+            headers: BTreeMap::from([
+                ("accept".to_owned(), "application/json".to_owned()),
+                ("x-github-api-version".to_owned(), "2022-11-28".to_owned()),
+            ]),
+            body: b"payload".to_vec(),
+        };
+
+        let debug = format!("{:?}", record);
+
+        assert!(debug.contains("<redacted path>"));
+        assert!(debug.contains("headers: [\"accept\", \"x-github-api-version\"]"));
+        assert!(debug.contains("body_len: 7"));
+        assert!(!debug.contains("/secret/orgs/acme/repos/private"));
     }
 }
