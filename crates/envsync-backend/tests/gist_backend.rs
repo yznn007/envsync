@@ -12,7 +12,7 @@ use envsync_backend::gist_bundle::{
 use envsync_crypto::device::DeviceKeypair;
 use envsync_crypto::sealed::SecretId;
 use envsync_crypto::suite::{DataKey, KeyEpoch, Plaintext};
-use envsync_domain::{ObjectId, SnapshotBody, StateRoot, WorkspaceId, WorkspaceRef};
+use envsync_domain::{CborCodec, ObjectId, SnapshotBody, StateRoot, WorkspaceId, WorkspaceRef};
 use serde_json::{json, Value};
 use support::mock_github::{MockGithub, ResponseSpec};
 
@@ -133,29 +133,48 @@ fn create_then_read_then_publish_sends_expected_contract() {
         published.encoded().as_bytes() == bundle_v2.as_bytes(),
         "最终 bundle bytes 必须匹配"
     );
-    assert_eq!(published.revision().header().workspace, workspace);
-    assert_eq!(published.revision().header().revision, 2);
+    assert!(
+        published.revision().header().workspace == workspace,
+        "发布结果必须保留工作区标识"
+    );
+    assert!(
+        published.revision().header().revision == 2,
+        "发布结果必须为 revision 2"
+    );
 
     let requests = mock.wait_for_requests(4, Duration::from_millis(200));
     assert_eq!(requests.len(), 4, "必须只发送四个 HTTP 请求");
-    assert_eq!(
+    assert!(
         requests
             .iter()
             .map(|request| (request.method.as_str(), request.path.as_str()))
-            .collect::<Vec<_>>(),
-        vec![
-            ("POST", "/gists"),
-            ("GET", "/gists/gist-123"),
-            ("PATCH", "/gists/gist-123"),
-            ("GET", "/gists/gist-123"),
-        ]
+            .eq([
+                ("POST", "/gists"),
+                ("GET", "/gists/gist-123"),
+                ("PATCH", "/gists/gist-123"),
+                ("GET", "/gists/gist-123"),
+            ]),
+        "HTTP 请求必须按 POST、GET、PATCH、GET 顺序发送"
     );
     for request in &requests {
-        assert_eq!(request.header("authorization"), Some("Bearer test-token"));
+        assert!(
+            request.header("authorization") == Some("Bearer test-token"),
+            "每个 HTTP 请求都必须携带预期的 Authorization header"
+        );
     }
 
     let create = request_json(&requests[0]);
-    assert_eq!(create["public"], false);
+    assert!(
+        create.get("public") == Some(&Value::Bool(false)),
+        "创建请求必须创建私有 Gist"
+    );
+    assert!(
+        create
+            .get("files")
+            .and_then(Value::as_object)
+            .is_some_and(|files| files.len() == 1 && files.contains_key(&filename)),
+        "创建请求必须仅包含预期文件名的一个文件"
+    );
     assert!(
         create["files"][&filename]["content"]
             .as_str()
@@ -169,7 +188,10 @@ fn create_then_read_then_publish_sends_expected_contract() {
             .is_some_and(|content| content.as_bytes() == bundle_v2.as_bytes()),
         "更新请求必须携带 revision 2 的 bundle"
     );
-    assert_eq!(requests[2].header("if-match"), Some("\"v1\""));
+    assert!(
+        requests[2].header("if-match") == Some("\"v1\""),
+        "PATCH 请求必须携带初始 ETag"
+    );
 }
 
 #[test]
@@ -179,7 +201,7 @@ fn descriptor_explicitly_reports_weak_cas() {
         .expect("构造 Gist 后端");
 
     let descriptor = backend.descriptor();
-    assert_eq!(descriptor.kind, "gist");
+    assert!(descriptor.kind == "gist", "descriptor 必须标识 gist 后端");
     assert!(!descriptor.supports_strong_cas);
 }
 
@@ -215,14 +237,29 @@ fn old_verify_read_after_patch_is_a_cas_conflict_without_patch_retry() {
         Err(error) => error,
     };
 
-    assert_eq!(error.code(), "gist.cas_conflict");
+    assert!(
+        error.code() == "gist.cas_conflict",
+        "验证读取仍为旧 bundle 时必须返回 gist.cas_conflict"
+    );
     let requests = mock.wait_for_requests(3, Duration::from_millis(200));
-    assert_eq!(
+    assert!(requests.len() == 3, "CAS 冲突路径必须恰好发送三个请求");
+    assert!(
+        requests
+            .iter()
+            .map(|request| (request.method.as_str(), request.path.as_str()))
+            .eq([
+                ("GET", "/gists/gist-123"),
+                ("PATCH", "/gists/gist-123"),
+                ("GET", "/gists/gist-123"),
+            ]),
+        "CAS 冲突路径必须按 GET、PATCH、GET 顺序发送请求"
+    );
+    assert!(
         requests
             .iter()
             .filter(|request| request.method == "PATCH")
-            .count(),
-        1,
+            .count()
+            == 1,
         "CAS 只能尝试一次 PATCH"
     );
 }

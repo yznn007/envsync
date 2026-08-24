@@ -3,7 +3,7 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -216,7 +216,10 @@ impl MockGithub {
     }
 
     pub fn enqueue(&self, response: ResponseSpec) {
-        self.responses.lock().expect("response queue").push_back(response);
+        self.responses
+            .lock()
+            .expect("response queue")
+            .push_back(response);
     }
 
     pub fn requests(&self) -> Vec<RequestRecord> {
@@ -263,13 +266,21 @@ fn read_request(stream: &mut TcpStream) -> io::Result<RequestRecord> {
             break;
         }
         if buffer.len() > 1024 * 1024 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "request headers too large"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "request headers too large",
+            ));
         }
     }
 
     let header_end = match find_header_end(&buffer) {
         Some(end) => end,
-        None => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "missing request headers")),
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "missing request headers",
+            ))
+        }
     };
     let head = &buffer[..header_end];
     let body_start = header_end + 4;
@@ -339,7 +350,8 @@ fn write_response(
     body: &[u8],
 ) -> io::Result<()> {
     let mut response = Vec::new();
-    response.extend_from_slice(format!("HTTP/1.1 {} {}\r\n", status, status_text(status)).as_bytes());
+    response
+        .extend_from_slice(format!("HTTP/1.1 {} {}\r\n", status, status_text(status)).as_bytes());
     response.extend_from_slice(format!("content-length: {}\r\n", body.len()).as_bytes());
     response.extend_from_slice(b"connection: close\r\n");
     for (name, value) in headers {

@@ -27,7 +27,7 @@ CAS 语义与 Gist 的单文件、服务端非原子更新模型不相容。
 - 新建：`crates/envsync-backend/tests/gist_backend.rs`
 
 1. 在工作区依赖声明 `reqwest = { version = "0.13", default-features = false, features =
-   ["blocking", "json", "rustls-tls"] }`，后端 crate 使用 workspace 依赖；保留现有
+   ["blocking", "json", "rustls"] }`，后端 crate 使用 workspace 依赖；保留现有
    `serde_json` workspace 版本。
 2. 建立可脚本化的 `MockGithub`：在 `127.0.0.1:0` 监听、按顺序发出预设 HTTP 响应并记录
    每个请求的 method/path/header/body；支持断开连接、延迟响应和 raw 文件路径。mock 仅解析
