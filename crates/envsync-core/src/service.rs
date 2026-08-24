@@ -23,6 +23,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use envsync_backend::git_auth::validate_remote_url;
 use envsync_backend::{Backend, BackendError, GitBackend, GitConfig, LocalBackend};
 use envsync_domain::{
     Blob, BlobId, CborCodec, Conflict, ConflictId, ConflictResolution, DesiredDisposition,
@@ -358,6 +359,61 @@ impl EnvSyncService {
         device_name: &str,
         backend_path: &Path,
     ) -> CoreResult<WorkspaceConfig> {
+        Self::init_workspace_with_optional_root_and_backend(
+            config_path,
+            device_name,
+            BackendConfig::Local {
+                path: backend_path.to_path_buf(),
+            },
+            None,
+        )
+    }
+
+    /// 初始化一个新工作区，并把已由宿主授权的目录设为 `home` 根。
+    ///
+    /// 该入口供桌面端等原生宿主使用：路径不能来自 WebView，而必须先经平台目录选择器
+    /// 和能力注册。服务会 canonicalize 并验证目录，再将其写进配置；UI 只会收到宿主
+    /// 分配的根能力 token，绝不接触这个路径。
+    pub fn init_workspace_with_root(
+        config_path: &Path,
+        device_name: &str,
+        backend_path: &Path,
+        authorized_root: &Path,
+    ) -> CoreResult<WorkspaceConfig> {
+        Self::init_workspace_with_optional_root_and_backend(
+            config_path,
+            device_name,
+            BackendConfig::Local {
+                path: backend_path.to_path_buf(),
+            },
+            Some(authorized_root),
+        )
+    }
+
+    /// 初始化一个新工作区，并指定已经经过宿主安全校验的后端配置。
+    ///
+    /// 此入口用于需要 Git 等非本地后端的原生宿主。它验证远端 URL 与认证方式，却不接收
+    /// 任何凭据明文；本地工作区状态仍从配置文件相邻的私有 state 目录派生。
+    pub fn init_workspace_with_root_and_backend(
+        config_path: &Path,
+        device_name: &str,
+        backend: BackendConfig,
+        authorized_root: &Path,
+    ) -> CoreResult<WorkspaceConfig> {
+        Self::init_workspace_with_optional_root_and_backend(
+            config_path,
+            device_name,
+            backend,
+            Some(authorized_root),
+        )
+    }
+
+    fn init_workspace_with_optional_root_and_backend(
+        config_path: &Path,
+        device_name: &str,
+        backend: BackendConfig,
+        authorized_root: Option<&Path>,
+    ) -> CoreResult<WorkspaceConfig> {
         if config_path.exists() {
             return Err(CoreError::ManualInterventionRequired(format!(
                 "配置文件 `{}` 已存在；初始化不会覆盖已有工作区",
@@ -367,17 +423,46 @@ impl EnvSyncService {
         let base_dir = config_path.parent().unwrap_or(Path::new("."));
         std::fs::create_dir_all(base_dir)
             .map_err(|err| envsync_platform::PlatformError::io("创建配置目录", &err))?;
-        std::fs::create_dir_all(backend_path)
-            .map_err(|err| envsync_platform::PlatformError::io("创建后端目录", &err))?;
+        let local_backend_path = match &backend {
+            BackendConfig::Local { path } => {
+                std::fs::create_dir_all(path)
+                    .map_err(|err| envsync_platform::PlatformError::io("创建后端目录", &err))?;
+                Some(path.as_path())
+            }
+            BackendConfig::Git {
+                remote_url, auth, ..
+            } => {
+                validate_remote_url(remote_url)?;
+                auth.validate()?;
+                None
+            }
+        };
 
-        let config =
-            WorkspaceConfig::scaffold(WorkspaceId::generate(), device_name, backend_path, base_dir);
+        let mut config = WorkspaceConfig::scaffold(
+            WorkspaceId::generate(),
+            device_name,
+            local_backend_path.unwrap_or(base_dir),
+            base_dir,
+        );
+        if !matches!(&backend, BackendConfig::Local { .. }) {
+            config.backend = backend;
+        }
+        if let Some(root) = authorized_root {
+            let root = AuthorizedRoot::open("home", root)?;
+            config.roots.clear();
+            config
+                .roots
+                .insert("home".to_owned(), root.path().to_path_buf());
+        }
         let yaml = config.to_yaml()?;
         std::fs::write(config_path, yaml)
             .map_err(|err| envsync_platform::PlatformError::io("写入配置文件", &err))?;
 
-        // 提前建立后端布局与状态目录，让 `init` 之后的任何命令都能直接工作。
-        LocalBackend::open(backend_path.to_path_buf())?;
+        // 提前建立本地后端布局与状态目录，让 `init` 之后的任何命令都能直接工作。Git
+        // 后端刻意不在此处主动连网：`open` 会把不可达远端降级成明确的离线状态。
+        if let BackendConfig::Local { path } = &config.backend {
+            LocalBackend::open(path.clone())?;
+        }
         std::fs::create_dir_all(&config.state_dir)
             .map_err(|err| envsync_platform::PlatformError::io("创建状态目录", &err))?;
         Ok(config)

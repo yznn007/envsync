@@ -63,7 +63,13 @@ pub fn run() -> tauri::Result<()> {
                 }
             },
         ))
+        // 原生 Rust command 使用系统选择器登记路径能力；WebView 不获得 dialog 或 fs
+        // capability，也不会调用该插件暴露的 JS command。
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
+            commands::onboarding_select_root,
+            commands::onboarding_create_workspace,
+            commands::onboarding_open_workspace,
             commands::workspace_status,
             commands::workspace_plan,
             commands::workspace_apply,

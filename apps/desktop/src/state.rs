@@ -6,11 +6,15 @@
 //! service；WebView 不能把任意配置路径或后端连接塞进状态层。
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use envsync_core::{ApplyCancellation, CoreResult, EnvSyncService, WorkspaceConfig};
+use envsync_core::{
+    ApplyCancellation, CoreResult, EnvSyncService, RootCapabilityView, WorkspaceConfig,
+};
 use envsync_domain::{OperationId, WorkspaceId};
+use envsync_platform::AuthorizedRoot;
 
 /// 桌面状态操作失败时的稳定原因。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +27,10 @@ pub enum DesktopStateError {
     OperationAlreadyActive,
     /// operation 不存在、已经结束，或不属于请求中的工作区。
     OperationNotActive,
+    /// 调用方引用了不存在或格式不正确的根目录能力。
+    UnknownRootCapability,
+    /// 原生选择器返回的对象不能作为目录能力打开。
+    InvalidRootCapability,
     /// 进程内锁已因其他线程 panic 而不可再安全使用。
     Unavailable,
 }
@@ -35,6 +43,8 @@ impl DesktopStateError {
             DesktopStateError::UnknownWorkspace => "desktop.workspace_not_registered",
             DesktopStateError::OperationAlreadyActive => "desktop.operation_already_active",
             DesktopStateError::OperationNotActive => "operation.not_cancellable",
+            DesktopStateError::UnknownRootCapability => "desktop.root_capability_unknown",
+            DesktopStateError::InvalidRootCapability => "desktop.root_capability_invalid",
             DesktopStateError::Unavailable => "desktop.workspace_unavailable",
         }
     }
@@ -200,6 +210,8 @@ impl OperationRegistry {
 #[derive(Default)]
 pub struct DesktopState {
     workspaces: Mutex<BTreeMap<WorkspaceId, Arc<WorkspaceRegistration>>>,
+    /// 只由原生文件选择器登记的目录；键是无路径语义的不透明 token。
+    root_capabilities: Mutex<BTreeMap<String, PathBuf>>,
     /// 同步 command（例如 rollback）持有的短生命周期操作计数。
     active_operations: AtomicUsize,
     /// 长操作的后台 worker 与取消令牌。
@@ -207,6 +219,53 @@ pub struct DesktopState {
 }
 
 impl DesktopState {
+    /// 把原生已选择的目录登记为只在当前进程有效的能力。
+    ///
+    /// 方法先以平台层的 no-follow 语义打开并规范化目录；WebView 只会拿到随机 token 和
+    /// 通用标签，永远不会拿到这个路径或由它派生的目录名。
+    pub(crate) fn register_root_capability(
+        &self,
+        selected_path: &Path,
+    ) -> Result<RootCapabilityView, DesktopStateError> {
+        let root = AuthorizedRoot::open("selected", selected_path)
+            .map_err(|_| DesktopStateError::InvalidRootCapability)?;
+        let token = OperationId::generate().to_string();
+        let mut roots = self
+            .root_capabilities
+            .lock()
+            .map_err(|_| DesktopStateError::Unavailable)?;
+        roots.insert(token.clone(), root.path().to_path_buf());
+        Ok(RootCapabilityView::new(token, "已授权目录"))
+    }
+
+    /// 解析之前由原生层登记的根能力。
+    ///
+    /// 返回路径只供本进程 Rust 命令调用；这个模块的公开 View 从不包含路径。
+    pub(crate) fn root_capability(
+        &self,
+        token: &str,
+    ) -> Result<(RootCapabilityView, PathBuf), DesktopStateError> {
+        if !is_root_capability_token(token) {
+            return Err(DesktopStateError::UnknownRootCapability);
+        }
+        let roots = self
+            .root_capabilities
+            .lock()
+            .map_err(|_| DesktopStateError::Unavailable)?;
+        let path = roots
+            .get(token)
+            .cloned()
+            .ok_or(DesktopStateError::UnknownRootCapability)?;
+        Ok((RootCapabilityView::new(token, "已授权目录"), path))
+    }
+
+    /// 丢弃尚未关联到工作区的目录能力。
+    pub(crate) fn discard_root_capability(&self, token: &str) {
+        if let Ok(mut roots) = self.root_capabilities.lock() {
+            roots.remove(token);
+        }
+    }
+
     /// 注册一个已经由 Rust 校验过的工作区配置。
     pub fn register(&self, config: WorkspaceConfig) -> Result<WorkspaceId, DesktopStateError> {
         let workspace = config.workspace_id;
@@ -309,6 +368,14 @@ impl DesktopState {
     }
 }
 
+fn is_root_capability_token(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= 128
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
 /// 一个自持的后台 worker lease。
 ///
 /// 只要它还活着，operation 就可被取消，窗口也不能安全退出。`Drop` 负责无论成功、失败
@@ -367,6 +434,8 @@ impl Drop for ActiveOperationGuard<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use envsync_core::ApplyCancellation;
     use envsync_domain::{OperationId, WorkspaceId};
 
@@ -407,6 +476,33 @@ mod tests {
             registry.request_cancel(workspace, closed_operation),
             Err(DesktopStateError::OperationNotActive),
             "不可逆边界关闭后不得把取消伪装成已接受"
+        );
+    }
+
+    #[test]
+    fn root_capability_keeps_the_selected_path_out_of_its_view() {
+        let directory = tempfile::tempdir().expect("创建临时目录");
+        let selected = directory.path().join("private-root");
+        fs::create_dir(&selected).expect("创建授权根");
+        let expected = fs::canonicalize(&selected).expect("规范化授权根");
+        let state = DesktopState::default();
+
+        let view = state
+            .register_root_capability(&selected)
+            .expect("原生选择的目录应可登记");
+        let (resolved_view, resolved_path) = state
+            .root_capability(&view.token)
+            .expect("已登记 token 应可由 Rust 解析");
+
+        assert_eq!(resolved_view, view);
+        assert_eq!(resolved_path, expected);
+        let serialized = serde_json::to_string(&view).expect("序列化安全 View");
+        assert!(!serialized.contains(selected.to_string_lossy().as_ref()));
+        assert!(!serialized.contains(expected.to_string_lossy().as_ref()));
+        assert_eq!(
+            state.root_capability("/Users/alice/.ssh/id_ed25519"),
+            Err(DesktopStateError::UnknownRootCapability),
+            "路径绝不能被误当作根能力 token"
         );
     }
 }

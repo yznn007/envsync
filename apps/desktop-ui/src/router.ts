@@ -1,6 +1,8 @@
 import { defineComponent, h } from 'vue'
 import { createRouter, createWebHashHistory } from 'vue-router'
 
+import WorkspacePage from './pages/WorkspacePage.vue'
+
 export const navigationItems = [
   { key: 'workspace', label: '工作区', path: '/' },
   { key: 'changes', label: '变更', path: '/changes' },
@@ -36,7 +38,7 @@ function sectionPage(label: string, key: NavigationKey) {
 const routes = navigationItems.map((item) => ({
   path: item.path,
   name: item.key,
-  component: sectionPage(item.label, item.key),
+  component: item.key === 'workspace' ? WorkspacePage : sectionPage(item.label, item.key),
   meta: { label: item.label },
 }))
 

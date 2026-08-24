@@ -21,8 +21,8 @@ mod support;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use envsync_backend::{Backend, BackendError, LocalBackend};
-use envsync_core::config::WorkspaceConfig;
+use envsync_backend::{Backend, BackendError, GitAuth, LocalBackend};
+use envsync_core::config::{BackendConfig, WorkspaceConfig};
 use envsync_core::ports::FixedClock;
 use envsync_core::service::{EnvSyncService, WorkspaceState};
 use envsync_core::{ApplyCancellation, ApplyOutcome};
@@ -191,6 +191,67 @@ fn init_workspace_writes_a_config_that_loads_back() {
     // 读回的配置可以直接打开服务。
     let service = EnvSyncService::open_with_clock(loaded, Arc::new(FixedClock(FIXED_NOW)));
     assert!(service.is_ok(), "读回的配置必须可用");
+}
+
+/// 桌面端从原生目录选择器取得授权根后，初始化必须使用这条已授权能力，不能悄悄退回
+/// 默认 HOME。配置仍需可以回读并打开 service。
+#[test]
+fn init_workspace_with_selected_root_preserves_the_authorized_root() {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let config_path = dir.path().join("workspace.yaml");
+    let backend_path = dir.path().join("backend");
+    let selected_root = dir.path().join("authorized-root");
+    std::fs::create_dir_all(&selected_root).expect("创建已授权根");
+
+    let created = EnvSyncService::init_workspace_with_root(
+        &config_path,
+        "workstation",
+        &backend_path,
+        &selected_root,
+    )
+    .expect("用已授权根初始化成功");
+    let canonical_root = std::fs::canonicalize(&selected_root).expect("规范化已授权根");
+
+    assert_eq!(
+        created.root_path("home").expect("home 根存在"),
+        canonical_root.as_path()
+    );
+    let loaded = WorkspaceConfig::load(&config_path).expect("配置必须能读回");
+    assert_eq!(
+        loaded.root_path("home").expect("读回的 home 根存在"),
+        canonical_root
+    );
+    assert!(EnvSyncService::open(loaded).is_ok(), "选择的根必须可打开");
+}
+
+/// 桌面端创建 Git 工作区时，只保存受控认证方式与私有 cache 位置；远端 URL 通过 core
+/// 校验，但初始化本身不把任何 token 或私钥写进配置。
+#[test]
+fn init_workspace_with_selected_root_persists_a_git_backend() {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let config_path = dir.path().join("workspace.yaml");
+    let selected_root = dir.path().join("authorized-root");
+    std::fs::create_dir_all(&selected_root).expect("创建已授权根");
+    let cache_dir = dir.path().join("state").join("git-cache");
+    let backend = BackendConfig::Git {
+        remote_url: "ssh://git@example.invalid/envsync.git".to_owned(),
+        branch: "envsync".to_owned(),
+        cache_dir: cache_dir.clone(),
+        auth: GitAuth::SshAgent,
+    };
+
+    let created = EnvSyncService::init_workspace_with_root_and_backend(
+        &config_path,
+        "workstation",
+        backend.clone(),
+        &selected_root,
+    )
+    .expect("Git 配置初始化成功");
+
+    assert_eq!(created.backend, backend);
+    let loaded = WorkspaceConfig::load(&config_path).expect("Git 配置必须可读回");
+    assert_eq!(loaded.backend, backend);
+    assert!(loaded.root_path("home").is_ok());
 }
 
 /// 验收条件：重复 `init` 必须报错且**不覆盖**已有配置。

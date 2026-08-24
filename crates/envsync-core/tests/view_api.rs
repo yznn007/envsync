@@ -5,8 +5,9 @@ mod support;
 use envsync_core::{
     ApiEvent, ApiRequest, ApiRequestId, ApiResponse, ApiResponseError, ApiSchemaVersionError,
     ApplyStartView, ApplyView, CancelOperationRequest, CancellationView, ConflictListView,
-    ConflictView, DiffView, OperationView, PlanView, ResourceStatus, StatusReport, StatusView,
-    ViewDiagnostic, WorkspaceState, WorkspaceSummary, APPLICATION_SERVICE_SCHEMA_VERSION,
+    ConflictView, DiffView, OperationView, PlanView, ResourceStatus, RootCapabilityView,
+    StatusReport, StatusView, ViewDiagnostic, WorkspaceRegistrationView, WorkspaceState,
+    WorkspaceSummary, APPLICATION_SERVICE_SCHEMA_VERSION,
 };
 use envsync_domain::{
     BlobId, ConflictId, ConflictKind, DesiredDisposition, DeviceId, Diagnostic, Digest32,
@@ -295,6 +296,15 @@ fn all_base_views_are_serializable_and_omit_sensitive_content() {
             "local",
         ))
         .expect("工作区摘要可序列化"),
+        serde_json::to_value(WorkspaceRegistrationView::new(
+            WorkspaceSummary::from_status_parts(
+                workspace,
+                DeviceId::derive(b"view-api-onboarding-device"),
+                "local",
+            ),
+            RootCapabilityView::new("cap-root-01", "已授权根目录"),
+        ))
+        .expect("工作区注册 View 可序列化"),
         serde_json::to_value(PlanView::from_plan(&plan)).expect("计划 View 可序列化"),
         serde_json::to_value(DiffView::from_action(&secret_action)).expect("差异 View 可序列化"),
         serde_json::to_value(ConflictView::from_record(&conflict)).expect("冲突 View 可序列化"),
@@ -318,16 +328,23 @@ fn all_base_views_are_serializable_and_omit_sensitive_content() {
             "View 不得包含 canary：{value}"
         );
     }
-    assert_eq!(values[2]["sensitive"], true);
-    assert!(values[2]["before_digest"].is_null());
-    assert!(values[2]["after_digest"].is_null());
-    assert!(values[1]["actions"][0].get("content").is_none());
-    assert_eq!(values[5]["error_code"], "operation.failed");
-    assert!(values[5].get("error_message").is_none());
-    assert_eq!(values[6]["state"], "queued");
-    assert_eq!(values[7]["state"], "requested");
-    assert_eq!(values[8]["outcome"], "completed");
-    assert!(values[8]["operation"].get("error_message").is_none());
+    let onboarding = &values[1];
+    assert_eq!(onboarding["root"]["token"], "cap-root-01");
+    assert_eq!(onboarding["root"]["label"], "已授权根目录");
+    assert!(
+        onboarding["root"].get("path").is_none(),
+        "原生目录选择结果不得把路径交给 UI"
+    );
+    assert_eq!(values[3]["sensitive"], true);
+    assert!(values[3]["before_digest"].is_null());
+    assert!(values[3]["after_digest"].is_null());
+    assert!(values[2]["actions"][0].get("content").is_none());
+    assert_eq!(values[6]["error_code"], "operation.failed");
+    assert!(values[6].get("error_message").is_none());
+    assert_eq!(values[7]["state"], "queued");
+    assert_eq!(values[8]["state"], "requested");
+    assert_eq!(values[9]["outcome"], "completed");
+    assert!(values[9]["operation"].get("error_message").is_none());
 }
 
 fn assert_json_contains(actual: &serde_json::Value, expected: &serde_json::Value, path: &str) {

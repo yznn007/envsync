@@ -6,6 +6,9 @@
   "permissions": [
     "core:event:allow-listen",
     "core:event:allow-unlisten",
+    "allow-onboarding-select-root",
+    "allow-onboarding-create-workspace",
+    "allow-onboarding-open-workspace",
     "allow-workspace-status",
     "allow-workspace-plan",
     "allow-workspace-apply",

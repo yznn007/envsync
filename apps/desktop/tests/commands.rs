@@ -3,7 +3,8 @@
 use envsync_core::ApiRequest;
 use envsync_desktop::{
     commands::{
-        is_allowed_command, ApplyPlanRequest, OperationRequest, WorkspaceRequest, ALLOWED_COMMANDS,
+        is_allowed_command, ApplyPlanRequest, CreateWorkspaceRequest, OperationRequest,
+        WorkspaceRequest, ALLOWED_COMMANDS,
     },
     parse_safe_deep_link, SafeDeepLinkAction,
 };
@@ -14,6 +15,9 @@ fn only_reviewed_application_commands_are_exposed() {
     assert_eq!(
         ALLOWED_COMMANDS,
         [
+            "onboarding_select_root",
+            "onboarding_create_workspace",
+            "onboarding_open_workspace",
             "workspace_status",
             "workspace_plan",
             "workspace_apply",
@@ -70,6 +74,57 @@ fn command_payloads_reject_paths_and_unknown_fields() {
     assert!(
         serde_json::from_value::<ApiRequest<WorkspaceRequest>>(unknown_envelope_field).is_err(),
         "统一信封不得静默接受未知高权限字段"
+    );
+}
+
+#[test]
+fn onboarding_payloads_only_accept_native_root_capabilities() {
+    let unsafe_create = serde_json::json!({
+        "schema_version": 1,
+        "request_id": "req-onboarding-path-injection",
+        "data": {
+            "backend_kind": "local",
+            "device_profile": "workstation",
+            "root_capability_token": "c7a16bdb-57b1-40bb-9cf1-1e42b463a53a",
+            "path": "/Users/alice/.ssh/id_ed25519"
+        }
+    });
+    assert!(
+        serde_json::from_value::<ApiRequest<CreateWorkspaceRequest>>(unsafe_create).is_err(),
+        "首次使用只能引用原生登记的 token，不能把路径传给 command"
+    );
+
+    let direct_path_token = serde_json::json!({
+        "schema_version": 1,
+        "request_id": "req-onboarding-direct-path",
+        "data": {
+            "backend_kind": "local",
+            "device_profile": "workstation",
+            "root_capability_token": "/Users/alice/.ssh/id_ed25519"
+        }
+    });
+    let request = serde_json::from_value::<ApiRequest<CreateWorkspaceRequest>>(direct_path_token)
+        .expect("协议层允许反序列化；原生状态层会拒绝非 token");
+    assert_eq!(
+        request.data().root_capability_token,
+        "/Users/alice/.ssh/id_ed25519"
+    );
+
+    let token_paste = serde_json::json!({
+        "schema_version": 1,
+        "request_id": "req-onboarding-token-paste",
+        "data": {
+            "backend_kind": "git",
+            "device_profile": "workstation",
+            "root_capability_token": "c7a16bdb-57b1-40bb-9cf1-1e42b463a53a",
+            "remote_url": "https://example.invalid/envsync.git",
+            "git_auth": "token-secret-ref",
+            "token": "must-not-be-accepted"
+        }
+    });
+    assert!(
+        serde_json::from_value::<ApiRequest<CreateWorkspaceRequest>>(token_paste).is_err(),
+        "首次使用不得接受 token 或 token-secret-ref 伪装成认证参数"
     );
 }
 

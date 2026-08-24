@@ -35,6 +35,44 @@ impl WorkspaceSummary {
     }
 }
 
+/// 原生层已授权目录的无路径能力摘要。
+///
+/// `token` 只在当前桌面进程中引用 Rust 保存的目录能力，不能反推出路径；`label` 也是
+/// 原生层生成的通用显示名而不是目录文本。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RootCapabilityView {
+    /// 不透明的根能力标识。
+    pub token: String,
+    /// 不含路径的安全显示标签。
+    pub label: String,
+}
+
+impl RootCapabilityView {
+    /// 构造已经由原生层验证过的根能力摘要。
+    pub fn new(token: impl Into<String>, label: impl Into<String>) -> Self {
+        RootCapabilityView {
+            token: token.into(),
+            label: label.into(),
+        }
+    }
+}
+
+/// 首次使用或打开工作区后交给 UI 的安全注册摘要。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WorkspaceRegistrationView {
+    /// 已注册工作区的公开摘要。
+    pub workspace: WorkspaceSummary,
+    /// 本次工作区关联的原生根能力。
+    pub root: RootCapabilityView,
+}
+
+impl WorkspaceRegistrationView {
+    /// 组合已审核的工作区与根能力 View。
+    pub const fn new(workspace: WorkspaceSummary, root: RootCapabilityView) -> Self {
+        WorkspaceRegistrationView { workspace, root }
+    }
+}
+
 /// 单个资源的状态摘要。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ResourceStatusView {
@@ -435,6 +473,8 @@ impl ApplyView {
 }
 
 impl private::Sealed for WorkspaceSummary {}
+impl private::Sealed for RootCapabilityView {}
+impl private::Sealed for WorkspaceRegistrationView {}
 impl private::Sealed for StatusView {}
 impl private::Sealed for PlanView {}
 impl private::Sealed for DiffView {}
@@ -445,6 +485,8 @@ impl private::Sealed for ApplyStartView {}
 impl private::Sealed for CancellationView {}
 impl private::Sealed for ApplyView {}
 impl ViewData for WorkspaceSummary {}
+impl ViewData for RootCapabilityView {}
+impl ViewData for WorkspaceRegistrationView {}
 impl ViewData for StatusView {}
 impl ViewData for PlanView {}
 impl ViewData for DiffView {}

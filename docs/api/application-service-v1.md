@@ -72,6 +72,8 @@ View：
 | View | 用途 | 明确不包含 |
 | --- | --- | --- |
 | `WorkspaceSummary` | 工作区、设备、后端类别 | 后端 URL、凭据、授权根绝对路径 |
+| `RootCapabilityView` | 原生已授权根的进程内令牌与安全标签 | 任何目录路径或可反推路径的文本 |
+| `WorkspaceRegistrationView` | 已注册工作区与其根能力 | 配置路径、状态目录、后端 URL、凭据 |
 | `StatusView` | 状态、ref、资源摘要、未完成操作计数 | 文件内容、诊断正文 |
 | `PlanView` | 计划与动作审核 | Blob ID、文件正文、绝对路径 |
 | `DiffView` | 变化摘要 | 敏感资源的摘要与任何内容 |
@@ -148,3 +150,21 @@ worker 随后发出 `operation.cancelled` 错误事件。发布后或 worker 已
 桌面壳只可传递已注册的 workspace/resource/plan/operation 标识。它不得提供任意文件路径、
 shell 命令、HTTP 请求或 Vault 明文参数。实际 command allowlist、Tauri capability 与参数
 解析将在桌面壳中执行，但必须继续使用本契约的 request、response 和 event 信封。
+
+### 原生首次使用
+
+`onboarding_select_root`、`onboarding_create_workspace` 与 `onboarding_open_workspace` 是
+桌面壳专用的受限扩展，仍使用相同的 v1 信封：
+
+- `onboarding_select_root` 与 `onboarding_open_workspace` 的 `data` 均为空对象。前者只由
+  原生系统 dialog 选取目录并返回 `RootCapabilityView`；后者先由原生 dialog 选取配置，再
+  对配置声明的**每个**授权根要求一次原生重新确认。
+- `onboarding_create_workspace` 只接受不透明的 `root_capability_token`、受限设备显示名与
+  后端意图。Local 后端不接受额外的 Git 字段；Git 后端只接受经校验的远端 URL，以及
+  `ssh-agent` 或 `credential-helper` 两种无明文认证方式。
+- 所有配置、Local backend、Git cache 和状态目录均由 Rust 从应用私有数据目录派生。WebView
+  不得传入、保存或显示目录路径、后端 cache 路径、私钥、密码或访问令牌。
+
+首次创建或打开成功后返回 `WorkspaceRegistrationView`；它只有工作区/设备/后端摘要与一个
+不透明根 token。即使 native 或远端组件返回了额外字段，Vue 端也会只投影该 View 的已审核
+字段，并把失败收敛为稳定诊断码。

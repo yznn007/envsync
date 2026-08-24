@@ -140,6 +140,6 @@ pub use vault::{
 };
 pub use view::{
     ApplyStartView, ApplyView, CancellationView, ConflictListView, ConflictView, DiffView,
-    OperationStatusView, OperationView, PlanActionView, PlanView, ResourceStatusView, StatusView,
-    ViewDiagnostic, WorkspaceSummary,
+    OperationStatusView, OperationView, PlanActionView, PlanView, ResourceStatusView,
+    RootCapabilityView, StatusView, ViewDiagnostic, WorkspaceRegistrationView, WorkspaceSummary,
 };

@@ -18,14 +18,20 @@ name = "envsync-desktop"
 path = "src/main.rs"
 
 [dependencies]
+envsync-backend.workspace = true
 envsync-core.workspace = true
 envsync-domain.workspace = true
+envsync-platform.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tauri.workspace = true
+tauri-plugin-dialog.workspace = true
 tauri-plugin-single-instance.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
 [build-dependencies]
 tauri-build.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
