@@ -110,7 +110,8 @@ cargo test -p envsync-backend --test gist_backend
    GET 重试；所有 API
    请求固定 `Accept: application/vnd.github+json`、`X-GitHub-Api-Version: 2022-11-28`、
    `User-Agent: envsync` 和 `Authorization: Bearer <vault token>`。
-2. POST body 固定为 `public: false`、稳定 description 与从已检查 header 派生的唯一文件名。
+2. POST body 固定为 `public: false`（GitHub 的 secret Gist，而非访问控制意义的 private Gist）、
+   稳定 description 与从已检查 header 派生的唯一文件名。
    POST 成功后只从结构化 JSON 取 id，返回由候选 bundle 构造的**待确认**记录；调用方须显式
    `read()` 取得 authoritative ETag、bundle bytes 和 header。这样 `create` 不会隐式增加一次
    GET，且未确认记录不得作为 `compare_and_swap` 的 expected revision。创建未知结果绝不重试。
@@ -139,7 +140,7 @@ cargo test -p envsync-backend --test gist_backend
    时为 `gist.update_outcome_unknown`。每个失败路径都断言 PATCH 恰好一次，绝不盲重发。
 2. 增加 GET 429 + `Retry-After: 0` 后重试一次的合约；零延迟确保红灯测试不真实 sleep。
    增加 POST 429 和 PATCH 429 合约，二者必须返回 `gist.rate_limited` 且不重放写请求。
-3. 覆盖 PATCH 的 `If-Match`、private 单文件 body、验证读得到的新 ETag，以及错误 `Debug`/
+3. 覆盖 PATCH 的 `If-Match`、secret（`public: false`）单文件 body、验证读得到的新 ETag，以及错误 `Debug`/
    `Display` 不回显 mock 的 response body、URL 或 token。测试只使用 `MockGithub` 的回环端口。
 4. 运行 `cargo test -p envsync-backend --test gist_backend`，记录当前预期红灯；测试不得用
    `#[ignore]`、sleep、真实 GitHub 或伪造 bundle 绕过 `gist_bundle::inspect()`。
@@ -178,8 +179,9 @@ cargo test -p envsync-backend --test gist_backend
 - 修改：`docs/superpowers/plans/2026-07-24-envsync-m4-desktop-gist-plugins.md`
 
 1. 在 Gist 文档增加“HTTP 与凭据”章节：fine-grained token 只需 Gists write、token 用
-   Vault `SecretRef` 注入、Gist 永远 private、5 MiB bundle 与截断 raw 读取策略、ETag 是弱
-   CAS、冲突必须由上层重新同步解决。记录不进行真实 GitHub 调用的测试边界。
+   Vault `SecretRef` 注入、Gist 永远是 secret（`public: false`，不被索引或搜索但不构成访问
+   控制）、5 MiB bundle 与截断 raw 读取策略、ETag 是弱 CAS、冲突必须由上层重新同步解决。
+   记录不进行真实 GitHub 调用的测试边界。
 2. 将 M4 Task 8 的检查项标为完成，并说明它不接入通用 `Backend` trait 的原因。
 3. 运行：
 

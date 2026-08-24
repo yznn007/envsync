@@ -607,7 +607,7 @@ fn create_then_read_then_publish_sends_expected_contract() {
     let create = request_json(&requests[0]);
     assert!(
         create.get("public") == Some(&Value::Bool(false)),
-        "创建请求必须创建私有 Gist"
+        "创建请求必须创建 secret（public:false）Gist"
     );
     assert!(
         create

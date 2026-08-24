@@ -510,7 +510,7 @@ impl GistBackend {
         }
     }
 
-    /// 创建一个非公开 Gist，并返回服务端分配的 Gist 标识。
+    /// 创建一个 secret（`public: false`）Gist，并返回服务端分配的 Gist 标识。
     pub fn create(
         &self,
         credentials: &GistCredentials,

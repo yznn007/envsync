@@ -17,8 +17,11 @@ HTTP、ETag 与 CAS 在后续 Gist backend 中处理。
 ## HTTP 与凭据
 
 Gist 后端只发布一个工作区唯一的 `envsync-<workspace-uuid>.bundle` 文件，并且创建的 Gist
-永远是 private。用于此后端的 fine-grained personal access token 仅授予 **Gists: write** 权限。
-token 只能由 Vault `SecretRef` 注入 HTTP 客户端；它不得写入配置、日志、诊断或错误消息。
+永远是 `secret` Gist（`public: false`）。secret Gist 不会出现在 Discover 或搜索结果中，但这
+不是访问控制：任何持有 URL 的人仍可读取它。因此内容保密必须由密封 bundle 保证，不能把
+Gist 可见性当作权限边界。用于此后端的 fine-grained personal access token 仅授予 **Gists:
+write** 权限。token 只能由 Vault `SecretRef` 注入 HTTP 客户端；它不得写入配置、日志、诊断
+或错误消息。
 
 EnvSync 自己的 encoded bundle 上限为 5 MiB；超过该上限立即拒绝，绝不将内容克隆、缓存或
 转交给其他位置。GitHub Gist API 的读取响应中，每个文件最多提供 1 MiB 的 `content`；若
