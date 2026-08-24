@@ -1,0 +1,18 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "仅允许主窗口调用 EnvSync 审核过的 application-service 命令",
+  "windows": ["main"],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "allow-workspace-status",
+    "allow-workspace-plan",
+    "allow-workspace-apply",
+    "allow-operation-rollback",
+    "allow-conflict-list",
+    "allow-vault-metadata",
+    "allow-bundle-review",
+    "allow-operation-cancel"
+  ]
+}

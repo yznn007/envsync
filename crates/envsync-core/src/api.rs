@@ -4,7 +4,7 @@
 //! 不能意外把领域对象、文件内容或秘密原样序列化到界面层。
 
 use envsync_domain::OperationId;
-use serde::Serialize;
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::view::ViewDiagnostic;
 
@@ -47,6 +47,16 @@ impl ApiRequestId {
     }
 }
 
+impl<'de> Deserialize<'de> for ApiRequestId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        ApiRequestId::parse(value).map_err(serde::de::Error::custom)
+    }
+}
+
 /// 请求标识不符合 API 契约时的原因。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ApiRequestIdError {
@@ -59,6 +69,17 @@ pub enum ApiRequestIdError {
     /// 标识包含未允许的字符。
     #[error("请求标识包含未允许的字符")]
     InvalidCharacter,
+}
+
+/// 请求信封中的 schema 版本不受当前 application service 支持。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ApiSchemaVersionError {
+    /// 收到的版本不是当前稳定版本。
+    #[error("不支持的 application service schema 版本 {received}")]
+    Unsupported {
+        /// 调用方发送的版本号。
+        received: u32,
+    },
 }
 
 /// 应用服务调用的终态。
@@ -93,7 +114,8 @@ pub(crate) mod private {
 ///
 /// 请求负载由具体 command 定义；其版本与请求标识始终位于统一信封中，避免宿主根据
 /// 隐式字段猜测协议版本。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApiRequest<T: Serialize> {
     schema_version: u32,
     request_id: ApiRequestId,
@@ -124,13 +146,27 @@ impl<T: Serialize> ApiRequest<T> {
     pub fn data(&self) -> &T {
         &self.data
     }
+
+    /// 验证调用方使用的是当前稳定 schema。
+    ///
+    /// 该检查与反序列化分离，使命令层仍能回显已验证的请求标识和返回脱敏错误信封。
+    pub fn validate_schema(&self) -> Result<(), ApiSchemaVersionError> {
+        if self.schema_version == APPLICATION_SERVICE_SCHEMA_VERSION {
+            Ok(())
+        } else {
+            Err(ApiSchemaVersionError::Unsupported {
+                received: self.schema_version,
+            })
+        }
+    }
 }
 
 /// `operation.cancel` 命令的受限负载。
 ///
-/// 取消只引用已经登记的操作标识；它不接受路径、命令行或任意内容。实际取消语义由应用
-/// 服务在 journal 安全边界内判断，不能由 UI 直接终止文件事务。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// 取消只引用已经分配给受控 worker 的操作标识；它不接受路径、命令行或任意内容。实际
+/// 取消语义由应用服务在 journal 安全边界内判断，不能由 UI 直接终止文件事务。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CancelOperationRequest {
     operation_id: OperationId,
 }
@@ -218,8 +254,9 @@ impl<T: ViewData> ApiResponse<T> {
 /// 一条版本化的应用服务事件。
 ///
 /// 长操作以此信封推送状态更新。`sequence` 只在同一 `request_id` 内单调递增，消费者可用
-/// 它去重并在事件间出现空洞时重新查询 [`ApiResponse`]。操作更新的 `data` 应使用
-/// [`crate::view::OperationView`]，从而始终带有操作标识且不泄露 journal 错误正文。
+/// 它去重并在事件间出现空洞时重新查询 [`ApiResponse`]。操作更新的 `data` 必须使用审核
+/// 过的 View（例如 [`crate::view::ApplyView`] 或 [`crate::view::OperationView`]），从而不
+/// 泄露 journal 错误正文、文件内容或秘密。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ApiEvent<T: ViewData> {
     schema_version: u32,

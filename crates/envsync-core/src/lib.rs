@@ -67,9 +67,10 @@ pub mod view;
 
 pub use api::{
     ApiEvent, ApiRequest, ApiRequestId, ApiRequestIdError, ApiResponse, ApiResponseError,
-    ApiStatus, CancelOperationRequest, ViewData, APPLICATION_SERVICE_SCHEMA_VERSION,
+    ApiSchemaVersionError, ApiStatus, CancelOperationRequest, ViewData,
+    APPLICATION_SERVICE_SCHEMA_VERSION,
 };
-pub use apply::{ApplyEngine, ApplyOutcome};
+pub use apply::{ApplyCancellation, ApplyEngine, ApplyOutcome, NeverCancelled};
 pub use attestation::{
     sign_index_attestation, verify_index_attestation, AttestationError, ATTESTATION_ALGORITHM,
     ATTESTATION_ALGORITHM_NONE, VAULT_ATTESTATION_DOMAIN,
@@ -138,6 +139,7 @@ pub use vault::{
     WORKSPACE_METADATA_PREFIX,
 };
 pub use view::{
-    ConflictView, DiffView, OperationStatusView, OperationView, PlanActionView, PlanView,
-    ResourceStatusView, StatusView, ViewDiagnostic, WorkspaceSummary,
+    ApplyStartView, ApplyView, CancellationView, ConflictListView, ConflictView, DiffView,
+    OperationStatusView, OperationView, PlanActionView, PlanView, ResourceStatusView, StatusView,
+    ViewDiagnostic, WorkspaceSummary,
 };

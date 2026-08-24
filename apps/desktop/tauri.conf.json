@@ -1,0 +1,32 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "EnvSync",
+  "version": "0.1.0",
+  "identifier": "io.envsync.desktop",
+  "build": {
+    "beforeDevCommand": "pnpm --dir ../desktop-ui dev -- --host 127.0.0.1 --port 1420",
+    "beforeBuildCommand": "pnpm --dir ../desktop-ui build",
+    "devUrl": "http://127.0.0.1:1420",
+    "frontendDist": "../desktop-ui/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "EnvSync",
+        "width": 1180,
+        "height": 760,
+        "minWidth": 760,
+        "minHeight": 560,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self' asset:; base-uri 'none'; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: data: blob:; font-src 'self'; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:1420; frame-src 'none'; form-action 'none'"
+    }
+  },
+  "bundle": {
+    "active": false,
+    "icon": ["icons/icon.png"]
+  }
+}

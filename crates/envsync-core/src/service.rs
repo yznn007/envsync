@@ -33,7 +33,7 @@ use envsync_domain::{
 use envsync_platform::{AuthorizedRoot, RelativeTarget, RootRegistry, SafeWriter};
 use envsync_storage::{ConflictRecord, ConflictStore, DraftStore, Journal, OperationState};
 
-use crate::apply::{ApplyEngine, ApplyOutcome};
+use crate::apply::{ApplyCancellation, ApplyEngine, ApplyOutcome, NeverCancelled};
 use crate::checkpoint::{CheckpointStore, SecureCheckpointStore};
 use crate::config::{BackendConfig, WorkspaceConfig};
 use crate::error::{CoreError, CoreResult};
@@ -675,6 +675,21 @@ impl EnvSyncService {
     /// 启动时自动运行恢复流程（M0 任务 13 的要求），随后校验计划新鲜度：重新生成的
     /// 计划标识必须与提交的一致，否则返回 [`CoreError::StalePlan`]。
     pub fn apply_plan(&mut self, plan_id: PlanId) -> CoreResult<ApplyOutcome> {
+        self.apply_plan_with_operation(plan_id, OperationId::generate(), &NeverCancelled)
+    }
+
+    /// 用调用方预先分配的 operation ID 应用指定计划。
+    ///
+    /// 桌面 worker 会在后台启动时分配 ID，因此 UI 可以在事务完成前订阅事件或请求取消。
+    /// service 仍然负责恢复、重新计划和新鲜度检查；只有计划确认可执行后才登记 journal。
+    /// 登记后，取消会在上传完成后的预检前或后端 Ref 发布前被采纳，并转换为可审计的
+    /// `aborted` 终态。已经发布的 operation 不接受取消，避免把本地收敛留在半状态。
+    pub fn apply_plan_with_operation(
+        &mut self,
+        plan_id: PlanId,
+        operation: OperationId,
+        cancellation: &dyn ApplyCancellation,
+    ) -> CoreResult<ApplyOutcome> {
         // 未解决的冲突一票否决，而且必须排在最前面：此后的任何一步都会动本地文件
         // 或远端 Ref，而「有冲突时两者都不变」是 M1 的硬性承诺。
         let open = self.conflicts_list()?;
@@ -692,10 +707,9 @@ impl EnvSyncService {
             );
         }
 
-        let submitted = self
-            .drafts
-            .get_plan(plan_id)?
-            .ok_or(CoreError::PlanNotFound(plan_id))?;
+        if self.drafts.get_plan(plan_id)?.is_none() {
+            return Err(CoreError::PlanNotFound(plan_id));
+        }
 
         // 重新观察并重新计划；标识不一致即判定失效。
         let current = self.build_plan()?;
@@ -706,8 +720,22 @@ impl EnvSyncService {
             });
         }
 
-        if planner::requires_publish(&submitted) {
-            self.upload_snapshot_closure(submitted.target_snapshot)?;
+        // 先登记再上传：桌面端在这里之后可以可靠地把 operation ID 关联到 journal，并且
+        // 在上传期间发出的取消会由后续安全边界采纳。阻塞/no-op 仍由 ApplyEngine 保持既有
+        // 语义，不产生 operation 记录。
+        {
+            let EnvSyncService { journal, .. } = self;
+            if let Some(outcome) = ApplyEngine::register_operation(journal, &current, operation)? {
+                return Ok(outcome);
+            }
+        }
+
+        if planner::requires_publish(&current) {
+            if let Err(error) = self.upload_snapshot_closure(current.target_snapshot) {
+                let EnvSyncService { journal, .. } = self;
+                ApplyEngine::abort_registered(journal, operation, &error)?;
+                return Err(error);
+            }
         }
 
         let EnvSyncService {
@@ -722,7 +750,7 @@ impl EnvSyncService {
             backend: backend.as_ref(),
         };
         let mut engine = ApplyEngine::new(backend.as_ref(), mutator.as_ref(), journal, &blobs);
-        let outcome = engine.apply(&current)?;
+        let outcome = engine.apply_registered(&current, operation, cancellation)?;
 
         if matches!(outcome, ApplyOutcome::Completed { .. }) {
             self.drafts.clear_head_draft()?;

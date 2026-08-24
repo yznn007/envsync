@@ -1,0 +1,31 @@
+[package]
+name = "envsync-desktop"
+description = "EnvSync 的受限 Tauri 桌面壳"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+build = "build.rs"
+
+[lib]
+name = "envsync_desktop"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[[bin]]
+name = "envsync-desktop"
+path = "src/main.rs"
+
+[dependencies]
+envsync-core.workspace = true
+envsync-domain.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tauri.workspace = true
+tauri-plugin-single-instance.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[build-dependencies]
+tauri-build.workspace = true

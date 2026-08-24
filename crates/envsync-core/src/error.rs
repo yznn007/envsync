@@ -147,6 +147,13 @@ pub enum CoreError {
     #[error("找不到操作 {0}")]
     OperationNotFound(String),
 
+    /// operation 在任何不可逆步骤之前被显式取消。
+    #[error("操作 {operation} 已取消")]
+    OperationCancelled {
+        /// 被取消的操作标识。
+        operation: String,
+    },
+
     /// 引用了不存在的对象。
     #[error("引用了缺失的对象：{0}")]
     MissingObject(String),
@@ -187,6 +194,7 @@ impl CoreError {
             CoreError::UnknownResource(_) => "resource.unknown",
             CoreError::PlanNotFound(_) => "plan.not_found",
             CoreError::OperationNotFound(_) => "operation.not_found",
+            CoreError::OperationCancelled { .. } => "operation.cancelled",
             CoreError::MissingObject(_) => "object.missing",
             CoreError::Invariant(_) => "internal.invariant",
         }

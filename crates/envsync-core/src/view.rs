@@ -4,8 +4,8 @@
 //! 诊断文本。错误文案由宿主按稳定诊断码本地化，避免把外部输入重新带到 UI 输出面。
 
 use envsync_domain::{
-    Action, ActionKind, BackupPolicy, ConflictKind, DesiredDisposition, DeviceId, Diagnostic, Plan,
-    ResolutionChoice, Risk, RollbackCapability, Severity, WorkspaceId,
+    Action, ActionKind, BackupPolicy, ConflictKind, DesiredDisposition, DeviceId, Diagnostic,
+    OperationId, Plan, ResolutionChoice, Risk, RollbackCapability, Severity, WorkspaceId,
 };
 use envsync_storage::{ConflictRecord, OperationRecord};
 use serde::Serialize;
@@ -295,6 +295,25 @@ impl ConflictView {
     }
 }
 
+/// 一个工作区的开放冲突列表。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConflictListView {
+    /// 所属工作区标识。
+    pub workspace: String,
+    /// 仅含无内容摘要的开放冲突。
+    pub conflicts: Vec<ConflictView>,
+}
+
+impl ConflictListView {
+    /// 从本地冲突索引记录构造脱敏列表。
+    pub fn from_records(workspace: WorkspaceId, records: &[ConflictRecord]) -> Self {
+        ConflictListView {
+            workspace: workspace.to_string(),
+            conflicts: records.iter().map(ConflictView::from_record).collect(),
+        }
+    }
+}
+
 /// 一次 journal 操作的无内容摘要。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OperationView {
@@ -335,18 +354,106 @@ impl OperationView {
     }
 }
 
+/// 已接受后台 apply 请求的脱敏摘要。
+///
+/// operation ID 在 worker 创建时就分配，但 journal 只有在 core 完成新鲜度检查后才会出现
+/// 对应记录。因此 UI 应把 `queued` 视为“已接受、等待安全执行”的暂态，并订阅 operation
+/// 事件取得最终 [`ApplyView`] 或失败诊断。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ApplyStartView {
+    /// 后台 worker 预先分配的 operation 标识。
+    pub operation: String,
+    /// 当前固定为 `queued`。
+    pub state: String,
+}
+
+impl ApplyStartView {
+    /// 构造已排入后台 worker 的 apply 摘要。
+    pub fn queued(operation: OperationId) -> Self {
+        ApplyStartView {
+            operation: operation.to_string(),
+            state: "queued".to_owned(),
+        }
+    }
+}
+
+/// 已接受取消请求的脱敏摘要。
+///
+/// `requested` 仅表示令牌已送达后台 worker；core 会在 journal 的安全边界决定是否实际
+/// 中止。若 operation 已越过发布边界或已经结束，command 会返回稳定错误响应而非本 View。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CancellationView {
+    /// 被请求取消的 operation 标识。
+    pub operation: String,
+    /// 当前固定为 `requested`。
+    pub state: String,
+}
+
+impl CancellationView {
+    /// 构造已送达 worker 的取消请求摘要。
+    pub fn requested(operation: OperationId) -> Self {
+        CancellationView {
+            operation: operation.to_string(),
+            state: "requested".to_owned(),
+        }
+    }
+}
+
+/// 提交 Plan 后的脱敏结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ApplyView {
+    /// `no_op` 或 `completed`。
+    pub outcome: String,
+    /// 已登记操作的摘要；无动作时为 `null`。
+    pub operation: Option<OperationView>,
+    /// 本次实际应用的动作数量。
+    pub applied_actions: usize,
+    /// 是否向后端发布新 revision。
+    pub published: bool,
+}
+
+impl ApplyView {
+    /// 构造无需登记 operation 的空计划结果。
+    pub fn no_op() -> Self {
+        ApplyView {
+            outcome: "no_op".to_owned(),
+            operation: None,
+            applied_actions: 0,
+            published: false,
+        }
+    }
+
+    /// 从已完成 operation 的 journal 记录构造结果。
+    pub fn completed(record: &OperationRecord, applied_actions: usize, published: bool) -> Self {
+        ApplyView {
+            outcome: "completed".to_owned(),
+            operation: Some(OperationView::from_record(record)),
+            applied_actions,
+            published,
+        }
+    }
+}
+
 impl private::Sealed for WorkspaceSummary {}
 impl private::Sealed for StatusView {}
 impl private::Sealed for PlanView {}
 impl private::Sealed for DiffView {}
 impl private::Sealed for ConflictView {}
+impl private::Sealed for ConflictListView {}
 impl private::Sealed for OperationView {}
+impl private::Sealed for ApplyStartView {}
+impl private::Sealed for CancellationView {}
+impl private::Sealed for ApplyView {}
 impl ViewData for WorkspaceSummary {}
 impl ViewData for StatusView {}
 impl ViewData for PlanView {}
 impl ViewData for DiffView {}
 impl ViewData for ConflictView {}
+impl ViewData for ConflictListView {}
 impl ViewData for OperationView {}
+impl ViewData for ApplyStartView {}
+impl ViewData for CancellationView {}
+impl ViewData for ApplyView {}
 
 fn disposition_name(disposition: DesiredDisposition) -> &'static str {
     match disposition {

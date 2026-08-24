@@ -3,7 +3,8 @@
 mod support;
 
 use envsync_core::{
-    ApiEvent, ApiRequest, ApiRequestId, ApiResponse, ApiResponseError, CancelOperationRequest,
+    ApiEvent, ApiRequest, ApiRequestId, ApiResponse, ApiResponseError, ApiSchemaVersionError,
+    ApplyStartView, ApplyView, CancelOperationRequest, CancellationView, ConflictListView,
     ConflictView, DiffView, OperationView, PlanView, ResourceStatus, StatusReport, StatusView,
     ViewDiagnostic, WorkspaceState, WorkspaceSummary, APPLICATION_SERVICE_SCHEMA_VERSION,
 };
@@ -90,6 +91,35 @@ fn request_is_explicitly_versioned_and_keeps_an_opaque_workspace_handle() {
     assert_eq!(json["schema_version"], APPLICATION_SERVICE_SCHEMA_VERSION);
     assert_eq!(json["request_id"], "req-workspace-status-v1");
     assert_eq!(json["data"], "workspace-handle-01");
+}
+
+/// IPC 反序列化不能绕过 request ID 的字符约束；宿主也必须能在回显请求 ID 后，明确拒绝
+/// 不受支持的 schema，而不是把它当成当前版本继续处理。
+#[test]
+fn deserialized_request_validates_id_and_schema_version() {
+    let invalid_id = serde_json::json!({
+        "schema_version": APPLICATION_SERVICE_SCHEMA_VERSION,
+        "request_id": "req-status\nsecret",
+        "data": { "workspace_handle": "workspace-01" }
+    });
+    assert!(
+        serde_json::from_value::<ApiRequest<serde_json::Value>>(invalid_id).is_err(),
+        "反序列化不得绕过 request ID 校验"
+    );
+
+    let future_schema = serde_json::json!({
+        "schema_version": APPLICATION_SERVICE_SCHEMA_VERSION + 1,
+        "request_id": "req-future-schema",
+        "data": { "workspace_handle": "workspace-01" }
+    });
+    let request = serde_json::from_value::<ApiRequest<serde_json::Value>>(future_schema)
+        .expect("未来 schema 的信封形状仍可解析，以便安全回显请求 ID");
+    assert_eq!(
+        request.validate_schema(),
+        Err(ApiSchemaVersionError::Unsupported {
+            received: APPLICATION_SERVICE_SCHEMA_VERSION + 1,
+        })
+    );
 }
 
 /// 失败响应和成功响应共用一个稳定信封；失败时不允许伪装成含数据的成功响应，也不能
@@ -268,7 +298,18 @@ fn all_base_views_are_serializable_and_omit_sensitive_content() {
         serde_json::to_value(PlanView::from_plan(&plan)).expect("计划 View 可序列化"),
         serde_json::to_value(DiffView::from_action(&secret_action)).expect("差异 View 可序列化"),
         serde_json::to_value(ConflictView::from_record(&conflict)).expect("冲突 View 可序列化"),
+        serde_json::to_value(ConflictListView::from_records(
+            workspace,
+            std::slice::from_ref(&conflict),
+        ))
+        .expect("冲突列表 View 可序列化"),
         serde_json::to_value(OperationView::from_record(&operation)).expect("操作 View 可序列化"),
+        serde_json::to_value(ApplyStartView::queued(operation.operation))
+            .expect("后台 apply 起始 View 可序列化"),
+        serde_json::to_value(CancellationView::requested(operation.operation))
+            .expect("取消请求 View 可序列化"),
+        serde_json::to_value(ApplyView::completed(&operation, 1, true))
+            .expect("应用 View 可序列化"),
     ];
 
     for value in &values {
@@ -281,8 +322,12 @@ fn all_base_views_are_serializable_and_omit_sensitive_content() {
     assert!(values[2]["before_digest"].is_null());
     assert!(values[2]["after_digest"].is_null());
     assert!(values[1]["actions"][0].get("content").is_none());
-    assert_eq!(values[4]["error_code"], "operation.failed");
-    assert!(values[4].get("error_message").is_none());
+    assert_eq!(values[5]["error_code"], "operation.failed");
+    assert!(values[5].get("error_message").is_none());
+    assert_eq!(values[6]["state"], "queued");
+    assert_eq!(values[7]["state"], "requested");
+    assert_eq!(values[8]["outcome"], "completed");
+    assert!(values[8]["operation"].get("error_message").is_none());
 }
 
 fn assert_json_contains(actual: &serde_json::Value, expected: &serde_json::Value, path: &str) {

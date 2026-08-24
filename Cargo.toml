@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "apps/desktop",
     "crates/envsync-adapters",
     "crates/envsync-domain",
     "crates/envsync-backend",
@@ -48,6 +49,9 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+tauri = { version = "2.11.5", default-features = false, features = ["wry"] }
+tauri-build = "2.6.3"
+tauri-plugin-single-instance = "2.4.3"
 
 # 密码学依赖：全部来自 RustCrypto / dalek 生态，不自研原语。
 ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }

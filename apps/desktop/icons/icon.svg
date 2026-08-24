@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="EnvSync">
+  <rect width="512" height="512" rx="112" fill="#102a43"/>
+  <path d="M128 214c18-69 89-110 158-92 35 9 64 33 81 65" fill="none" stroke="#7dd3c7" stroke-linecap="round" stroke-width="42"/>
+  <path d="m340 137 42 57-71 8" fill="#7dd3c7"/>
+  <path d="M384 298c-18 69-89 110-158 92-35-9-64-33-81-65" fill="none" stroke="#e6f6f2" stroke-linecap="round" stroke-width="42"/>
+  <path d="m172 375-42-57 71-8" fill="#e6f6f2"/>
+</svg>

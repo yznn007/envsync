@@ -25,7 +25,7 @@ use envsync_backend::{Backend, BackendError, LocalBackend};
 use envsync_core::config::WorkspaceConfig;
 use envsync_core::ports::FixedClock;
 use envsync_core::service::{EnvSyncService, WorkspaceState};
-use envsync_core::ApplyOutcome;
+use envsync_core::{ApplyCancellation, ApplyOutcome};
 use envsync_domain::{
     BlobId, DesiredDisposition, FileMode, ObjectId, PlanId, SnapshotId, StateRootId,
 };
@@ -431,6 +431,42 @@ fn apply_plan_rejects_an_unknown_plan_id() {
         .expect_err("未知计划必须被拒绝");
     assert_eq!(error.code(), "plan.not_found");
     assert_eq!(world.revision(), 0, "被拒绝的计划不得发布");
+}
+
+/// 桌面后台 worker 预先分配的 operation ID 必须原样进入 journal；若 UI 在 publish 前已经
+/// 请求取消，则事务留下 aborted 审计记录且后端 Ref 不前进。
+#[test]
+fn apply_plan_with_operation_id_honours_cancellation_before_publish() {
+    struct AlreadyCancelled;
+
+    impl ApplyCancellation for AlreadyCancelled {
+        fn is_cancelled(&self) -> bool {
+            true
+        }
+    }
+
+    let world = World::new();
+    let device = world.device("one", SEED_A);
+    seed_device_one(&device, BLOCK_V1);
+    let mut service = device.service();
+    service.capture().expect("capture");
+    let plan = service.build_plan().expect("build_plan");
+    let operation = "12345678-1234-4234-8234-123456789abc"
+        .parse()
+        .expect("固定 operation 标识有效");
+
+    let error = service
+        .apply_plan_with_operation(plan.id(), operation, &AlreadyCancelled)
+        .expect_err("取消必须阻止 publish");
+
+    assert_eq!(error.code(), "operation.cancelled");
+    assert_eq!(world.revision(), 0, "取消前不得推进后端 Ref");
+    let record = service
+        .journal()
+        .operation(operation)
+        .expect("读取 operation")
+        .expect("取消仍必须留下 journal 记录");
+    assert_eq!(record.state, OperationState::Aborted);
 }
 
 /// 验收条件：应用前文件被外部修改时 Plan 失效（设计文档 §12）。
