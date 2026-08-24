@@ -198,26 +198,15 @@ fn read_timeout_is_reported_without_echoing_endpoint() {
 #[test]
 fn read_rejects_oversized_response_before_json_parsing() {
     let mock = MockGithub::start().expect("启动 GitHub mock");
-    let (workspace, bundle, _) = sealed_bundles();
-    let filename = gist_bundle_filename(workspace);
+    let workspace = WorkspaceId::generate();
     let sentinel = "oversized-body-must-not-appear";
-    let oversized = sentinel.repeat((MAX_ENCODED_BUNDLE_LEN + 128 * 1024) / sentinel.len() + 1);
     mock.enqueue(
-        ResponseSpec::new(200).body(
-            json!({
-                "id": "gist-123",
-                "files": {
-                    filename: {
-                        "truncated": false,
-                        "content": bundle,
-                    }
-                },
-                "padding": oversized,
-            })
-            .to_string(),
-        ),
+        ResponseSpec::new(200)
+            .body(sentinel)
+            .declared_content_length(MAX_ENCODED_BUNDLE_LEN + 128 * 1024 + 1)
+            .delay_after_headers(Duration::from_millis(200)),
     );
-    let backend = GistBackend::with_api_base(mock.base_url(), Duration::from_millis(100))
+    let backend = GistBackend::with_api_base(mock.base_url(), Duration::from_millis(25))
         .expect("构造 Gist 后端");
 
     let error = backend
@@ -229,33 +218,51 @@ fn read_rejects_oversized_response_before_json_parsing() {
 
 #[test]
 fn truncated_gist_file_uses_allowed_uncredentialed_raw_url() {
-    let mock = MockGithub::start().expect("启动 GitHub mock");
-    let (workspace, bundle, _) = sealed_bundles();
+    let mock = match MockGithub::start() {
+        Ok(mock) => mock,
+        Err(_) => panic!("启动 GitHub mock 失败"),
+    };
+    let (workspace, bundle_v1, bundle_v2) = sealed_bundles();
     let filename = gist_bundle_filename(workspace);
-    let raw_url = format!("{}/raw/gist-123/{}", mock.base_url(), filename);
-    let mut raw_file = NamedTempFile::new().expect("创建临时 raw bundle 文件");
-    raw_file
-        .write_all(bundle.as_bytes())
-        .expect("写入临时 raw bundle 文件");
+    let raw_path = format!("/raw/gist-123/{filename}");
+    let raw_url = format!("{}{raw_path}", mock.base_url());
+    let mut raw_file = match NamedTempFile::new() {
+        Ok(file) => file,
+        Err(_) => panic!("创建临时 raw bundle 文件失败"),
+    };
+    match raw_file.write_all(bundle_v2.as_bytes()) {
+        Ok(()) => {}
+        Err(_) => panic!("写入临时 raw bundle 文件失败"),
+    }
     mock.enqueue(
         ResponseSpec::new(200)
             .header("etag", "\"v1\"")
             .body(truncated_gist_response(
-                "gist-123", &filename, &raw_url, &bundle,
+                "gist-123", &filename, &raw_url, &bundle_v1,
             )),
     );
     mock.enqueue(ResponseSpec::new(200).body_file(raw_file.path()));
-    let backend = GistBackend::with_api_base(mock.base_url(), Duration::from_millis(100))
-        .expect("构造 Gist 后端");
+    let backend = match GistBackend::with_api_base(mock.base_url(), Duration::from_millis(100)) {
+        Ok(backend) => backend,
+        Err(_) => panic!("构造 Gist 后端失败"),
+    };
 
-    let record = backend
-        .read(&credentials(), &gist_id(), workspace)
-        .expect("允许的 raw URL 必须返回完整 bundle");
-    let expected_header = gist_inspect(&bundle).expect("读取测试 bundle header");
+    let record = match backend.read(&credentials(), &gist_id(), workspace) {
+        Ok(record) => record,
+        Err(_) => panic!("允许的 raw URL 未返回完整 bundle"),
+    };
+    let expected_header = match gist_inspect(&bundle_v2) {
+        Ok(header) => header,
+        Err(_) => panic!("读取测试 bundle header 失败"),
+    };
 
     assert!(
-        record.encoded().as_bytes() == bundle.as_bytes(),
-        "raw 响应必须保留完整 bundle 字节"
+        bundle_v1.as_bytes() != bundle_v2.as_bytes(),
+        "fixture 必须提供不同版本的 bundle"
+    );
+    assert!(
+        record.encoded().as_bytes() == bundle_v2.as_bytes(),
+        "raw 响应必须采用 V2 bundle"
     );
     assert!(
         record.revision().header() == &expected_header,
@@ -270,6 +277,8 @@ fn truncated_gist_file_uses_allowed_uncredentialed_raw_url() {
         requests[0].header("authorization") == Some("Bearer test-token"),
         "初始 API 请求必须携带 Authorization"
     );
+    assert!(requests[1].method == "GET", "raw 请求必须使用 GET");
+    assert!(requests[1].path == raw_path, "raw 请求必须访问预期路径");
     assert!(
         requests[1].header("authorization").is_none(),
         "raw 请求不得携带 Authorization"

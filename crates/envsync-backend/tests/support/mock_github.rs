@@ -86,6 +86,8 @@ pub struct ResponseSpec {
     pub headers: BTreeMap<String, String>,
     pub body: ResponseBody,
     pub delay: Option<Duration>,
+    pub declared_content_length: Option<usize>,
+    pub delay_after_headers: Option<Duration>,
     pub disconnect: bool,
 }
 
@@ -97,6 +99,8 @@ impl fmt::Debug for ResponseSpec {
             .field("headers", &header_names)
             .field("body", &self.body)
             .field("delay", &self.delay)
+            .field("declared_content_length", &self.declared_content_length)
+            .field("delay_after_headers", &self.delay_after_headers)
             .field("disconnect", &self.disconnect)
             .finish()
     }
@@ -109,6 +113,8 @@ impl ResponseSpec {
             headers: BTreeMap::new(),
             body: ResponseBody::Empty,
             delay: None,
+            declared_content_length: None,
+            delay_after_headers: None,
             disconnect: false,
         }
     }
@@ -131,6 +137,16 @@ impl ResponseSpec {
 
     pub fn delay(mut self, delay: Duration) -> Self {
         self.delay = Some(delay);
+        self
+    }
+
+    pub fn declared_content_length(mut self, content_length: usize) -> Self {
+        self.declared_content_length = Some(content_length);
+        self
+    }
+
+    pub fn delay_after_headers(mut self, delay: Duration) -> Self {
+        self.delay_after_headers = Some(delay);
         self
     }
 
@@ -186,11 +202,26 @@ impl MockGithub {
                             continue;
                         }
 
-                        let (status, body) = match response.body.into_bytes() {
-                            Ok(body) => (response.status, body),
-                            Err(_) => (500, Vec::new()),
-                        };
-                        let _ = write_response(&mut stream, status, &response.headers, &body);
+                        let (status, body, declared_content_length) =
+                            match response.body.into_bytes() {
+                                Ok(body) => {
+                                    let declared_content_length =
+                                        response.declared_content_length.unwrap_or(body.len());
+                                    (response.status, body, declared_content_length)
+                                }
+                                Err(_) => (500, Vec::new(), 0),
+                            };
+                        let _ = write_response_headers(
+                            &mut stream,
+                            status,
+                            &response.headers,
+                            declared_content_length,
+                        );
+                        let _ = stream.flush();
+                        if let Some(delay) = response.delay_after_headers {
+                            thread::sleep(delay);
+                        }
+                        let _ = stream.write_all(&body);
                         let _ = stream.flush();
                         let _ = stream.shutdown(Shutdown::Both);
                     }
@@ -343,16 +374,16 @@ fn trim_cr(bytes: &[u8]) -> &[u8] {
     bytes.strip_suffix(b"\r").unwrap_or(bytes)
 }
 
-fn write_response(
+fn write_response_headers(
     stream: &mut TcpStream,
     status: u16,
     headers: &BTreeMap<String, String>,
-    body: &[u8],
+    content_length: usize,
 ) -> io::Result<()> {
     let mut response = Vec::new();
     response
         .extend_from_slice(format!("HTTP/1.1 {} {}\r\n", status, status_text(status)).as_bytes());
-    response.extend_from_slice(format!("content-length: {}\r\n", body.len()).as_bytes());
+    response.extend_from_slice(format!("content-length: {}\r\n", content_length).as_bytes());
     response.extend_from_slice(b"connection: close\r\n");
     for (name, value) in headers {
         response.extend_from_slice(name.as_bytes());
@@ -361,7 +392,6 @@ fn write_response(
         response.extend_from_slice(b"\r\n");
     }
     response.extend_from_slice(b"\r\n");
-    response.extend_from_slice(body);
     stream.write_all(&response)
 }
 
