@@ -47,6 +47,31 @@ fn sealed_bundle_versions() -> (WorkspaceId, String, String, String) {
     (workspace, bundle_v1, bundle_v2, bundle_v3)
 }
 
+fn sealed_bundle_same_ref_ciphertext_variants() -> (WorkspaceId, String, String, String) {
+    let workspace = WorkspaceId::generate();
+    let data_key = DataKey::generate().expect("生成测试数据密钥");
+    let device = DeviceKeypair::generate().expect("生成测试设备密钥");
+    let signer = GistBundleSigner::from_m2(Some(&data_key), Some(KeyEpoch::INITIAL), Some(&device))
+        .expect("构造测试签名器");
+
+    let bundle_v1 = sealed_bundle(
+        workspace,
+        WorkspaceRef::initial(workspace),
+        &signer,
+        &device,
+    );
+    let reference_v1 = WorkspaceRef::initial(workspace).advance(snapshot_id(workspace, &device, 1));
+    let candidate = sealed_bundle(workspace, reference_v1.clone(), &signer, &device);
+    let same_ref_different_ciphertext = sealed_bundle(workspace, reference_v1, &signer, &device);
+
+    (
+        workspace,
+        bundle_v1,
+        candidate,
+        same_ref_different_ciphertext,
+    )
+}
+
 fn sealed_bundle(
     workspace: WorkspaceId,
     previous: WorkspaceRef,
@@ -179,6 +204,27 @@ fn assert_cas_requests(
             ]),
         "CAS 分支必须按 GET、PATCH、GET 顺序请求"
     );
+    assert_cas_patch_and_verify_requests(&requests[1..], expected_etag, filename, candidate);
+}
+
+fn assert_cas_patch_and_verify_requests(
+    requests: &[support::mock_github::RequestRecord],
+    expected_etag: &str,
+    filename: &str,
+    candidate: &str,
+) {
+    assert_eq!(
+        requests.len(),
+        2,
+        "连续 CAS 的后续轮次必须恰好发送 PATCH、GET 两个请求"
+    );
+    assert!(
+        requests
+            .iter()
+            .map(|request| (request.method.as_str(), request.path.as_str()))
+            .eq([("PATCH", "/gists/gist-123"), ("GET", "/gists/gist-123")]),
+        "连续 CAS 的后续轮次必须按 PATCH、GET 顺序请求"
+    );
     assert_eq!(
         requests
             .iter()
@@ -187,7 +233,7 @@ fn assert_cas_requests(
         1,
         "每个 CAS 分支都只能 PATCH 一次，绝不能盲重发"
     );
-    let patch = &requests[1];
+    let patch = &requests[0];
     assert_eq!(patch.header("if-match"), Some(expected_etag));
     let body = request_json(patch);
     assert_eq!(body.get("public"), None, "PATCH body 不得改变 Gist 可见性");
@@ -698,7 +744,7 @@ fn cas_success_verifies_complete_candidate_and_returns_new_etag() {
     let requests = mock.wait_for_requests(5, Duration::from_millis(200));
     assert_eq!(requests.len(), 5, "连续两次 CAS 必须恰好发送五个请求");
     assert_cas_requests(&requests[..3], "\"v1\"", &filename, &bundle_v2);
-    assert_cas_requests(&requests[3..], "\"v2\"", &filename, &bundle_v3);
+    assert_cas_patch_and_verify_requests(&requests[3..], "\"v2\"", &filename, &bundle_v3);
 }
 
 #[test]
@@ -855,6 +901,53 @@ fn cas_verifies_other_valid_bundle_as_conflict_once() {
 }
 
 #[test]
+fn cas_verifies_same_ref_different_ciphertext_as_conflict_once() {
+    let mock = MockGithub::start().expect("启动 GitHub mock");
+    let (workspace, bundle_v1, candidate, same_ref_different_ciphertext) =
+        sealed_bundle_same_ref_ciphertext_variants();
+    let filename = gist_bundle_filename(workspace);
+    let candidate_header = gist_inspect(&candidate).expect("候选 bundle 必须可由生产路径检查");
+    let observed_header = gist_inspect(&same_ref_different_ciphertext)
+        .expect("验证读取的 bundle 必须可由生产路径检查");
+    assert_ne!(
+        candidate.as_bytes(),
+        same_ref_different_ciphertext.as_bytes(),
+        "同一 ref 的两次真实密封必须产生不同 ciphertext bytes"
+    );
+    assert_eq!(candidate_header.workspace, observed_header.workspace);
+    assert_eq!(candidate_header.revision, observed_header.revision);
+    assert_eq!(candidate_header.head, observed_header.head);
+
+    mock.enqueue(
+        ResponseSpec::new(200)
+            .header("etag", "\"v1\"")
+            .body(gist_response("gist-123", &filename, &bundle_v1)),
+    );
+    mock.enqueue(ResponseSpec::new(200).body(json!({ "id": "gist-123" }).to_string()));
+    mock.enqueue(
+        ResponseSpec::new(200)
+            .header("etag", "\"v2\"")
+            .body(gist_response(
+                "gist-123",
+                &filename,
+                &same_ref_different_ciphertext,
+            )),
+    );
+    let backend = GistBackend::with_api_base(mock.base_url(), Duration::from_millis(100))
+        .expect("构造 Gist 后端");
+    let credentials = credentials();
+    let read = read_for_cas(&backend, &credentials, workspace);
+
+    let error = backend
+        .compare_and_swap(&credentials, read.revision(), &candidate)
+        .expect_err("验证读取同 ref 但不同 bytes 的合法 bundle 时必须报告 CAS 冲突");
+
+    assert_safe_error(&error, "gist.cas_conflict", &same_ref_different_ciphertext);
+    let requests = mock.wait_for_requests(3, Duration::from_millis(200));
+    assert_cas_requests(&requests, "\"v1\"", &filename, &candidate);
+}
+
+#[test]
 fn cas_5xx_verifies_old_bundle_once_and_reports_conflict_without_leaks() {
     let mock = MockGithub::start().expect("启动 GitHub mock");
     let endpoint = mock.base_url();
@@ -945,7 +1038,7 @@ fn read_retries_once_after_zero_retry_after_without_real_wait() {
 
     assert_eq!(record.encoded().as_bytes(), bundle.as_bytes());
     assert!(
-        elapsed < Duration::from_millis(500),
+        elapsed < Duration::from_millis(75),
         "Retry-After: 0 不得触发固定真实退避；实际耗时：{elapsed:?}"
     );
     let requests = mock.wait_for_requests(2, Duration::from_millis(200));

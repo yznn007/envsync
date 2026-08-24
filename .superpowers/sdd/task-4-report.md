@@ -102,3 +102,64 @@
      为 `gist.rate_limited`，尚未按 `Retry-After: 0` 立即额外 GET 一次。
 
 所有失败均为预期生产功能红灯；未发现测试编译失败、无效 fixture、Mock 超时或真实等待。
+
+## 红灯合约复审修复（Critical / Important / Minor）
+
+- 连续 CAS 现在精确断言五个请求：初始 `GET`、第一轮 `PATCH → GET`、第二轮
+  `PATCH → GET`。第二轮使用专门的两请求 helper，明确检查其 PATCH 的
+  `If-Match: "v2"`，不再把两请求切片传给要求 `GET → PATCH → GET` 的 helper。
+- 新增同一真实 `sealed_bundle` / `pack` 路径的重封装覆盖：候选与验证读取 bundle 的
+  `workspace`、`revision`、`head` 完全相同，且显式确认 ciphertext bytes 不同；该合法
+  但非完整字节相同的验证结果必须是 `gist.cas_conflict`。未伪造文本。
+- `Retry-After: 0` 的总耗时上限由 500ms 收紧为 `< 75ms`。聚焦红灯测试在本机 mock
+  调度下完成约 20ms；75ms 留出回环调度余量，同时固定 100ms 或 250ms backoff 必然超限。
+  Task 5 将以 fake Sleeper 覆盖内部精确等待；本集成测试继续只防止实质真实等待。
+- 澄清 PATCH body 合约：PATCH 仅更新一个目标文件，且不得携带 `public` 或改变 Gist
+  可见性；它**不是**要求 PATCH body 包含 `public: false`。`public: false` 只属于创建
+  私有 Gist 的 POST 合约。
+
+## 复审后验证结果
+
+执行时间：2026-08-25（Asia/Shanghai）
+
+`cargo fmt --check`
+
+- 通过（退出码 0）。
+
+聚焦测量：
+
+- `cargo test -p envsync-backend --test gist_backend
+  truncated_gist_file_uses_allowed_uncredentialed_raw_url -- --exact --nocapture` 通过；测试自身
+  完成时间为 0.02s（两次本机 MockGithub GET）。
+- 新增 `cas_verifies_same_ref_different_ciphertext_as_conflict_once` 的聚焦红灯在 0.02s
+  完成；它先验证同 ref 真实重封装的不同 bytes，再因现有 CAS 返回
+  `gist.not_implemented` 而失败。75ms 门槛相对该本机基线保留余量，并会拒绝 100ms/250ms
+  的固定真实等待。
+
+`cargo test -p envsync-backend --test gist_backend`
+
+- 总计：25；通过：12；失败：13；忽略：0；过滤：0；测试执行时间：0.24s。
+- 精确预期红灯：
+  - `cas_success_verifies_complete_candidate_and_returns_new_etag`、
+    `cas_412_verifies_candidate_once_and_reports_published`、
+    `cas_disconnect_verifies_candidate_once_and_reports_published`、
+    `cas_412_with_failed_verification_reports_unknown_once`、
+    `cas_disconnect_with_failed_verification_reports_unknown_once`：CAS 仍返回
+    `gist.not_implemented`，尚未完成 PATCH 后验证。
+  - `old_verify_read_after_patch_is_a_cas_conflict_without_patch_retry`、
+    `cas_verifies_other_valid_bundle_as_conflict_once`、
+    `cas_verifies_same_ref_different_ciphertext_as_conflict_once`、
+    `cas_5xx_verifies_old_bundle_once_and_reports_conflict_without_leaks`：CAS 仍返回
+    `gist.not_implemented`，尚未将验证读取的非候选完整 bytes 映射为
+    `gist.cas_conflict`。
+  - `cas_5xx_with_failed_verification_reports_unknown_once_without_leaks`：CAS 仍返回
+    `gist.not_implemented`，尚未将失败验证映射为 `gist.update_outcome_unknown`。
+  - `cas_patch_429_is_rate_limited_and_never_replays_patch`：CAS 尚未发送 PATCH，当前返回
+    `gist.not_implemented`，尚未映射为 `gist.rate_limited`。
+  - `create_then_read_then_publish_sends_expected_contract`：发布步骤仍返回
+    `gist.not_implemented`。
+  - `read_retries_once_after_zero_retry_after_without_real_wait`：GET 429 当前直接返回
+    `gist.rate_limited`，尚未立即重试一次。
+
+除上述生产实现缺口外，未出现测试编译失败、fixture 无效、Mock 超时、真实网络或测试内
+sleep。
