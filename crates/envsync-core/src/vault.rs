@@ -65,7 +65,7 @@ use envsync_domain::object::{ObjectId, ObjectKind, StateRoot};
 use envsync_domain::snapshot::{SnapshotBody, SnapshotSignature, WorkspaceRef};
 use envsync_platform::secure_store::{SecureKey, SecurePurpose, SecureStore};
 use envsync_storage::{DraftStore, RotationJournal};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::checkpoint::{advance as advance_checkpoint, Checkpoint, CheckpointStore};
 use crate::error::{CoreError, CoreResult};
@@ -282,13 +282,13 @@ impl SecretInput {
     /// 而 `printf 'a\n\n'` 仍然保留第二个换行——多吃一个字节会静默改变秘密内容。
     pub fn from_reader<R: Read + ?Sized>(reader: &mut R) -> CoreResult<Self> {
         // 多读一个字节，用来把「恰好等于上限」和「超过上限」区分开。
-        let mut buffer = Vec::new();
+        let mut buffer = Zeroizing::new(Vec::new());
         let read = reader
             .take((MAX_PLAINTEXT_LEN + 1) as u64)
             .read_to_end(&mut buffer)
             .map_err(|error| envsync_platform::PlatformError::io("读取秘密输入", &error))?;
         if read > MAX_PLAINTEXT_LEN {
-            buffer.clear();
+            buffer.zeroize();
             return Err(VaultError::ValueTooLarge {
                 limit: MAX_PLAINTEXT_LEN,
             }
@@ -312,8 +312,7 @@ impl SecretInput {
         let value = std::env::var(name).map_err(|_| VaultError::EnvVarMissing {
             name: name.to_owned(),
         })?;
-        let bytes = Zeroizing::new(value.into_bytes());
-        Self::from_bytes(bytes.to_vec())
+        Self::from_bytes(Zeroizing::new(value.into_bytes()))
     }
 
     /// 通过交互式隐藏输入读取。
@@ -321,8 +320,7 @@ impl SecretInput {
     where
         P: HiddenPrompt + ?Sized,
     {
-        let bytes = prompt.read_hidden(label)?;
-        Self::from_bytes(bytes.to_vec())
+        Self::from_bytes(prompt.read_hidden(label)?)
     }
 
     /// 值的字节长度。长度是元数据，不是秘密。
@@ -336,7 +334,7 @@ impl SecretInput {
     }
 
     /// 共同的字节校验与规范化。
-    fn from_bytes(mut bytes: Vec<u8>) -> CoreResult<Self> {
+    fn from_bytes(mut bytes: Zeroizing<Vec<u8>>) -> CoreResult<Self> {
         if bytes.ends_with(b"\n") {
             bytes.pop();
             if bytes.ends_with(b"\r") {
@@ -347,14 +345,14 @@ impl SecretInput {
             return Err(VaultError::EmptyValue.into());
         }
         if bytes.len() > MAX_PLAINTEXT_LEN {
-            bytes.clear();
+            bytes.zeroize();
             return Err(VaultError::ValueTooLarge {
                 limit: MAX_PLAINTEXT_LEN,
             }
             .into());
         }
         Ok(SecretInput {
-            plaintext: Plaintext::from_vec(bytes),
+            plaintext: Plaintext::from_vec(bytes.to_vec()),
         })
     }
 
@@ -1667,6 +1665,13 @@ mod tests {
         assert_eq!(error.code(), "vault.empty_value");
         let error = err(SecretInput::from_reader(&mut &b"\n"[..]));
         assert_eq!(error.code(), "vault.empty_value");
+    }
+
+    #[test]
+    fn secret_input_rejects_over_limit_value_without_retaining_the_buffer() {
+        let oversized = vec![b'x'; MAX_PLAINTEXT_LEN + 1];
+        let error = err(SecretInput::from_reader(&mut oversized.as_slice()));
+        assert_eq!(error.code(), "vault.value_too_large");
     }
 
     #[test]

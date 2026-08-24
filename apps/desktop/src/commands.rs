@@ -3,7 +3,6 @@
 //! 所有 command 都只接收 API v1 信封、强类型 ID 与已注册 workspace；本模块没有任意
 //! 路径、shell、HTTP 或 Vault 明文入口。失败一律映射成脱敏的 [`ApiResponse`]。
 
-use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::thread;
 
@@ -15,16 +14,14 @@ use envsync_core::{
     ApplyStartView, ApplyView, CancellationView, ConflictDetailView, ConflictListView,
     ConflictResolutionView, CoreError, CoreResult, DeviceListView, DeviceRevocationView,
     DiffListView, EnvSyncService, OperationDetailView, OperationHistoryView, OperationView,
-    PlanView, RollbackReviewView, RootCapabilityView, SecretInput, StatusView, VaultMetadataView,
-    VaultSetView, ViewData, ViewDiagnostic, WorkspaceConfig, WorkspaceRegistrationView,
-    WorkspaceSummary,
+    PlanView, RollbackReviewView, RootCapabilityView, StatusView, VaultMetadataView, ViewData,
+    ViewDiagnostic, WorkspaceConfig, WorkspaceRegistrationView, WorkspaceSummary,
 };
 use envsync_domain::{ConflictId, OperationId, PlanId, ResolutionChoice, WorkspaceId};
 use envsync_platform::AuthorizedRoot;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::{DialogExt, FilePath};
-use zeroize::{Zeroize, Zeroizing};
 
 use crate::state::{DesktopState, DesktopStateError};
 
@@ -35,7 +32,7 @@ pub const OPERATION_EVENT: &str = "envsync://operation";
 ///
 /// 此列表也会写入 Tauri build manifest；新增 command 必须先添加安全测试、明确输入 View
 /// 和最小 capability，不能通过插件自动扩展。
-pub const ALLOWED_COMMANDS: [&str; 20] = [
+pub const ALLOWED_COMMANDS: [&str; 19] = [
     "onboarding_select_root",
     "onboarding_create_workspace",
     "onboarding_open_workspace",
@@ -51,7 +48,6 @@ pub const ALLOWED_COMMANDS: [&str; 20] = [
     "operation_rollback_review",
     "operation_rollback",
     "vault_metadata",
-    "vault_set_secret",
     "device_list",
     "device_revoke",
     "bundle_review",
@@ -211,27 +207,6 @@ pub struct RollbackExecutionRequest {
     pub review_token: String,
     /// 必须与审核响应中所有 inverse action 的序号一一对应。
     pub confirmations: Vec<u32>,
-}
-
-/// 一次性的 Vault 写入意图。
-///
-/// `secret_value` 只在当前 command 的栈中存在。该类型在离开作用域时主动清零，且成功
-/// response 不会回显它；Pinia、日志、诊断和 Rust 进程状态都不保存这个字段。
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct VaultSetSecretRequest {
-    /// 已注册工作区。
-    pub workspace_id: WorkspaceId,
-    /// 逻辑 Secret ID，不是路径。
-    pub secret_id: String,
-    /// 单次 modal buffer 里的明文；绝不被序列化进响应。
-    pub secret_value: String,
-}
-
-impl Drop for VaultSetSecretRequest {
-    fn drop(&mut self) {
-        self.secret_value.zeroize();
-    }
 }
 
 /// 撤销设备的受限意图。
@@ -756,37 +731,6 @@ pub fn vault_metadata(
     }
 }
 
-/// 将单次 modal buffer 写入 Vault。
-///
-/// request 在 schema 校验后被消费，值移入 [`Zeroizing`] 并通过 `SecretInput` 交给 core；
-/// 期间没有日志、事件或 response 会携带明文。UI 只能传逻辑 ID，不能指定对象、路径或
-/// 输出目的地。
-#[tauri::command]
-pub fn vault_set_secret(
-    state: State<'_, DesktopState>,
-    request: ApiRequest<VaultSetSecretRequest>,
-) -> ApiResponse<VaultSetView> {
-    let request_id = request.request_id().clone();
-    if let Some(response) = schema_error(&request) {
-        return response;
-    }
-    let mut data = request.into_data();
-    let workspace = data.workspace_id;
-    let secret_id = std::mem::take(&mut data.secret_id);
-    let secret_value = Zeroizing::new(std::mem::take(&mut data.secret_value));
-    let mut reader = Cursor::new(secret_value.as_bytes());
-    let input = match SecretInput::from_reader(&mut reader) {
-        Ok(input) => input,
-        Err(error) => return command_error(request_id, CommandFailure::Core(error)),
-    };
-    match call_service(state.inner(), workspace, |service| {
-        service.set_vault_secret(&secret_id, input)
-    }) {
-        Ok(view) => ApiResponse::ok(request_id, view, Vec::new()),
-        Err(error) => command_error(request_id, error),
-    }
-}
-
 /// 列出已经过成员链验证的设备元数据。
 ///
 /// 不传输设备私钥、公开材料、邀请内容或恢复短语；这些要么从系统安全存储读取，要么仍
@@ -1097,7 +1041,7 @@ fn checked_unavailable(
     }
 }
 
-fn schema_error<T: ViewData, P>(request: &ApiRequest<P>) -> Option<ApiResponse<T>> {
+fn schema_error<T: ViewData, P: Serialize>(request: &ApiRequest<P>) -> Option<ApiResponse<T>> {
     request.validate_schema().err().map(|_| {
         error_response(
             request.request_id().clone(),

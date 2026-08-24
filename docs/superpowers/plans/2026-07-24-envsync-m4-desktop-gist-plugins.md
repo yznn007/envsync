@@ -236,10 +236,11 @@ action。
 显示 signer、digest、文件、capability、SecretRef 和版本 diff。新 capability 必须单独
 确认；quarantine 内容不能从 UI 直接执行。
 
-- [x] **Step 3: Vault UI**
+- [x] **Step 3: Vault UI（metadata-only）**
 
-列表只显示 Secret ID、更新时间、引用者。设置 secret 使用单次 modal buffer，提交或关闭后
-清空；不提供复制全部 vault 或 reveal-by-default。
+列表只显示 Secret ID、更新时间、引用者。Tauri IPC 在 command 参数校验前会解析完整 JSON，
+无法可靠地约束秘密正文；因此桌面端不接收 Vault 值，设置操作保留给 CLI 的 stdin、环境变量
+名或隐藏输入通道；不提供复制全部 vault 或 reveal-by-default。
 
 - [x] **Step 4: Device UI**
 

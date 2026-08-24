@@ -3,7 +3,7 @@
  *
  * 包计划和 Bundle manifest 尚没有可持久化的 application-service 来源，因此它们的页面
  * 只接收测试或未来审核流注入的 View，不在这里伪造 native 调用。此模块仅桥接已经由
- * core 暴露的 Vault metadata / 单次写入与设备轮换操作。
+ * core 暴露的 Vault metadata 与设备轮换操作。Vault 值绝不通过 WebView IPC 传入。
  */
 
 import {
@@ -23,8 +23,6 @@ const rotationStages = new Set([
   'rewrapping',
   'complete',
 ])
-const maxSecretBytes = 1024 * 1024
-
 export type SafeVaultMetadataView = {
   workspace: string
   index_missing: boolean
@@ -33,10 +31,6 @@ export type SafeVaultMetadataView = {
     updated_at_unix_ms: number
     referenced_by: string[]
   }>
-}
-
-export type SafeVaultSetView = {
-  id: string
 }
 
 export type SafeDeviceListView = {
@@ -67,11 +61,6 @@ export type SecurityReviewResult<T> = ({ kind: 'success' } & T) | { kind: 'error
 /** 可替换的安全管理端口，页面测试不会接触 Tauri。 */
 export interface SecurityReviewPort {
   loadVaultMetadata(workspaceId: string): Promise<SecurityReviewResult<{ vault: SafeVaultMetadataView }>>
-  setVaultSecret(intent: {
-    workspaceId: string
-    secretId: string
-    secretValue: string
-  }): Promise<SecurityReviewResult<{ receipt: SafeVaultSetView }>>
   listDevices(workspaceId: string): Promise<SecurityReviewResult<{ devices: SafeDeviceListView }>>
   revokeDevice(intent: {
     workspaceId: string
@@ -119,17 +108,6 @@ function vaultMetadataView(value: unknown): { vault: SafeVaultMetadataView } | n
           entries: entries as SafeVaultMetadataView['entries'],
         },
       }
-}
-
-function vaultSetView(value: unknown): { receipt: SafeVaultSetView } | null {
-  if (!isRecord(value) || !safeResourceIdentifier(value.id)) {
-    return null
-  }
-  return {
-    receipt: {
-      id: value.id,
-    },
-  }
 }
 
 function deviceMetadata(value: unknown): SafeDeviceListView['devices'][number] | null {
@@ -207,10 +185,6 @@ function invalidWorkspace<T>(): Promise<SecurityReviewResult<T>> {
   return Promise.resolve({ kind: 'error', code: 'desktop.workspace_not_registered' })
 }
 
-function secretValueIsBounded(value: string) {
-  return value.length > 0 && new TextEncoder().encode(value).byteLength <= maxSecretBytes
-}
-
 /** 生产环境的 Vault / device Tauri 端口。 */
 export const tauriSecurityReviewPort: SecurityReviewPort = {
   loadVaultMetadata: (workspaceId) => (
@@ -218,24 +192,6 @@ export const tauriSecurityReviewPort: SecurityReviewPort = {
       ? invokeDesktop('vault_metadata', { workspace_id: workspaceId }, vaultMetadataView)
       : invalidWorkspace()
   ),
-  setVaultSecret: (intent) => {
-    if (
-      !opaqueIdentifier(intent.workspaceId)
-      || !safeResourceIdentifier(intent.secretId)
-      || !secretValueIsBounded(intent.secretValue)
-    ) {
-      return invalidWorkspace()
-    }
-    return invokeDesktop(
-      'vault_set_secret',
-      {
-        workspace_id: intent.workspaceId,
-        secret_id: intent.secretId,
-        secret_value: intent.secretValue,
-      },
-      vaultSetView,
-    )
-  },
   listDevices: (workspaceId) => (
     opaqueIdentifier(workspaceId)
       ? invokeDesktop('device_list', { workspace_id: workspaceId }, deviceListView)

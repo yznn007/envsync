@@ -88,7 +88,6 @@ View：
 | `CancellationView` | 已送达 worker 的取消请求 | 是否跨过发布边界之外的内部状态 |
 | `ApplyView` | apply 的最终 no-op 或完成结果 | 文件内容、收据、错误正文 |
 | `VaultMetadataView` | Secret ID、更新时间、引用资源与索引缺失状态 | 值、密文对象、密钥纪元、批量读取入口 |
-| `VaultSetView` | 单次写入的 Secret ID 回执 | 写入值、长度、密钥纪元、密文、对象 ID、路径或输出目标 |
 | `DeviceListView` | 已验证成员设备、角色、纪元和成员链序号 | 私钥、设备公开材料、邀请、恢复短语 |
 | `DeviceRevocationView` | 已撤销设备与密钥轮换阶段摘要 | 轮换密钥、旧条目内容、恢复材料 |
 
@@ -166,10 +165,8 @@ worker 随后发出 `operation.cancelled` 错误事件。发布后或 worker 已
 ## 宿主边界
 
 桌面壳只可传递已注册的 workspace/resource/plan/operation 标识。它不得提供任意文件路径、
-shell 命令、HTTP 请求或 Vault 明文参数；唯一例外是下面定义的 `vault_set_secret` 一次性
-输入，它必须在 IPC 调用结束时清零且不得出现在任何 response、event、日志或 store 中。实际
-command allowlist、Tauri capability 与参数解析将在桌面壳中执行，但必须继续使用本契约的
-request、response 和 event 信封。
+shell 命令、HTTP 请求或 Vault 明文参数。实际 command allowlist、Tauri capability 与参数
+解析将在桌面壳中执行，但必须继续使用本契约的 request、response 和 event 信封。
 
 ### 原生首次使用
 
@@ -205,10 +202,10 @@ request、response 和 event 信封。
 - `vault_metadata` 的负载仅为 `{ workspace_id }`，返回 `VaultMetadataView`。每条 entry
   只有 `id`、`updated_at_unix_ms` 和 `referenced_by`；没有 `get`、批量复制或默认 reveal
   command。若 `index_missing=true`，空条目列表表示“读不到”，不是“Vault 为空”。
-- `vault_set_secret` 是唯一允许一次性秘密输入的桌面 command。负载为
-  `{ workspace_id, secret_id, secret_value }`：`secret_id` 是受限逻辑 ID，不是路径；
-  `secret_value` 仅在本次 IPC 调用中移入零化 buffer，成功/失败 response、诊断、事件和
-  前端 store 均不会回显或保存它。该 command 不提供任意文件输出、`vault get` 或复制 API。
+- 桌面端不提供 `vault_set_secret` 或任何等价的明文 IPC。当前 Tauri IPC 会在 command
+  获得参数前解析整个 JSON payload，无法在 Rust command 内可靠地实施输入体上限；因此
+  设置值必须走 CLI 的 stdin / 环境变量名 / 隐藏输入三条受限通道。桌面页只显示 metadata，
+  不提供 `vault get`、复制 API 或默认 reveal。
 - `device_list` 的负载仅为 `{ workspace_id }`，返回已验证成员链的 `DeviceListView`。
   `device_revoke` 只接受 `{ workspace_id, device_id, confirmation }`，其中
   `confirmation` 必须逐字匹配公开的 `device_id`；这只是防误触，core 仍会强制管理员身份、

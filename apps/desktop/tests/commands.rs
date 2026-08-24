@@ -4,8 +4,8 @@ use envsync_core::ApiRequest;
 use envsync_desktop::{
     commands::{
         is_allowed_command, ApplyPlanRequest, ConflictResolutionRequest, CreateWorkspaceRequest,
-        DeviceRevokeRequest, OperationRequest, RollbackExecutionRequest, VaultSetSecretRequest,
-        WorkspaceRequest, ALLOWED_COMMANDS,
+        DeviceRevokeRequest, OperationRequest, RollbackExecutionRequest, WorkspaceRequest,
+        ALLOWED_COMMANDS,
     },
     parse_safe_deep_link, SafeDeepLinkAction,
 };
@@ -31,7 +31,6 @@ fn only_reviewed_application_commands_are_exposed() {
             "operation_rollback_review",
             "operation_rollback",
             "vault_metadata",
-            "vault_set_secret",
             "device_list",
             "device_revoke",
             "bundle_review",
@@ -51,6 +50,7 @@ fn only_reviewed_application_commands_are_exposed() {
         "run_shell",
         "http_request",
         "vault_get_secret",
+        "vault_set_secret",
         "secret_get",
     ] {
         assert!(
@@ -58,6 +58,63 @@ fn only_reviewed_application_commands_are_exposed() {
             "桌面端不得暴露高权限命令：{forbidden}"
         );
     }
+}
+
+/// application-service command 由四处共同声明；这个测试让任何一处遗漏或额外暴露都立即
+/// 失败，而不是等到打包后的 capability 才发现。
+#[test]
+fn generated_command_registrations_match_the_allowlist() {
+    let build = include_str!("../build.rs");
+    let handler = include_str!("../src/lib.rs");
+    let capabilities: serde_json::Value =
+        serde_json::from_str(include_str!("../capabilities/default.json"))
+            .expect("默认 capability 必须是合法 JSON");
+
+    assert_eq!(quoted_names_after(build, ".commands(&["), ALLOWED_COMMANDS);
+    assert_eq!(handler_names(handler), ALLOWED_COMMANDS);
+
+    let capability_names = capabilities["permissions"]
+        .as_array()
+        .expect("permissions 必须是数组")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .filter_map(|permission| permission.strip_prefix("allow-"))
+        .collect::<Vec<_>>();
+    let expected_capabilities = ALLOWED_COMMANDS
+        .iter()
+        .map(|command| command.replace('_', "-"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        capability_names,
+        expected_capabilities
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    );
+}
+
+fn quoted_names_after<'a>(source: &'a str, marker: &str) -> Vec<&'a str> {
+    source
+        .split_once(marker)
+        .expect("命令数组标记必须存在")
+        .1
+        .lines()
+        .take_while(|line| !line.trim().starts_with("])"))
+        .filter_map(|line| line.trim().strip_prefix('"'))
+        .filter_map(|line| line.split_once('"').map(|(name, _)| name))
+        .collect()
+}
+
+fn handler_names(source: &str) -> Vec<&str> {
+    source
+        .split_once(".invoke_handler(tauri::generate_handler![")
+        .expect("Tauri handler 必须存在")
+        .1
+        .lines()
+        .take_while(|line| !line.trim().starts_with("])"))
+        .filter_map(|line| line.trim().strip_prefix("commands::"))
+        .filter_map(|line| line.strip_suffix(','))
+        .collect()
 }
 
 #[test]
@@ -201,21 +258,6 @@ fn mutating_command_payloads_only_accept_registered_ids() {
     assert!(
         serde_json::from_value::<ApiRequest<RollbackExecutionRequest>>(direct_rollback).is_err(),
         "回滚必须携带原生审核 token 与逐项确认，不能从 UI 直接执行"
-    );
-
-    let unsafe_vault_set = serde_json::json!({
-        "schema_version": 1,
-        "request_id": "req-vault-path-injection",
-        "data": {
-            "workspace_id": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
-            "secret_id": "ci/npm-token",
-            "secret_value": "must-never-echo",
-            "path": "/Users/alice/.ssh/id_ed25519"
-        }
-    });
-    assert!(
-        serde_json::from_value::<ApiRequest<VaultSetSecretRequest>>(unsafe_vault_set).is_err(),
-        "Vault 写入只接受逻辑 ID 与一次性值，不能接受路径"
     );
 
     let unsafe_revoke = serde_json::json!({

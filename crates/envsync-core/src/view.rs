@@ -827,20 +827,6 @@ impl VaultMetadataView {
     }
 }
 
-/// 单次 Vault 写入的无明文回执。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct VaultSetView {
-    /// 被写入的逻辑 Secret ID。
-    pub id: String,
-}
-
-impl VaultSetView {
-    /// 构造没有明文回显的写入回执。
-    pub fn new(id: impl Into<String>) -> Self {
-        VaultSetView { id: id.into() }
-    }
-}
-
 /// 一台已加入工作区的设备摘要。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DeviceMetadataView {
@@ -950,7 +936,6 @@ impl private::Sealed for ApplyStartView {}
 impl private::Sealed for CancellationView {}
 impl private::Sealed for ApplyView {}
 impl private::Sealed for VaultMetadataView {}
-impl private::Sealed for VaultSetView {}
 impl private::Sealed for DeviceListView {}
 impl private::Sealed for DeviceRevocationView {}
 impl ViewData for WorkspaceSummary {}
@@ -972,7 +957,6 @@ impl ViewData for ApplyStartView {}
 impl ViewData for CancellationView {}
 impl ViewData for ApplyView {}
 impl ViewData for VaultMetadataView {}
-impl ViewData for VaultSetView {}
 impl ViewData for DeviceListView {}
 impl ViewData for DeviceRevocationView {}
 

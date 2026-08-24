@@ -144,6 +144,6 @@ pub use view::{
     DiffListView, DiffView, OperationActionView, OperationDetailView, OperationHistoryView,
     OperationReceiptView, OperationStatusView, OperationView, PlanActionView, PlanView,
     ResourceStatusView, RollbackActionView, RollbackReviewView, RootCapabilityView, StatusView,
-    VaultMetadataView, VaultSecretMetadataView, VaultSetView, ViewDiagnostic,
-    WorkspaceRegistrationView, WorkspaceSummary,
+    VaultMetadataView, VaultSecretMetadataView, ViewDiagnostic, WorkspaceRegistrationView,
+    WorkspaceSummary,
 };

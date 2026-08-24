@@ -116,13 +116,13 @@ pub(crate) mod private {
 /// 隐式字段猜测协议版本。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ApiRequest<T> {
+pub struct ApiRequest<T: Serialize> {
     schema_version: u32,
     request_id: ApiRequestId,
     data: T,
 }
 
-impl<T> ApiRequest<T> {
+impl<T: Serialize> ApiRequest<T> {
     /// 以当前 schema 版本创建请求。
     pub fn new(request_id: ApiRequestId, data: T) -> Self {
         ApiRequest {
@@ -145,15 +145,6 @@ impl<T> ApiRequest<T> {
     /// 返回命令负载。
     pub fn data(&self) -> &T {
         &self.data
-    }
-
-    /// 消费请求并取得其负载。
-    ///
-    /// 这给一次性敏感输入提供了一个不必克隆的出口：宿主先验证 schema 与 request ID，
-    /// 再消费信封，把负载移入短生命周期的处理栈并及时清零。普通 command 仍可使用
-    /// [`Self::data`] 的借用接口。
-    pub fn into_data(self) -> T {
-        self.data
     }
 
     /// 验证调用方使用的是当前稳定 schema。

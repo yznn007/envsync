@@ -94,24 +94,6 @@ fn request_is_explicitly_versioned_and_keeps_an_opaque_workspace_handle() {
     assert_eq!(json["data"], "workspace-handle-01");
 }
 
-/// 入站请求只需可被宿主反序列化；一次性敏感 payload 不应为了复用信封而被迫具备
-/// `Serialize`，以免被意外写入日志、事件或 response。
-#[test]
-fn request_accepts_a_nonserializable_one_shot_payload() {
-    struct OneShotPayload {
-        secret: String,
-    }
-
-    let request = ApiRequest::new(
-        ApiRequestId::parse("req-one-shot-v1").expect("请求标识有效"),
-        OneShotPayload {
-            secret: "VIEW_API_ONE_SHOT_CANARY".to_owned(),
-        },
-    );
-
-    assert_eq!(request.into_data().secret, "VIEW_API_ONE_SHOT_CANARY");
-}
-
 /// IPC 反序列化不能绕过 request ID 的字符约束；宿主也必须能在回显请求 ID 后，明确拒绝
 /// 不受支持的 schema，而不是把它当成当前版本继续处理。
 #[test]

@@ -25,7 +25,6 @@ use std::sync::Arc;
 
 use envsync_backend::git_auth::validate_remote_url;
 use envsync_backend::{Backend, BackendError, GitBackend, GitConfig, LocalBackend};
-use envsync_crypto::sealed::SecretId;
 use envsync_domain::{
     Blob, BlobId, CborCodec, Conflict, ConflictId, ConflictKind, ConflictResolution,
     DesiredDisposition, DeviceId, DeviceProfile, FileMode, ObjectId, ObjectKind, Observation,
@@ -53,9 +52,8 @@ use crate::sync::{self, ConflictDetail, FetchOutcome, MergeContext, MergeOutcome
 use crate::view::{
     ConflictDetailView, ConflictResolutionView, DeviceListView, DeviceRevocationView, DiffListView,
     DiffView, OperationDetailView, OperationHistoryView, RollbackReviewView, VaultMetadataView,
-    VaultSetView,
 };
-use crate::{device_admin, vault, SecretInput, VaultDeps, VaultService};
+use crate::{device_admin, vault, VaultDeps, VaultService};
 
 /// 桌面端单次手动冲突裁决正文的硬上限。
 ///
@@ -516,17 +514,6 @@ impl EnvSyncService {
             index_missing,
             &entries,
         ))
-    }
-
-    /// 通过已经打开的系统安全存储写入一条 Vault 值，并仅返回无明文回执。
-    ///
-    /// `SecretInput` 没有 `Debug` / `Display` / serialization，因此调用端无法把它误塞进
-    /// View API。桌面壳必须让它只在一次 IPC 调用栈中存在，并在响应前丢弃。
-    pub fn set_vault_secret(&mut self, id: &str, input: SecretInput) -> CoreResult<VaultSetView> {
-        let id = SecretId::parse(id)?;
-        let mut service = self.open_vault_service()?;
-        service.set(&id, input)?;
-        Ok(VaultSetView::new(id.as_str()))
     }
 
     /// 列出已经过成员链验证的设备；不暴露私钥、公开材料、邀请或恢复短语。

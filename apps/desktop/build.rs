@@ -16,7 +16,6 @@ fn main() {
             "operation_rollback_review",
             "operation_rollback",
             "vault_metadata",
-            "vault_set_secret",
             "device_list",
             "device_revoke",
             "bundle_review",

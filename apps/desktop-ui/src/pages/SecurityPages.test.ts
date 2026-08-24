@@ -21,7 +21,6 @@ function setupWorkspace() {
 function basePort(): SecurityReviewPort {
   return {
     loadVaultMetadata: vi.fn(),
-    setVaultSecret: vi.fn(),
     listDevices: vi.fn(),
     revokeDevice: vi.fn(),
   }
@@ -118,7 +117,7 @@ describe('M4 Task 6 security pages', () => {
     expect((confirmation.element as HTMLInputElement).checked).toBe(true)
   })
 
-  it('Vault modal 的值只走一次调用，关闭或提交后都会清空', async () => {
+  it('Vault 页面仅显示 metadata，秘密输入保留在有界的 CLI 通道', async () => {
     setupWorkspace()
     const port = basePort()
     vi.mocked(port.loadVaultMetadata).mockResolvedValue({
@@ -133,36 +132,13 @@ describe('M4 Task 6 security pages', () => {
         }],
       },
     })
-    vi.mocked(port.setVaultSecret).mockResolvedValue({
-      kind: 'success',
-      receipt: { id: 'ci/npm-token' },
-    })
-
     const wrapper = mount(VaultPage, { props: { port } })
     await flushPromises()
     expect(wrapper.text()).toContain('ci/npm-token')
-
-    await wrapper.get('[data-action="open-vault-set-modal"]').trigger('click')
-    await wrapper.get('[data-vault-secret-id]').setValue('ci/next-token')
-    await wrapper.get('[data-vault-secret-value]').setValue('VAULT_CANARY_do_not_persist')
-    await wrapper.get('[data-action="close-vault-set-modal"]').trigger('click')
+    expect(wrapper.text()).toContain('envsync vault set')
     expect(wrapper.find('[data-vault-secret-value]').exists()).toBe(false)
-    expect(wrapper.html()).not.toContain('VAULT_CANARY_do_not_persist')
-
-    await wrapper.get('[data-action="open-vault-set-modal"]').trigger('click')
-    await wrapper.get('[data-vault-secret-id]').setValue('ci/npm-token')
-    await wrapper.get('[data-vault-secret-value]').setValue('VAULT_CANARY_do_not_persist')
-    await wrapper.get('[data-action="submit-vault-secret"]').trigger('submit')
-    await flushPromises()
-
-    expect(port.setVaultSecret).toHaveBeenCalledWith({
-      workspaceId: 'workspace-01',
-      secretId: 'ci/npm-token',
-      secretValue: 'VAULT_CANARY_do_not_persist',
-    })
-    expect(wrapper.find('[data-vault-secret-value]').exists()).toBe(false)
-    expect(wrapper.html()).not.toContain('VAULT_CANARY_do_not_persist')
-    expect(wrapper.text()).toContain('响应未包含值')
+    expect(wrapper.find('[data-action="open-vault-set-modal"]').exists()).toBe(false)
+    expect(wrapper.html()).not.toContain('secret_value')
   })
 
   it('设备撤销明确提示密钥轮换与旧设备重新授权，并要求匹配 ID 确认', async () => {
