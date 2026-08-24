@@ -316,6 +316,33 @@ fn truncated_gist_rejects_untrusted_raw_url_without_following_it() {
 }
 
 #[test]
+fn loopback_api_rejects_public_github_raw_url_without_following_it() {
+    let mock = MockGithub::start().expect("启动 GitHub mock");
+    let (workspace, bundle, _) = sealed_bundles();
+    let filename = gist_bundle_filename(workspace);
+    let raw_url = format!("https://gist.githubusercontent.com/owner/gist-123/raw/{filename}");
+    mock.enqueue(
+        ResponseSpec::new(200)
+            .header("etag", "\"v1\"")
+            .body(truncated_gist_response(
+                "gist-123", &filename, &raw_url, &bundle,
+            )),
+    );
+    let backend = GistBackend::with_api_base(mock.base_url(), Duration::from_millis(100))
+        .expect("构造 loopback Gist 后端");
+
+    let error = backend
+        .read(&credentials(), &gist_id(), workspace)
+        .expect_err("非默认 API base 不得接受公共 GitHub raw URL");
+
+    assert_safe_error(error, "gist.invalid_raw_url", &raw_url);
+    let requests = mock.wait_for_requests(1, Duration::from_millis(100));
+    assert_eq!(requests.len(), 1, "不受信 raw URL 不得触发第二个请求");
+    assert_eq!(requests[0].method, "GET");
+    assert_eq!(requests[0].path, "/gists/gist-123");
+}
+
+#[test]
 fn read_transport_failure_is_safe() {
     let mock = MockGithub::start().expect("启动 GitHub mock");
     let endpoint = mock.base_url();
@@ -343,6 +370,50 @@ fn read_transport_failure_is_safe() {
     assert!(
         !format!("{error:?}").contains(&endpoint),
         "传输错误 Debug 不得回显 endpoint"
+    );
+}
+
+#[test]
+fn create_sends_one_private_post_without_implicit_read() {
+    let mock = MockGithub::start().expect("启动 GitHub mock");
+    let (workspace, bundle, _) = sealed_bundles();
+    let filename = gist_bundle_filename(workspace);
+    mock.enqueue(ResponseSpec::new(201).body(json!({ "id": "gist-123" }).to_string()));
+    let backend = GistBackend::with_api_base(mock.base_url(), Duration::from_millis(100))
+        .expect("构造 Gist 后端");
+
+    let created = backend
+        .create(&credentials(), &bundle)
+        .expect("创建 Gist 必须成功");
+
+    assert_eq!(created.revision().gist_id().as_str(), "gist-123");
+    let requests = mock.wait_for_requests(1, Duration::from_millis(200));
+    assert_eq!(requests.len(), 1, "create 不得隐式读取 Gist");
+    let request = &requests[0];
+    assert_eq!(request.method, "POST");
+    assert_eq!(request.path, "/gists");
+    assert_eq!(
+        request.header("accept"),
+        Some("application/vnd.github+json")
+    );
+    assert_eq!(request.header("x-github-api-version"), Some("2022-11-28"));
+    assert_eq!(request.header("user-agent"), Some("envsync"));
+    assert_eq!(request.header("authorization"), Some("Bearer test-token"));
+
+    let body = request_json(request);
+    assert_eq!(body.get("public"), Some(&Value::Bool(false)));
+    let files = body
+        .get("files")
+        .and_then(Value::as_object)
+        .expect("创建请求必须包含文件对象");
+    assert_eq!(files.len(), 1, "创建请求必须仅包含一个文件");
+    assert_eq!(
+        files
+            .get(&filename)
+            .and_then(Value::as_object)
+            .and_then(|file| file.get("content"))
+            .and_then(Value::as_str),
+        Some(bundle.as_str())
     );
 }
 

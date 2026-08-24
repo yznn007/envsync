@@ -646,8 +646,12 @@ impl GistBackend {
             .expect("固定 GitHub raw Gist URL 必须有效")
             .origin();
         let is_public_github_api = self.api_base.as_str() == GITHUB_API_BASE;
-        let is_allowed_same_origin = !is_public_github_api && raw_url.origin() == api_origin;
-        if !is_allowed_same_origin && raw_url.origin() != github_raw_origin {
+        let is_allowed_origin = if is_public_github_api {
+            raw_url.origin() == github_raw_origin
+        } else {
+            raw_url.origin() == api_origin
+        };
+        if !is_allowed_origin {
             return Err(GistError::invalid_api_base());
         }
         Ok(raw_url)
@@ -917,7 +921,7 @@ mod tests {
     }
 
     #[test]
-    fn create_inspects_its_bundle_before_returning_not_implemented() {
+    fn create_rejects_invalid_bundle_before_http_and_redacts_it() {
         let backend =
             GistBackend::with_api_base("http://127.0.0.1:8080/", std::time::Duration::from_secs(1))
                 .expect("本地 API 基址合法");

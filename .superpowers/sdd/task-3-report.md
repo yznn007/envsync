@@ -62,3 +62,29 @@ old_verify_read_after_patch_is_a_cas_conflict_without_patch_retry
 ### 自审
 
 `git diff --check` 退出码为 `0`。复核确认没有修改集成测试、mock、计划或其他文档；提交只包含本任务的两个授权生产文件及本报告。
+
+## 复审修复：raw URL origin 约束与 create 合同
+
+### 修复内容
+
+- 收紧 `validate_raw_url`：默认 API base `https://api.github.com/` 仅允许
+  `https://gist.githubusercontent.com`；任何非默认 base（含 GHE 与 loopback mock）仅允许与已验证 API base 完全同 origin 的 raw URL。原有的 userinfo、query 与 fragment 拒绝规则保持不变。
+- 增加 loopback API base 返回 `https://gist.githubusercontent.com/...` 的回归集成测试：返回
+  `gist.invalid_raw_url`，并断言 MockGithub 仅收到初始 `GET /gists/gist-123`，没有 raw 第二请求。
+- 将过时的 gist.rs 单元测试名称改为
+  `create_rejects_invalid_bundle_before_http_and_redacts_it`，准确表达其断言：非法 Bundle 在 HTTP 前拒绝，且错误中不回显正文。
+- 新增独立 create 合同测试：成功创建仅发送一个 `POST /gists`，请求为私有、仅含预期 Bundle 文件、携带固定 GitHub Accept/API version/User-Agent/Authorization headers，且不隐式 GET。该测试不依赖 CAS/PATCH。
+
+### 验证
+
+`cargo fmt --check`：退出码 `0`。
+
+`cargo test -p envsync-backend --lib`：退出码 `0`，16 passed。
+
+`cargo test -p envsync-backend --test gist_backend`：退出码 `101`；11 passed、2 failed。
+新增 raw URL 回归与 create 合同测试均通过。以下两项仍是 Task 4 才实现的 PATCH/CAS 行为，按 Task 3 边界保留预期红灯：
+
+- `create_then_read_then_publish_sends_expected_contract`：当前 `compare_and_swap` 返回 `gist.not_implemented`。
+- `old_verify_read_after_patch_is_a_cas_conflict_without_patch_retry`：当前尚未实现 PATCH、读后验证及 `gist.cas_conflict`。
+
+未实现 PATCH/CAS 或限流重试；未使用真实网络，集成测试仅使用本机 MockGithub。
