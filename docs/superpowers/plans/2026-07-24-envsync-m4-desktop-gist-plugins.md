@@ -262,27 +262,27 @@ git commit -am "feat(ui): 添加包 Agent Vault 与设备管理"
 - Test: `crates/envsync-backend/tests/gist_bundle.rs`
 - Create: `docs/backends/gist.md`
 
-- [ ] **Step 1: 写格式测试**
+- [x] **Step 1: 写格式测试**
 
 一个 Gist 文件 `envsync-<workspace>.bundle`，内容为 base64url canonical envelope：
-version、workspace、revision、head、objects、bundle digest、signature。最多 256 resources
-和 5 MiB encoded size。
+version、workspace、revision、head、密封对象目录、仅含成员链和当前 KeyEnvelope 的受限
+bootstrap、bundle digest、signature。最多 256 resources 和 5 MiB encoded size。
 
-- [ ] **Step 2: sealed-only 测试**
+- [x] **Step 2: sealed-only 测试**
 
 配置 Vault 或普通资源时 bundle payload 始终是 ciphertext；fixture 扫描不得出现资源明文、
 路径、Secret ID 或 metadata。未启用 M2 密钥的 Workspace 不能选择 Gist。
 
-- [ ] **Step 3: 实现 pack/unpack**
+- [x] **Step 3: 实现 pack/unpack**
 
 对象排序确定；解包先检查 encoded size、版本和计数，再验证 digest/signature，最后解密。
 拒绝压缩炸弹和重复 object ID。
 
-- [ ] **Step 4: 验证并提交**
+- [x] **Step 4: 验证并提交**
 
 ```bash
 cargo test -p envsync-backend --test gist_bundle
-git commit -am "feat(backend): 添加密封 Gist bundle 格式"
+git commit -m "feat(backend): 添加可引导的密封 Gist bundle"
 ```
 
 ### Task 8: GitHub Gist Backend 与 CAS

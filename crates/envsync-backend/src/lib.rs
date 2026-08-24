@@ -50,6 +50,7 @@
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 
+pub mod gist_bundle;
 pub mod git;
 pub mod git_auth;
 pub mod local;

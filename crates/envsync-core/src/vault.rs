@@ -58,6 +58,9 @@ use envsync_crypto::device::{DeviceKeypair, DevicePublic};
 use envsync_crypto::envelope::{open_envelope, seal_envelope, KeyEnvelope};
 use envsync_crypto::sealed::{open as open_sealed, seal, SealedSecret, SecretId};
 use envsync_crypto::suite::{DataKey, KeyEpoch, Plaintext, MAX_PLAINTEXT_LEN};
+pub use envsync_crypto::vault::{
+    SecretRef, VaultIndex, MAX_SECRETS, VAULT_INDEX_FORMAT_VERSION, VAULT_INDEX_METADATA_KEY,
+};
 use envsync_domain::cbor::{CborCodec, CborError, Value};
 use envsync_domain::id::{DeviceId, ResourceId, SnapshotId, WorkspaceId};
 use envsync_domain::membership::{MembershipEvent, MembershipState};
@@ -71,9 +74,6 @@ use crate::checkpoint::{advance as advance_checkpoint, Checkpoint, CheckpointSto
 use crate::error::{CoreError, CoreResult};
 use crate::membership::{self, membership_object_id};
 use crate::ports::Clock;
-
-/// 索引对象的格式版本。字段增删都必须提升它。
-pub const VAULT_INDEX_FORMAT_VERSION: u32 = 1;
 
 /// **工作区级**快照元数据的键前缀。
 ///
@@ -93,13 +93,6 @@ pub const VAULT_INDEX_FORMAT_VERSION: u32 = 1;
 /// 不必再去每一条发布路径上补一行。
 pub const WORKSPACE_METADATA_PREFIX: &str = "envsync.";
 
-/// 快照元数据中指向索引对象的键名。
-///
-/// 这是持久化契约：改名会让所有已发布的快照「看起来没有 vault」。名字刻意避开
-/// `secret` / `token` 一类词根——CLI 的脱敏器按键名工作，叫 `vault_secrets` 会让这个
-/// 对象标识本身被脱敏掉，用户就再也看不到自己该去读哪个对象。
-pub const VAULT_INDEX_METADATA_KEY: &str = "envsync.vault.index";
-
 /// 快照元数据中承载 Vault 索引背书的键名。
 ///
 /// 值的形状与语义见 [`crate::attestation`]。
@@ -110,11 +103,6 @@ pub const SNAPSHOT_SIGNATURE_DOMAIN: &str = "snapshot";
 
 /// 密钥环的格式版本。
 pub const KEY_RING_FORMAT_VERSION: u32 = 1;
-
-/// 一个工作区允许保存的秘密条数上限。
-///
-/// 上限存在的意义不是性能，而是**在做任何解码之前**就能拒绝一个恶意构造的巨大索引。
-pub const MAX_SECRETS: usize = 4096;
 
 /// 密钥环中允许保留的纪元数量上限。
 pub const MAX_KEY_EPOCHS: usize = 256;
@@ -214,6 +202,13 @@ pub enum VaultError {
         reason: &'static str,
     },
 
+    /// Gist 公开引导区与本地信任锚点不一致。
+    #[error("Gist 引导无效：{reason}")]
+    GistBootstrapInvalid {
+        /// 静态原因，不回显远端对象内容。
+        reason: &'static str,
+    },
+
     /// 交互式隐藏输入在当前环境不可用。
     #[error("当前环境无法提供隐藏输入；请改用 `--stdin` 或 `--from-env <NAME>`")]
     HiddenInputUnavailable,
@@ -243,6 +238,7 @@ impl VaultError {
             VaultError::NotAMemberDevice { .. } => "vault.not_a_member_device",
             VaultError::IndexInconsistent { .. } => "vault.index_inconsistent",
             VaultError::InvitationInvalid { .. } => "vault.invitation_invalid",
+            VaultError::GistBootstrapInvalid { .. } => "vault.gist_bootstrap_invalid",
             VaultError::HiddenInputUnavailable => "vault.hidden_input_unavailable",
             VaultError::NonTtyOutputRefused => "vault.non_tty_output_refused",
         }
@@ -360,201 +356,6 @@ impl SecretInput {
     fn into_plaintext(self) -> Plaintext {
         self.plaintext
     }
-}
-
-// ---------------------------------------------------------------------------
-// 索引
-// ---------------------------------------------------------------------------
-
-/// 索引里的一条秘密引用。
-///
-/// **这里没有值**：只有逻辑标识、密封对象标识、加密时的纪元和引用它的资源。整条记录
-/// 都是公开元数据，放在不受信任的后端上是安全的。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SecretRef {
-    /// 逻辑标识。
-    pub id: SecretId,
-    /// 密封对象在后端中的标识。
-    pub object: ObjectId,
-    /// 密封时使用的数据密钥纪元。
-    pub epoch: u64,
-    /// 最近一次写入时刻（Unix 毫秒）。
-    pub updated_at_unix_ms: u64,
-    /// 引用该秘密的资源，按标识排序。
-    pub referenced_by: Vec<ResourceId>,
-}
-
-impl CborCodec for SecretRef {
-    fn to_value(&self) -> Value {
-        Value::Array(vec![
-            Value::Text(self.id.as_str().to_owned()),
-            Value::Text(self.object.to_string()),
-            Value::Uint(self.epoch),
-            Value::Uint(self.updated_at_unix_ms),
-            self.referenced_by.to_value(),
-        ])
-    }
-
-    fn from_value(value: &Value) -> Result<Self, CborError> {
-        let items = value.as_array()?;
-        if items.len() != 5 {
-            return Err(CborError::ArityMismatch);
-        }
-        Ok(SecretRef {
-            id: SecretId::parse(items[0].as_text()?)
-                .map_err(|error| CborError::InvalidValue(error.to_string()))?,
-            object: items[1]
-                .as_text()?
-                .parse::<ObjectId>()
-                .map_err(|error| CborError::InvalidValue(error.to_string()))?,
-            epoch: items[2].as_uint()?,
-            updated_at_unix_ms: items[3].as_uint()?,
-            referenced_by: Vec::<ResourceId>::from_value(&items[4])?,
-        })
-    }
-}
-
-/// Vault 索引对象：一次发布中「后端上有什么」的完整清单。
-///
-/// 它是快照与秘密之间的唯一桥梁：快照元数据里放它的对象标识，它里面放
-/// [`SecretRef`]、成员事件对象和当前纪元的信封对象。**没有任何私有材料**。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VaultIndex {
-    /// 格式版本。
-    pub format_version: u32,
-    /// 所属工作区。
-    pub workspace: WorkspaceId,
-    /// 当前密钥纪元。
-    pub epoch: u64,
-    /// 成员事件对象，按 sequence 升序；第一项一定是 genesis。
-    pub membership: Vec<ObjectId>,
-    /// 当前纪元的设备信封对象。
-    pub envelopes: Vec<ObjectId>,
-    /// 秘密引用，按逻辑标识升序。
-    pub secrets: Vec<SecretRef>,
-    /// 恢复包对象；尚未创建恢复短语时为 `None`。
-    pub recovery: Option<ObjectId>,
-}
-
-impl VaultIndex {
-    /// 建立一个空索引。
-    pub fn empty(workspace: WorkspaceId, epoch: u64) -> Self {
-        VaultIndex {
-            format_version: VAULT_INDEX_FORMAT_VERSION,
-            workspace,
-            epoch,
-            membership: Vec::new(),
-            envelopes: Vec::new(),
-            secrets: Vec::new(),
-            recovery: None,
-        }
-    }
-
-    /// 按逻辑标识查找。
-    pub fn find(&self, id: &SecretId) -> Option<&SecretRef> {
-        self.secrets.iter().find(|entry| &entry.id == id)
-    }
-
-    /// 插入或替换一条引用，并保持按标识升序。
-    fn upsert(&mut self, entry: SecretRef) {
-        match self.secrets.iter().position(|item| item.id == entry.id) {
-            Some(index) => self.secrets[index] = entry,
-            None => {
-                self.secrets.push(entry);
-                self.secrets
-                    .sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
-            }
-        }
-    }
-
-    /// 移除一条引用，返回是否真的移除了。
-    fn remove(&mut self, id: &SecretId) -> bool {
-        match self.secrets.iter().position(|item| &item.id == id) {
-            Some(index) => {
-                self.secrets.remove(index);
-                true
-            }
-            None => false,
-        }
-    }
-}
-
-impl CborCodec for VaultIndex {
-    fn to_value(&self) -> Value {
-        Value::Array(vec![
-            Value::Uint(self.format_version as u64),
-            self.workspace.to_value(),
-            Value::Uint(self.epoch),
-            Value::Array(
-                self.membership
-                    .iter()
-                    .map(|id| Value::Text(id.to_string()))
-                    .collect(),
-            ),
-            Value::Array(
-                self.envelopes
-                    .iter()
-                    .map(|id| Value::Text(id.to_string()))
-                    .collect(),
-            ),
-            self.secrets.to_value(),
-            match &self.recovery {
-                Some(id) => Value::Text(id.to_string()),
-                None => Value::Null,
-            },
-        ])
-    }
-
-    fn from_value(value: &Value) -> Result<Self, CborError> {
-        let items = value.as_array()?;
-        if items.len() != 7 {
-            return Err(CborError::ArityMismatch);
-        }
-        let format_version = u32::from_value(&items[0])?;
-        if format_version != VAULT_INDEX_FORMAT_VERSION {
-            return Err(CborError::UnsupportedFormatVersion {
-                found: format_version,
-                supported: VAULT_INDEX_FORMAT_VERSION,
-            });
-        }
-        let secrets = Vec::<SecretRef>::from_value(&items[5])?;
-        if secrets.len() > MAX_SECRETS {
-            return Err(CborError::InvalidValue(format!(
-                "秘密数量 {} 超过上限 {MAX_SECRETS}",
-                secrets.len()
-            )));
-        }
-        Ok(VaultIndex {
-            format_version,
-            workspace: WorkspaceId::from_value(&items[1])?,
-            epoch: items[2].as_uint()?,
-            membership: object_list(&items[3])?,
-            envelopes: object_list(&items[4])?,
-            secrets,
-            recovery: match &items[6] {
-                Value::Null => None,
-                other => Some(
-                    other
-                        .as_text()?
-                        .parse::<ObjectId>()
-                        .map_err(|error| CborError::InvalidValue(error.to_string()))?,
-                ),
-            },
-        })
-    }
-}
-
-/// 把一个文本数组解码成对象标识列表。
-fn object_list(value: &Value) -> Result<Vec<ObjectId>, CborError> {
-    value
-        .as_array()?
-        .iter()
-        .map(|item| {
-            item.as_text()?
-                .parse::<ObjectId>()
-                .map_err(|error| CborError::InvalidValue(error.to_string()))
-        })
-        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1709,64 +1510,6 @@ mod tests {
         let mut ring = KeyRing::new(KeyEpoch::INITIAL, DataKey::from_bytes([7u8; 32]));
         let error = ring.promote(KeyEpoch::new(5)).unwrap_err();
         assert_eq!(error.code(), "vault.data_key_missing");
-    }
-
-    #[test]
-    fn vault_index_round_trips_through_canonical_cbor() {
-        let workspace = WorkspaceId::generate();
-        let mut index = VaultIndex::empty(workspace, 3);
-        index
-            .membership
-            .push(ObjectId::for_bytes(ObjectKind::MembershipEvent, b"genesis"));
-        index
-            .envelopes
-            .push(ObjectId::for_bytes(ObjectKind::KeyEnvelope, b"envelope"));
-        index.upsert(SecretRef {
-            id: SecretId::parse("ci/npm-token").expect("标识"),
-            object: ObjectId::for_bytes(ObjectKind::SealedSecret, b"sealed"),
-            epoch: 3,
-            updated_at_unix_ms: 1_700_000_000_000,
-            referenced_by: vec![ResourceId::parse("shell/zsh/main").expect("资源")],
-        });
-        index.recovery = Some(ObjectId::for_bytes(ObjectKind::Blob, b"recovery"));
-
-        let bytes = index.to_canonical_vec();
-        assert_eq!(
-            VaultIndex::from_canonical_slice(&bytes).expect("还原"),
-            index
-        );
-    }
-
-    #[test]
-    fn vault_index_keeps_secrets_sorted_and_supports_removal() {
-        let mut index = VaultIndex::empty(WorkspaceId::generate(), 1);
-        for id in ["z/last", "a/first", "m/middle"] {
-            index.upsert(SecretRef {
-                id: SecretId::parse(id).expect("标识"),
-                object: ObjectId::for_bytes(ObjectKind::SealedSecret, id.as_bytes()),
-                epoch: 1,
-                updated_at_unix_ms: 0,
-                referenced_by: Vec::new(),
-            });
-        }
-        let ids: Vec<&str> = index.secrets.iter().map(|item| item.id.as_str()).collect();
-        assert_eq!(ids, ["a/first", "m/middle", "z/last"]);
-
-        let target = SecretId::parse("m/middle").expect("标识");
-        assert!(index.remove(&target));
-        assert!(!index.remove(&target));
-        assert_eq!(index.secrets.len(), 2);
-    }
-
-    #[test]
-    fn vault_index_rejects_an_unknown_format_version() {
-        let index = VaultIndex::empty(WorkspaceId::generate(), 1);
-        let mut value = index.to_value();
-        if let Value::Array(items) = &mut value {
-            items[0] = Value::Uint(99);
-        }
-        let bytes = envsync_domain::cbor::encode(&value);
-        assert!(VaultIndex::from_canonical_slice(&bytes).is_err());
     }
 
     #[test]

@@ -91,8 +91,9 @@ pub use config::{
 };
 pub use device_admin::{
     create_recovery, forget_device, init_device, invite, join, list_devices, load_device,
-    restore_recovery, DeviceInvitation, DeviceSummary, RecoveryOutcome, INVITATION_DEFAULT_TTL_MS,
-    INVITATION_SIGNATURE_DOMAIN,
+    restore_recovery, verify_gist_bootstrap_for_checkpoint, verify_gist_bootstrap_for_invitation,
+    DeviceInvitation, DeviceSummary, GistBootstrapTrust, RecoveryOutcome,
+    INVITATION_DEFAULT_TTL_MS, INVITATION_SIGNATURE_DOMAIN,
 };
 pub use error::{CoreError, CoreResult};
 pub use last_known::{
