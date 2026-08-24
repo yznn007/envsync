@@ -118,7 +118,7 @@ fn gist_id() -> GistId {
 }
 
 fn assert_safe_error(
-    error: envsync_backend::gist::GistError,
+    error: &envsync_backend::gist::GistError,
     expected_code: &'static str,
     forbidden: &str,
 ) {
@@ -135,6 +135,61 @@ fn assert_safe_error(
 
 fn request_json(request: &support::mock_github::RequestRecord) -> Value {
     serde_json::from_slice(&request.body).expect("请求必须是 JSON")
+}
+
+fn assert_cas_requests(
+    requests: &[support::mock_github::RequestRecord],
+    expected_etag: &str,
+    filename: &str,
+    candidate: &str,
+) {
+    assert_eq!(
+        requests.len(),
+        3,
+        "CAS 分支必须恰好发送 GET、PATCH、GET 三个请求"
+    );
+    assert!(
+        requests
+            .iter()
+            .map(|request| (request.method.as_str(), request.path.as_str()))
+            .eq([
+                ("GET", "/gists/gist-123"),
+                ("PATCH", "/gists/gist-123"),
+                ("GET", "/gists/gist-123"),
+            ]),
+        "CAS 分支必须按 GET、PATCH、GET 顺序请求"
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method == "PATCH")
+            .count(),
+        1,
+        "每个 CAS 分支都只能 PATCH 一次，绝不能盲重发"
+    );
+    let patch = &requests[1];
+    assert_eq!(patch.header("if-match"), Some(expected_etag));
+    let body = request_json(patch);
+    assert_eq!(body.get("public"), None, "PATCH body 不得改变 Gist 可见性");
+    let files = body["files"]
+        .as_object()
+        .expect("PATCH 必须包含 files 对象");
+    assert_eq!(files.len(), 1, "PATCH body 必须只包含一个文件");
+    assert_eq!(
+        files[filename]["content"].as_str(),
+        Some(candidate),
+        "PATCH 必须发布候选 bundle 的完整 bytes"
+    );
+}
+
+fn read_for_cas(
+    backend: &GistBackend,
+    credentials: &GistCredentials,
+    workspace: WorkspaceId,
+) -> envsync_backend::gist::GistBundleRecord {
+    backend
+        .read(credentials, &gist_id(), workspace)
+        .expect("读取初始 bundle")
 }
 
 #[test]
@@ -154,7 +209,7 @@ fn read_maps_auth_forbidden_and_not_found_to_safe_codes() {
             .read(&credentials(), &gist_id(), WorkspaceId::generate())
             .expect_err("认证与状态错误必须被读取操作返回");
 
-        assert_safe_error(error, expected_code, sentinel);
+        assert_safe_error(&error, expected_code, sentinel);
     }
 }
 
@@ -171,7 +226,7 @@ fn read_rejects_missing_etag_before_returning_unusable_revision() {
         .read(&credentials(), &gist_id(), workspace)
         .expect_err("缺少 ETag 的读取不得返回 revision");
 
-    assert_safe_error(error, "gist.missing_etag", &bundle);
+    assert_safe_error(&error, "gist.missing_etag", &bundle);
 }
 
 #[test]
@@ -192,7 +247,7 @@ fn read_timeout_is_reported_without_echoing_endpoint() {
         .read(&credentials(), &gist_id(), workspace)
         .expect_err("超过超时的读取必须失败");
 
-    assert_safe_error(error, "gist.timeout", &endpoint);
+    assert_safe_error(&error, "gist.timeout", &endpoint);
 }
 
 #[test]
@@ -213,7 +268,7 @@ fn read_rejects_oversized_response_before_json_parsing() {
         .read(&credentials(), &gist_id(), workspace)
         .expect_err("超出接收上限的响应必须被拒绝");
 
-    assert_safe_error(error, "gist.response_too_large", sentinel);
+    assert_safe_error(&error, "gist.response_too_large", sentinel);
 }
 
 #[test]
@@ -309,7 +364,7 @@ fn truncated_gist_rejects_untrusted_raw_url_without_following_it() {
             .read(&credentials(), &gist_id(), workspace)
             .expect_err("不受信 raw URL 必须被拒绝");
 
-        assert_safe_error(error, "gist.invalid_raw_url", &raw_url);
+        assert_safe_error(&error, "gist.invalid_raw_url", &raw_url);
         let requests = mock.wait_for_requests(1, Duration::from_millis(100));
         assert!(requests.len() == 1, "不受信 raw URL 不得触发第二个请求");
     }
@@ -335,7 +390,7 @@ fn loopback_api_rejects_public_github_raw_url_without_following_it() {
         .read(&credentials(), &gist_id(), workspace)
         .expect_err("非默认 API base 不得接受公共 GitHub raw URL");
 
-    assert_safe_error(error, "gist.invalid_raw_url", &raw_url);
+    assert_safe_error(&error, "gist.invalid_raw_url", &raw_url);
     let requests = mock.wait_for_requests(1, Duration::from_millis(100));
     assert_eq!(requests.len(), 1, "不受信 raw URL 不得触发第二个请求");
     assert_eq!(requests[0].method, "GET");
@@ -582,4 +637,235 @@ fn old_verify_read_after_patch_is_a_cas_conflict_without_patch_retry() {
             == 1,
         "CAS 只能尝试一次 PATCH"
     );
+}
+
+#[test]
+fn cas_success_verifies_complete_candidate_and_returns_new_etag() {
+    let mock = MockGithub::start().expect("启动 GitHub mock");
+    let (workspace, bundle_v1, bundle_v2) = sealed_bundles();
+    let filename = gist_bundle_filename(workspace);
+    mock.enqueue(
+        ResponseSpec::new(200)
+            .header("etag", "\"v1\"")
+            .body(gist_response("gist-123", &filename, &bundle_v1)),
+    );
+    mock.enqueue(ResponseSpec::new(200).body(json!({ "id": "gist-123" }).to_string()));
+    mock.enqueue(
+        ResponseSpec::new(200)
+            .header("etag", "\"v2\"")
+            .body(gist_response("gist-123", &filename, &bundle_v2)),
+    );
+    let backend = GistBackend::with_api_base(mock.base_url(), Duration::from_millis(100))
+        .expect("构造 Gist 后端");
+    let credentials = credentials();
+    let read = read_for_cas(&backend, &credentials, workspace);
+
+    let published = backend
+        .compare_and_swap(&credentials, read.revision(), &bundle_v2)
+        .expect("PATCH 成功后必须读取验证，并返回已发布的候选 bundle");
+
+    assert_eq!(published.encoded().as_bytes(), bundle_v2.as_bytes());
+    let requests = mock.wait_for_requests(3, Duration::from_millis(200));
+    assert_cas_requests(&requests, "\"v1\"", &filename, &bundle_v2);
+    assert_eq!(
+        requests[2].method, "GET",
+        "成功 PATCH 后必须由携带新 ETag 的验证读取确认结果"
+    );
+}
+
+#[test]
+fn cas_412_verifies_candidate_once_and_reports_published() {
+    let mock = MockGithub::start().expect("启动 GitHub mock");
+    let (workspace, bundle_v1, bundle_v2) = sealed_bundles();
+    let filename = gist_bundle_filename(workspace);
+    mock.enqueue(
+        ResponseSpec::new(200)
+            .header("etag", "\"v1\"")
+            .body(gist_response("gist-123", &filename, &bundle_v1)),
+    );
+    mock.enqueue(ResponseSpec::new(412).body("cas-412-sentinel"));
+    mock.enqueue(
+        ResponseSpec::new(200)
+            .header("etag", "\"v2\"")
+            .body(gist_response("gist-123", &filename, &bundle_v2)),
+    );
+    let backend = GistBackend::with_api_base(mock.base_url(), Duration::from_millis(100))
+        .expect("构造 Gist 后端");
+    let credentials = credentials();
+    let read = read_for_cas(&backend, &credentials, workspace);
+
+    let published = backend
+        .compare_and_swap(&credentials, read.revision(), &bundle_v2)
+        .expect("412 后验证读到候选完整 bytes 时必须确认已发布");
+
+    assert_eq!(published.encoded().as_bytes(), bundle_v2.as_bytes());
+    let requests = mock.wait_for_requests(3, Duration::from_millis(200));
+    assert_cas_requests(&requests, "\"v1\"", &filename, &bundle_v2);
+}
+
+#[test]
+fn cas_disconnect_verifies_candidate_once_and_reports_published() {
+    let mock = MockGithub::start().expect("启动 GitHub mock");
+    let endpoint = mock.base_url();
+    let (workspace, bundle_v1, bundle_v2) = sealed_bundles();
+    let filename = gist_bundle_filename(workspace);
+    mock.enqueue(
+        ResponseSpec::new(200)
+            .header("etag", "\"v1\"")
+            .body(gist_response("gist-123", &filename, &bundle_v1)),
+    );
+    mock.enqueue(ResponseSpec::new(200).disconnect());
+    mock.enqueue(
+        ResponseSpec::new(200)
+            .header("etag", "\"v2\"")
+            .body(gist_response("gist-123", &filename, &bundle_v2)),
+    );
+    let backend =
+        GistBackend::with_api_base(&endpoint, Duration::from_millis(100)).expect("构造 Gist 后端");
+    let credentials = credentials();
+    let read = read_for_cas(&backend, &credentials, workspace);
+
+    let published = backend
+        .compare_and_swap(&credentials, read.revision(), &bundle_v2)
+        .expect("断线后验证读到候选完整 bytes 时必须确认已发布");
+
+    assert_eq!(published.encoded().as_bytes(), bundle_v2.as_bytes());
+    let requests = mock.wait_for_requests(3, Duration::from_millis(200));
+    assert_cas_requests(&requests, "\"v1\"", &filename, &bundle_v2);
+}
+
+#[test]
+fn cas_5xx_verifies_old_bundle_once_and_reports_conflict_without_leaks() {
+    let mock = MockGithub::start().expect("启动 GitHub mock");
+    let sentinel = "patch-5xx-conflict-body-sentinel";
+    let (workspace, bundle_v1, bundle_v2) = sealed_bundles();
+    let filename = gist_bundle_filename(workspace);
+    mock.enqueue(
+        ResponseSpec::new(200)
+            .header("etag", "\"v1\"")
+            .body(gist_response("gist-123", &filename, &bundle_v1)),
+    );
+    mock.enqueue(ResponseSpec::new(503).body(sentinel));
+    mock.enqueue(
+        ResponseSpec::new(200)
+            .header("etag", "\"v1\"")
+            .body(gist_response("gist-123", &filename, &bundle_v1)),
+    );
+    let backend = GistBackend::with_api_base(mock.base_url(), Duration::from_millis(100))
+        .expect("构造 Gist 后端");
+    let credentials = credentials();
+    let read = read_for_cas(&backend, &credentials, workspace);
+
+    let error = backend
+        .compare_and_swap(&credentials, read.revision(), &bundle_v2)
+        .expect_err("5xx 后验证仍为旧 bundle 必须报告 CAS 冲突");
+
+    assert_safe_error(&error, "gist.cas_conflict", sentinel);
+    let requests = mock.wait_for_requests(3, Duration::from_millis(200));
+    assert_cas_requests(&requests, "\"v1\"", &filename, &bundle_v2);
+}
+
+#[test]
+fn cas_5xx_with_failed_verification_reports_unknown_once_without_leaks() {
+    let mock = MockGithub::start().expect("启动 GitHub mock");
+    let endpoint = mock.base_url();
+    let sentinel = "unknown-outcome-body-sentinel";
+    let (workspace, bundle_v1, bundle_v2) = sealed_bundles();
+    let filename = gist_bundle_filename(workspace);
+    mock.enqueue(
+        ResponseSpec::new(200)
+            .header("etag", "\"v1\"")
+            .body(gist_response("gist-123", &filename, &bundle_v1)),
+    );
+    mock.enqueue(ResponseSpec::new(503).body(sentinel));
+    mock.enqueue(ResponseSpec::new(500).body(sentinel));
+    let backend =
+        GistBackend::with_api_base(&endpoint, Duration::from_millis(100)).expect("构造 Gist 后端");
+    let credentials = credentials();
+    let read = read_for_cas(&backend, &credentials, workspace);
+
+    let error = backend
+        .compare_and_swap(&credentials, read.revision(), &bundle_v2)
+        .expect_err("5xx 后验证失败必须报告结果未知");
+
+    assert_safe_error(&error, "gist.update_outcome_unknown", sentinel);
+    assert!(!error.to_string().contains(&endpoint));
+    assert!(!format!("{error:?}").contains(&endpoint));
+    let requests = mock.wait_for_requests(3, Duration::from_millis(200));
+    assert_cas_requests(&requests, "\"v1\"", &filename, &bundle_v2);
+}
+
+#[test]
+fn read_retries_once_after_zero_retry_after_without_real_wait() {
+    let mock = MockGithub::start().expect("启动 GitHub mock");
+    let (workspace, bundle, _) = sealed_bundles();
+    let filename = gist_bundle_filename(workspace);
+    mock.enqueue(
+        ResponseSpec::new(429)
+            .header("retry-after", "0")
+            .body("get-rate-limit-body-sentinel"),
+    );
+    mock.enqueue(
+        ResponseSpec::new(200)
+            .header("etag", "\"v1\"")
+            .body(gist_response("gist-123", &filename, &bundle)),
+    );
+    let backend = GistBackend::with_api_base(mock.base_url(), Duration::from_millis(100))
+        .expect("构造 Gist 后端");
+
+    let record = backend
+        .read(&credentials(), &gist_id(), workspace)
+        .expect("Retry-After: 0 后必须立即重试一次读取");
+
+    assert_eq!(record.encoded().as_bytes(), bundle.as_bytes());
+    let requests = mock.wait_for_requests(2, Duration::from_millis(200));
+    assert_eq!(requests.len(), 2, "GET 429 只允许额外重试一次");
+    assert!(requests.iter().all(|request| request.method == "GET"));
+}
+
+#[test]
+fn create_429_is_rate_limited_and_never_replays_post() {
+    let mock = MockGithub::start().expect("启动 GitHub mock");
+    let (_, bundle, _) = sealed_bundles();
+    let sentinel = "post-rate-limit-body-sentinel";
+    mock.enqueue(ResponseSpec::new(429).body(sentinel));
+    let backend = GistBackend::with_api_base(mock.base_url(), Duration::from_millis(100))
+        .expect("构造 Gist 后端");
+
+    let error = backend
+        .create(&credentials(), &bundle)
+        .expect_err("POST 429 必须返回限流错误");
+
+    assert_safe_error(&error, "gist.rate_limited", sentinel);
+    let requests = mock.wait_for_requests(1, Duration::from_millis(200));
+    assert_eq!(requests.len(), 1, "POST 限流不得重放写请求");
+    assert_eq!(requests[0].method, "POST");
+}
+
+#[test]
+fn cas_patch_429_is_rate_limited_and_never_replays_patch() {
+    let mock = MockGithub::start().expect("启动 GitHub mock");
+    let (workspace, bundle_v1, bundle_v2) = sealed_bundles();
+    let filename = gist_bundle_filename(workspace);
+    let sentinel = "patch-rate-limit-body-sentinel";
+    mock.enqueue(
+        ResponseSpec::new(200)
+            .header("etag", "\"v1\"")
+            .body(gist_response("gist-123", &filename, &bundle_v1)),
+    );
+    mock.enqueue(ResponseSpec::new(429).body(sentinel));
+    let backend = GistBackend::with_api_base(mock.base_url(), Duration::from_millis(100))
+        .expect("构造 Gist 后端");
+    let credentials = credentials();
+    let read = read_for_cas(&backend, &credentials, workspace);
+
+    let error = backend
+        .compare_and_swap(&credentials, read.revision(), &bundle_v2)
+        .expect_err("PATCH 429 必须返回限流错误");
+
+    assert_safe_error(&error, "gist.rate_limited", sentinel);
+    let requests = mock.wait_for_requests(2, Duration::from_millis(200));
+    assert_eq!(requests.len(), 2, "PATCH 限流不得重放写请求");
+    assert_eq!(requests[0].method, "GET");
+    assert_eq!(requests[1].method, "PATCH");
 }
