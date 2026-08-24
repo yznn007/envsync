@@ -1,26 +1,34 @@
 //! 受限的 GitHub Gist 后端边界。
 //!
-//! 本模块只持有经过校验的 API 基址和 Vault 提供的 token。真正的 HTTP 读写与 CAS
-//! 协议由后续任务实现；在此之前，所有操作在完成本地 Bundle 校验后稳定地返回
-//! [`GistError::code`] 为 `gist.not_implemented` 的错误。
+//! 本模块只持有经过校验的 API 基址和 Vault 提供的 token。它实现 Gist 的创建和读取
+//! 边界；弱 CAS 协议仍由后续任务实现。
 
 use std::fmt;
+use std::io::Read;
 use std::net::IpAddr;
 use std::time::Duration;
 
 use envsync_crypto::sealed::SecretId;
 use envsync_crypto::suite::Plaintext;
 use envsync_domain::WorkspaceId;
+use reqwest::header::{self, HeaderMap};
 use reqwest::redirect::Policy;
-use reqwest::Url;
+use reqwest::{StatusCode, Url};
+use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
-use crate::gist_bundle::{self, GistBundleHeader};
+use crate::gist_bundle::{self, gist_bundle_filename, GistBundleHeader, MAX_ENCODED_BUNDLE_LEN};
 use crate::BackendDescriptor;
 
 const GITHUB_API_BASE: &str = "https://api.github.com/";
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_TOKEN_LEN: usize = 4096;
+const MAX_RESPONSE_LEN: usize = MAX_ENCODED_BUNDLE_LEN + 128 * 1024;
+const MAX_ETAG_LEN: usize = 1024;
+const MAX_REQUEST_ID_LEN: usize = 256;
+const GIST_ACCEPT: &str = "application/vnd.github+json";
+const GITHUB_API_VERSION: &str = "2022-11-28";
+const GIST_DESCRIPTION: &str = "EnvSync encrypted workspace bundle";
 
 /// 一个经过语法校验的 Gist 标识。
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -91,7 +99,7 @@ impl fmt::Debug for GistCredentials {
 pub struct GistRevision {
     gist_id: GistId,
     header: GistBundleHeader,
-    etag: String,
+    etag: Option<String>,
 }
 
 impl GistRevision {
@@ -151,6 +159,10 @@ impl fmt::Debug for GistBundleRecord {
 /// Gist 后端的稳定错误。
 pub struct GistError {
     kind: GistErrorKind,
+    operation: &'static str,
+    status: Option<u16>,
+    observed_revision: Option<u64>,
+    request_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -161,50 +173,169 @@ enum GistErrorKind {
     InvalidBundle(&'static str),
     WorkspaceMismatch,
     RevisionNotNext,
+    UnconfirmedRevision,
     NotImplemented,
+    Authentication,
+    Forbidden,
+    NotFound,
+    RateLimited,
+    Timeout,
+    Transport,
+    HttpStatus,
+    ResponseTooLarge,
+    InvalidResponse,
+    MissingEtag,
+    InvalidRawUrl,
 }
 
 impl GistError {
-    fn invalid_api_base() -> Self {
+    fn local(kind: GistErrorKind) -> Self {
         Self {
-            kind: GistErrorKind::InvalidApiBase,
+            kind,
+            operation: "local",
+            status: None,
+            observed_revision: None,
+            request_id: None,
         }
+    }
+
+    fn response(
+        kind: GistErrorKind,
+        operation: &'static str,
+        status: Option<StatusCode>,
+        request_id: Option<String>,
+    ) -> Self {
+        Self {
+            kind,
+            operation,
+            status: status.map(|status| status.as_u16()),
+            observed_revision: None,
+            request_id,
+        }
+    }
+
+    fn invalid_api_base() -> Self {
+        Self::local(GistErrorKind::InvalidApiBase)
     }
 
     fn invalid_credentials() -> Self {
-        Self {
-            kind: GistErrorKind::InvalidCredentials,
-        }
+        Self::local(GistErrorKind::InvalidCredentials)
     }
 
     fn invalid_gist_id() -> Self {
-        Self {
-            kind: GistErrorKind::InvalidGistId,
-        }
+        Self::local(GistErrorKind::InvalidGistId)
     }
 
     fn invalid_bundle(bundle_code: &'static str) -> Self {
-        Self {
-            kind: GistErrorKind::InvalidBundle(bundle_code),
-        }
+        Self::local(GistErrorKind::InvalidBundle(bundle_code))
     }
 
     fn workspace_mismatch() -> Self {
-        Self {
-            kind: GistErrorKind::WorkspaceMismatch,
-        }
+        Self::local(GistErrorKind::WorkspaceMismatch)
     }
 
     fn revision_not_next() -> Self {
-        Self {
-            kind: GistErrorKind::RevisionNotNext,
-        }
+        Self::local(GistErrorKind::RevisionNotNext)
     }
 
     fn not_implemented() -> Self {
-        Self {
-            kind: GistErrorKind::NotImplemented,
-        }
+        Self::local(GistErrorKind::NotImplemented)
+    }
+
+    fn unconfirmed_revision() -> Self {
+        Self::local(GistErrorKind::UnconfirmedRevision)
+    }
+
+    fn invalid_response(
+        operation: &'static str,
+        status: Option<StatusCode>,
+        request_id: Option<String>,
+    ) -> Self {
+        Self::response(
+            GistErrorKind::InvalidResponse,
+            operation,
+            status,
+            request_id,
+        )
+    }
+
+    fn response_too_large(
+        operation: &'static str,
+        status: Option<StatusCode>,
+        request_id: Option<String>,
+    ) -> Self {
+        Self::response(
+            GistErrorKind::ResponseTooLarge,
+            operation,
+            status,
+            request_id,
+        )
+    }
+
+    fn missing_etag(
+        operation: &'static str,
+        status: StatusCode,
+        request_id: Option<String>,
+    ) -> Self {
+        Self::response(
+            GistErrorKind::MissingEtag,
+            operation,
+            Some(status),
+            request_id,
+        )
+    }
+
+    fn invalid_raw_url(
+        operation: &'static str,
+        status: StatusCode,
+        request_id: Option<String>,
+    ) -> Self {
+        Self::response(
+            GistErrorKind::InvalidRawUrl,
+            operation,
+            Some(status),
+            request_id,
+        )
+    }
+
+    fn request_error(operation: &'static str, error: &reqwest::Error) -> Self {
+        let kind = if error.is_timeout() {
+            GistErrorKind::Timeout
+        } else {
+            GistErrorKind::Transport
+        };
+        Self::response(kind, operation, None, None)
+    }
+
+    fn body_error(
+        operation: &'static str,
+        status: StatusCode,
+        request_id: Option<String>,
+        error: &std::io::Error,
+    ) -> Self {
+        let kind = if error.kind() == std::io::ErrorKind::TimedOut {
+            GistErrorKind::Timeout
+        } else {
+            GistErrorKind::Transport
+        };
+        Self::response(kind, operation, Some(status), request_id)
+    }
+
+    fn status_error(
+        operation: &'static str,
+        status: StatusCode,
+        headers: &HeaderMap,
+        request_id: Option<String>,
+    ) -> Self {
+        let kind = match status {
+            StatusCode::UNAUTHORIZED => GistErrorKind::Authentication,
+            StatusCode::FORBIDDEN if is_rate_limited(headers) => GistErrorKind::RateLimited,
+            StatusCode::FORBIDDEN => GistErrorKind::Forbidden,
+            StatusCode::NOT_FOUND => GistErrorKind::NotFound,
+            StatusCode::TOO_MANY_REQUESTS => GistErrorKind::RateLimited,
+            _ => GistErrorKind::HttpStatus,
+        };
+        Self::response(kind, operation, Some(status), request_id)
     }
 
     /// 返回稳定的机器可读错误码。
@@ -221,7 +352,19 @@ impl GistError {
             GistErrorKind::InvalidBundle(_) => "gist.invalid_bundle",
             GistErrorKind::WorkspaceMismatch => "gist.workspace_mismatch",
             GistErrorKind::RevisionNotNext => "gist.revision_not_next",
+            GistErrorKind::UnconfirmedRevision => "gist.unconfirmed_revision",
             GistErrorKind::NotImplemented => "gist.not_implemented",
+            GistErrorKind::Authentication => "gist.authentication",
+            GistErrorKind::Forbidden => "gist.forbidden",
+            GistErrorKind::NotFound => "gist.not_found",
+            GistErrorKind::RateLimited => "gist.rate_limited",
+            GistErrorKind::Timeout => "gist.timeout",
+            GistErrorKind::Transport => "gist.transport",
+            GistErrorKind::HttpStatus => "gist.http_status",
+            GistErrorKind::ResponseTooLarge => "gist.response_too_large",
+            GistErrorKind::InvalidResponse => "gist.invalid_response",
+            GistErrorKind::MissingEtag => "gist.missing_etag",
+            GistErrorKind::InvalidRawUrl => "gist.invalid_raw_url",
         }
     }
 }
@@ -235,7 +378,19 @@ impl fmt::Display for GistError {
             GistErrorKind::InvalidBundle(_) => "Gist Bundle 无效",
             GistErrorKind::WorkspaceMismatch => "Gist Bundle 工作区不匹配",
             GistErrorKind::RevisionNotNext => "Gist Bundle revision 必须恰好递增 1",
+            GistErrorKind::UnconfirmedRevision => "Gist revision 尚未通过读取确认",
             GistErrorKind::NotImplemented => "Gist HTTP 操作尚未实现",
+            GistErrorKind::Authentication => "Gist 认证失败",
+            GistErrorKind::Forbidden => "Gist 访问被拒绝",
+            GistErrorKind::NotFound => "Gist 不存在",
+            GistErrorKind::RateLimited => "Gist 请求受限",
+            GistErrorKind::Timeout => "Gist 请求超时",
+            GistErrorKind::Transport => "Gist 传输失败",
+            GistErrorKind::HttpStatus => "Gist HTTP 状态异常",
+            GistErrorKind::ResponseTooLarge => "Gist 响应超过大小上限",
+            GistErrorKind::InvalidResponse => "Gist 响应格式无效",
+            GistErrorKind::MissingEtag => "Gist 响应缺少 ETag",
+            GistErrorKind::InvalidRawUrl => "Gist raw URL 不符合安全约束",
         };
         formatter.write_str(message)
     }
@@ -243,6 +398,14 @@ impl fmt::Display for GistError {
 
 impl fmt::Debug for GistError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // HTTP metadata is intentionally retained for future control flow but never rendered:
+        // it is remote-controlled and must not become a logging side channel.
+        let _metadata = (
+            self.operation,
+            self.status,
+            self.observed_revision,
+            &self.request_id,
+        );
         formatter
             .debug_struct("GistError")
             .field("code", &self.code())
@@ -294,32 +457,119 @@ impl GistBackend {
         encoded: &str,
     ) -> Result<GistBundleRecord, GistError> {
         let header = inspect(encoded)?;
-        let _ = (
-            self.api_base.as_str(),
-            &self.client,
-            credentials.secret_ref.as_str(),
-            credentials.token.as_str(),
-            header,
-        );
-        Err(GistError::not_implemented())
+        let filename = gist_bundle_filename(header.workspace);
+        let body = json!({
+            "description": GIST_DESCRIPTION,
+            "public": false,
+            "files": { filename: { "content": encoded } },
+        });
+        let url = self.api_url(&["gists"])?;
+        let response = self
+            .api_request(self.client.post(url), credentials)
+            .json(&body)
+            .send()
+            .map_err(|error| GistError::request_error("create", &error))?;
+        let (status, request_id) = response_context(&response);
+        if !status.is_success() {
+            return Err(GistError::status_error(
+                "create",
+                status,
+                response.headers(),
+                request_id,
+            ));
+        }
+        let bytes = read_bounded_response(response, "create", status, request_id.clone())?;
+        let value: Value = serde_json::from_slice(&bytes)
+            .map_err(|_| GistError::invalid_response("create", Some(status), request_id.clone()))?;
+        let id = value
+            .get("id")
+            .and_then(Value::as_str)
+            .and_then(|id| GistId::parse(id).ok())
+            .ok_or_else(|| GistError::invalid_response("create", Some(status), request_id))?;
+
+        Ok(GistBundleRecord {
+            encoded: encoded.to_owned(),
+            revision: GistRevision {
+                gist_id: id,
+                header,
+                etag: None,
+            },
+        })
     }
 
-    /// 读取工作区的 Gist Bundle；当前不会发出网络请求。
+    /// 读取工作区的 Gist Bundle，并保存服务端 authoritative ETag。
     pub fn read(
         &self,
         credentials: &GistCredentials,
         gist: &GistId,
         workspace: WorkspaceId,
     ) -> Result<GistBundleRecord, GistError> {
-        let _ = (
-            self.api_base.as_str(),
-            &self.client,
-            credentials.secret_ref.as_str(),
-            credentials.token.as_str(),
-            gist,
-            workspace,
-        );
-        Err(GistError::not_implemented())
+        let url = self.api_url(&["gists", gist.as_str()])?;
+        let response = self
+            .api_request(self.client.get(url), credentials)
+            .send()
+            .map_err(|error| GistError::request_error("read", &error))?;
+        let (status, request_id) = response_context(&response);
+        if !status.is_success() {
+            return Err(GistError::status_error(
+                "read",
+                status,
+                response.headers(),
+                request_id,
+            ));
+        }
+        let etag = validated_etag(response.headers());
+        let bytes = read_bounded_response(response, "read", status, request_id.clone())?;
+        let value: Value = serde_json::from_slice(&bytes)
+            .map_err(|_| GistError::invalid_response("read", Some(status), request_id.clone()))?;
+        let filename = gist_bundle_filename(workspace);
+        let file = value
+            .get("files")
+            .and_then(Value::as_object)
+            .and_then(|files| files.get(&filename))
+            .and_then(Value::as_object)
+            .ok_or_else(|| GistError::invalid_response("read", Some(status), request_id.clone()))?;
+        let truncated = file
+            .get("truncated")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| GistError::invalid_response("read", Some(status), request_id.clone()))?;
+        let etag =
+            etag.ok_or_else(|| GistError::missing_etag("read", status, request_id.clone()))?;
+        let encoded = if truncated {
+            let raw_url = file
+                .get("raw_url")
+                .and_then(Value::as_str)
+                .and_then(|raw_url| self.validate_raw_url(raw_url).ok())
+                .ok_or_else(|| GistError::invalid_raw_url("read", status, request_id.clone()))?;
+            self.read_raw(&raw_url)?
+        } else {
+            file.get("content")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    GistError::invalid_response("read", Some(status), request_id.clone())
+                })?
+        };
+        if encoded.len() > MAX_ENCODED_BUNDLE_LEN {
+            return Err(GistError::response_too_large(
+                "read",
+                Some(status),
+                request_id,
+            ));
+        }
+        let header = inspect(&encoded)?;
+        if header.workspace != workspace {
+            return Err(GistError::workspace_mismatch());
+        }
+
+        Ok(GistBundleRecord {
+            encoded,
+            revision: GistRevision {
+                gist_id: gist.clone(),
+                header,
+                etag: Some(etag),
+            },
+        })
     }
 
     /// 以 ETag 为条件发布下一 revision；当前仅执行本地 Bundle 校验。
@@ -335,7 +585,7 @@ impl GistBackend {
             &self.client,
             credentials.secret_ref.as_str(),
             credentials.token.as_str(),
-            expected.etag.as_str(),
+            expected.etag.as_deref(),
         );
         if candidate.workspace != expected.header.workspace {
             return Err(GistError::workspace_mismatch());
@@ -348,7 +598,79 @@ impl GistBackend {
         {
             return Err(GistError::revision_not_next());
         }
+        if expected.etag.is_none() {
+            return Err(GistError::unconfirmed_revision());
+        }
         Err(GistError::not_implemented())
+    }
+
+    fn api_url(&self, segments: &[&str]) -> Result<Url, GistError> {
+        let mut url = self.api_base.clone();
+        let mut path = url
+            .path_segments_mut()
+            .map_err(|_| GistError::invalid_api_base())?;
+        for segment in segments {
+            path.push(segment);
+        }
+        drop(path);
+        Ok(url)
+    }
+
+    fn api_request(
+        &self,
+        request: reqwest::blocking::RequestBuilder,
+        credentials: &GistCredentials,
+    ) -> reqwest::blocking::RequestBuilder {
+        request
+            .header(header::ACCEPT, GIST_ACCEPT)
+            .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
+            .header(header::USER_AGENT, "envsync")
+            .header(
+                header::AUTHORIZATION,
+                format!("Bearer {}", credentials.token.as_str()),
+            )
+    }
+
+    fn validate_raw_url(&self, text: &str) -> Result<Url, GistError> {
+        let raw_url = Url::parse(text).map_err(|_| GistError::invalid_api_base())?;
+        if !raw_url.has_authority()
+            || !raw_url.username().is_empty()
+            || raw_url.password().is_some()
+            || raw_url.query().is_some()
+            || raw_url.fragment().is_some()
+        {
+            return Err(GistError::invalid_api_base());
+        }
+        let api_origin = self.api_base.origin();
+        let github_raw_origin = Url::parse("https://gist.githubusercontent.com/")
+            .expect("固定 GitHub raw Gist URL 必须有效")
+            .origin();
+        let is_public_github_api = self.api_base.as_str() == GITHUB_API_BASE;
+        let is_allowed_same_origin = !is_public_github_api && raw_url.origin() == api_origin;
+        if !is_allowed_same_origin && raw_url.origin() != github_raw_origin {
+            return Err(GistError::invalid_api_base());
+        }
+        Ok(raw_url)
+    }
+
+    fn read_raw(&self, raw_url: &Url) -> Result<String, GistError> {
+        let response = self
+            .client
+            .get(raw_url.clone())
+            .send()
+            .map_err(|error| GistError::request_error("read_raw", &error))?;
+        let (status, request_id) = response_context(&response);
+        if !status.is_success() {
+            return Err(GistError::status_error(
+                "read_raw",
+                status,
+                response.headers(),
+                request_id,
+            ));
+        }
+        let bytes = read_bounded_response(response, "read_raw", status, request_id.clone())?;
+        String::from_utf8(bytes)
+            .map_err(|_| GistError::invalid_response("read_raw", Some(status), request_id))
     }
 }
 
@@ -363,6 +685,67 @@ impl fmt::Debug for GistBackend {
 
 fn inspect(encoded: &str) -> Result<GistBundleHeader, GistError> {
     gist_bundle::inspect(encoded).map_err(|error| GistError::invalid_bundle(error.code()))
+}
+
+fn response_context(response: &reqwest::blocking::Response) -> (StatusCode, Option<String>) {
+    let request_id = response
+        .headers()
+        .get("X-GitHub-Request-Id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= MAX_REQUEST_ID_LEN
+                && value.bytes().all(|byte| byte.is_ascii_graphic())
+        })
+        .map(str::to_owned);
+    tracing::debug!(github_request_id = ?request_id);
+    (response.status(), request_id)
+}
+
+fn read_bounded_response(
+    response: reqwest::blocking::Response,
+    operation: &'static str,
+    status: StatusCode,
+    request_id: Option<String>,
+) -> Result<Vec<u8>, GistError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RESPONSE_LEN as u64)
+    {
+        return Err(GistError::response_too_large(
+            operation,
+            Some(status),
+            request_id,
+        ));
+    }
+    let mut bytes = Vec::new();
+    response
+        .take(MAX_RESPONSE_LEN as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| GistError::body_error(operation, status, request_id.clone(), &error))?;
+    if bytes.len() > MAX_RESPONSE_LEN {
+        return Err(GistError::response_too_large(
+            operation,
+            Some(status),
+            request_id,
+        ));
+    }
+    Ok(bytes)
+}
+
+fn validated_etag(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty() && value.len() <= MAX_ETAG_LEN)
+        .map(str::to_owned)
+}
+
+fn is_rate_limited(headers: &HeaderMap) -> bool {
+    headers
+        .get("X-RateLimit-Remaining")
+        .is_some_and(|value| value.as_bytes() == b"0")
+        || headers.contains_key(header::RETRY_AFTER)
 }
 
 fn validate_api_base(text: &str) -> Result<Url, GistError> {
@@ -502,7 +885,7 @@ mod tests {
                     signer: signer.device_id(),
                     object_count: 2,
                 },
-                etag: "etag-must-not-appear".to_owned(),
+                etag: Some("etag-must-not-appear".to_owned()),
             },
         };
 
