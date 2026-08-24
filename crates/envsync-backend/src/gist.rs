@@ -6,7 +6,9 @@
 use std::fmt;
 use std::io::Read;
 use std::net::IpAddr;
-use std::time::Duration;
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use envsync_crypto::sealed::SecretId;
 use envsync_crypto::suite::Plaintext;
@@ -26,6 +28,7 @@ const MAX_TOKEN_LEN: usize = 4096;
 const MAX_RESPONSE_LEN: usize = MAX_ENCODED_BUNDLE_LEN + 128 * 1024;
 const MAX_ETAG_LEN: usize = 1024;
 const MAX_REQUEST_ID_LEN: usize = 256;
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 const GIST_ACCEPT: &str = "application/vnd.github+json";
 const GITHUB_API_VERSION: &str = "2022-11-28";
 const GIST_DESCRIPTION: &str = "EnvSync encrypted workspace bundle";
@@ -86,6 +89,7 @@ impl GistCredentials {
 
 impl fmt::Debug for GistCredentials {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _secret_ref = &self.secret_ref;
         formatter
             .debug_struct("GistCredentials")
             .field("secret_ref", &"<redacted>")
@@ -174,7 +178,8 @@ enum GistErrorKind {
     WorkspaceMismatch,
     RevisionNotNext,
     UnconfirmedRevision,
-    NotImplemented,
+    CasConflict { expected_revision: u64 },
+    UpdateOutcomeUnknown,
     Authentication,
     Forbidden,
     NotFound,
@@ -238,12 +243,43 @@ impl GistError {
         Self::local(GistErrorKind::RevisionNotNext)
     }
 
-    fn not_implemented() -> Self {
-        Self::local(GistErrorKind::NotImplemented)
-    }
-
     fn unconfirmed_revision() -> Self {
         Self::local(GistErrorKind::UnconfirmedRevision)
+    }
+
+    fn cas_conflict(expected: &GistRevision, observed: &GistRevision) -> Self {
+        Self {
+            kind: GistErrorKind::CasConflict {
+                expected_revision: expected.header.revision,
+            },
+            operation: "compare_and_swap",
+            status: None,
+            observed_revision: Some(observed.header.revision),
+            request_id: None,
+        }
+    }
+
+    fn update_outcome_unknown() -> Self {
+        Self {
+            kind: GistErrorKind::UpdateOutcomeUnknown,
+            operation: "compare_and_swap",
+            status: None,
+            observed_revision: None,
+            request_id: None,
+        }
+    }
+
+    fn rate_limited(
+        operation: &'static str,
+        status: StatusCode,
+        request_id: Option<String>,
+    ) -> Self {
+        Self::response(
+            GistErrorKind::RateLimited,
+            operation,
+            Some(status),
+            request_id,
+        )
     }
 
     fn invalid_response(
@@ -353,7 +389,8 @@ impl GistError {
             GistErrorKind::WorkspaceMismatch => "gist.workspace_mismatch",
             GistErrorKind::RevisionNotNext => "gist.revision_not_next",
             GistErrorKind::UnconfirmedRevision => "gist.unconfirmed_revision",
-            GistErrorKind::NotImplemented => "gist.not_implemented",
+            GistErrorKind::CasConflict { .. } => "gist.cas_conflict",
+            GistErrorKind::UpdateOutcomeUnknown => "gist.update_outcome_unknown",
             GistErrorKind::Authentication => "gist.authentication",
             GistErrorKind::Forbidden => "gist.forbidden",
             GistErrorKind::NotFound => "gist.not_found",
@@ -379,7 +416,8 @@ impl fmt::Display for GistError {
             GistErrorKind::WorkspaceMismatch => "Gist Bundle 工作区不匹配",
             GistErrorKind::RevisionNotNext => "Gist Bundle revision 必须恰好递增 1",
             GistErrorKind::UnconfirmedRevision => "Gist revision 尚未通过读取确认",
-            GistErrorKind::NotImplemented => "Gist HTTP 操作尚未实现",
+            GistErrorKind::CasConflict { .. } => "Gist CAS 冲突",
+            GistErrorKind::UpdateOutcomeUnknown => "Gist 更新结果未知",
             GistErrorKind::Authentication => "Gist 认证失败",
             GistErrorKind::Forbidden => "Gist 访问被拒绝",
             GistErrorKind::NotFound => "Gist 不存在",
@@ -400,9 +438,14 @@ impl fmt::Debug for GistError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         // HTTP metadata is intentionally retained for future control flow but never rendered:
         // it is remote-controlled and must not become a logging side channel.
+        let expected_revision = match &self.kind {
+            GistErrorKind::CasConflict { expected_revision } => Some(*expected_revision),
+            _ => None,
+        };
         let _metadata = (
             self.operation,
             self.status,
+            expected_revision,
             self.observed_revision,
             &self.request_id,
         );
@@ -415,10 +458,23 @@ impl fmt::Debug for GistError {
 
 impl std::error::Error for GistError {}
 
+trait Sleeper: Send + Sync {
+    fn sleep(&self, duration: Duration);
+}
+
+struct ThreadSleeper;
+
+impl Sleeper for ThreadSleeper {
+    fn sleep(&self, duration: Duration) {
+        thread::sleep(duration);
+    }
+}
+
 /// GitHub Gist 后端。
 pub struct GistBackend {
     api_base: Url,
     client: reqwest::blocking::Client,
+    sleeper: Arc<dyn Sleeper>,
 }
 
 impl GistBackend {
@@ -439,7 +495,11 @@ impl GistBackend {
             .retry(reqwest::retry::never())
             .build()
             .map_err(|_| GistError::invalid_api_base())?;
-        Ok(Self { api_base, client })
+        Ok(Self {
+            api_base,
+            client,
+            sleeper: Arc::new(ThreadSleeper),
+        })
     }
 
     /// 返回此后端的能力声明。
@@ -450,7 +510,7 @@ impl GistBackend {
         }
     }
 
-    /// 创建一个非公开 Gist；当前仅执行本地 Bundle 校验。
+    /// 创建一个非公开 Gist，并返回服务端分配的 Gist 标识。
     pub fn create(
         &self,
         credentials: &GistCredentials,
@@ -504,55 +564,98 @@ impl GistBackend {
         gist: &GistId,
         workspace: WorkspaceId,
     ) -> Result<GistBundleRecord, GistError> {
-        let url = self.api_url(&["gists", gist.as_str()])?;
-        let response = self
-            .api_request(self.client.get(url), credentials)
-            .send()
-            .map_err(|error| GistError::request_error("read", &error))?;
-        let (status, request_id) = response_context(&response);
-        if !status.is_success() {
-            return Err(GistError::status_error(
-                "read",
-                status,
-                response.headers(),
-                request_id,
-            ));
+        self.read_api(credentials, gist, workspace, "read", true)
+    }
+
+    fn read_api(
+        &self,
+        credentials: &GistCredentials,
+        gist: &GistId,
+        workspace: WorkspaceId,
+        operation: &'static str,
+        retry_rate_limit: bool,
+    ) -> Result<GistBundleRecord, GistError> {
+        let mut retried = false;
+        loop {
+            let url = self.api_url(&["gists", gist.as_str()])?;
+            let response = self
+                .api_request(self.client.get(url), credentials)
+                .send()
+                .map_err(|error| GistError::request_error(operation, &error))?;
+            let (status, request_id) = response_context(&response);
+            if !status.is_success() {
+                if is_read_rate_limited(status, response.headers()) {
+                    if retry_rate_limit && !retried {
+                        if let Some(delay) = bounded_retry_delay(response.headers()) {
+                            self.sleep_for_rate_limit_retry(delay);
+                            retried = true;
+                            continue;
+                        }
+                    }
+                    return Err(GistError::rate_limited(operation, status, request_id));
+                }
+                return Err(GistError::status_error(
+                    operation,
+                    status,
+                    response.headers(),
+                    request_id,
+                ));
+            }
+
+            return self
+                .parse_gist_response(response, operation, status, request_id, gist, workspace);
         }
+    }
+
+    fn parse_gist_response(
+        &self,
+        response: reqwest::blocking::Response,
+        operation: &'static str,
+        status: StatusCode,
+        request_id: Option<String>,
+        gist: &GistId,
+        workspace: WorkspaceId,
+    ) -> Result<GistBundleRecord, GistError> {
         let etag = validated_etag(response.headers());
-        let bytes = read_bounded_response(response, "read", status, request_id.clone())?;
-        let value: Value = serde_json::from_slice(&bytes)
-            .map_err(|_| GistError::invalid_response("read", Some(status), request_id.clone()))?;
+        let bytes = read_bounded_response(response, operation, status, request_id.clone())?;
+        let value: Value = serde_json::from_slice(&bytes).map_err(|_| {
+            GistError::invalid_response(operation, Some(status), request_id.clone())
+        })?;
         let filename = gist_bundle_filename(workspace);
         let file = value
             .get("files")
             .and_then(Value::as_object)
             .and_then(|files| files.get(&filename))
             .and_then(Value::as_object)
-            .ok_or_else(|| GistError::invalid_response("read", Some(status), request_id.clone()))?;
+            .ok_or_else(|| {
+                GistError::invalid_response(operation, Some(status), request_id.clone())
+            })?;
         let truncated = file
             .get("truncated")
             .and_then(Value::as_bool)
-            .ok_or_else(|| GistError::invalid_response("read", Some(status), request_id.clone()))?;
+            .ok_or_else(|| {
+                GistError::invalid_response(operation, Some(status), request_id.clone())
+            })?;
         let etag =
-            etag.ok_or_else(|| GistError::missing_etag("read", status, request_id.clone()))?;
+            etag.ok_or_else(|| GistError::missing_etag(operation, status, request_id.clone()))?;
         let encoded = if truncated {
             let raw_url = file
                 .get("raw_url")
                 .and_then(Value::as_str)
                 .and_then(|raw_url| self.validate_raw_url(raw_url).ok())
-                .ok_or_else(|| GistError::invalid_raw_url("read", status, request_id.clone()))?;
+                .ok_or_else(|| GistError::invalid_raw_url(operation, status, request_id.clone()))?;
             self.read_raw(&raw_url)?
         } else {
             file.get("content")
                 .and_then(Value::as_str)
                 .map(str::to_owned)
                 .ok_or_else(|| {
-                    GistError::invalid_response("read", Some(status), request_id.clone())
+                    GistError::invalid_response(operation, Some(status), request_id.clone())
                 })?
         };
         if encoded.len() > MAX_ENCODED_BUNDLE_LEN {
             return Err(GistError::response_too_large(
-                "read",
+                operation,
                 Some(status),
                 request_id,
             ));
@@ -572,7 +675,7 @@ impl GistBackend {
         })
     }
 
-    /// 以 ETag 为条件发布下一 revision；当前仅执行本地 Bundle 校验。
+    /// 以 ETag 为条件发布下一 revision，并以后读的完整候选 bytes 判定结果。
     pub fn compare_and_swap(
         &self,
         credentials: &GistCredentials,
@@ -580,13 +683,6 @@ impl GistBackend {
         encoded: &str,
     ) -> Result<GistBundleRecord, GistError> {
         let candidate = inspect(encoded)?;
-        let _ = (
-            self.api_base.as_str(),
-            &self.client,
-            credentials.secret_ref.as_str(),
-            credentials.token.as_str(),
-            expected.etag.as_deref(),
-        );
         if candidate.workspace != expected.header.workspace {
             return Err(GistError::workspace_mismatch());
         }
@@ -598,10 +694,65 @@ impl GistBackend {
         {
             return Err(GistError::revision_not_next());
         }
-        if expected.etag.is_none() {
-            return Err(GistError::unconfirmed_revision());
+        let expected_etag = expected
+            .etag
+            .as_deref()
+            .ok_or_else(GistError::unconfirmed_revision)?;
+
+        let filename = gist_bundle_filename(candidate.workspace);
+        let body = json!({
+            "files": { filename: { "content": encoded } },
+        });
+        let url = self.api_url(&["gists", expected.gist_id.as_str()])?;
+        let response = match self
+            .api_request(self.client.patch(url), credentials)
+            .header(header::IF_MATCH, expected_etag)
+            .json(&body)
+            .send()
+        {
+            Ok(response) => response,
+            Err(_) => return self.verify_after_patch(credentials, expected, encoded),
+        };
+        let (status, request_id) = response_context(&response);
+        if status.is_success()
+            || status == StatusCode::PRECONDITION_FAILED
+            || status.is_server_error()
+        {
+            return self.verify_after_patch(credentials, expected, encoded);
         }
-        Err(GistError::not_implemented())
+        Err(GistError::status_error(
+            "compare_and_swap",
+            status,
+            response.headers(),
+            request_id,
+        ))
+    }
+
+    fn verify_after_patch(
+        &self,
+        credentials: &GistCredentials,
+        expected: &GistRevision,
+        candidate: &str,
+    ) -> Result<GistBundleRecord, GistError> {
+        let observed = match self.read_api(
+            credentials,
+            &expected.gist_id,
+            expected.header.workspace,
+            "verify",
+            false,
+        ) {
+            Ok(record) => record,
+            Err(_) => return Err(GistError::update_outcome_unknown()),
+        };
+        if observed.encoded.as_bytes() == candidate.as_bytes() {
+            Ok(observed)
+        } else {
+            Err(GistError::cas_conflict(expected, observed.revision()))
+        }
+    }
+
+    fn sleep_for_rate_limit_retry(&self, delay: Duration) {
+        self.sleeper.sleep(delay);
     }
 
     fn api_url(&self, segments: &[&str]) -> Result<Url, GistError> {
@@ -752,6 +903,34 @@ fn is_rate_limited(headers: &HeaderMap) -> bool {
         || headers.contains_key(header::RETRY_AFTER)
 }
 
+fn is_read_rate_limited(status: StatusCode, headers: &HeaderMap) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS || is_rate_limited(headers)
+}
+
+fn bounded_retry_delay(headers: &HeaderMap) -> Option<Duration> {
+    if let Some(value) = headers.get(header::RETRY_AFTER) {
+        return parse_retry_after(value.to_str().ok()?);
+    }
+    let reset_at = headers
+        .get("X-RateLimit-Reset")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    bounded_delay(Duration::from_secs(reset_at.saturating_sub(now)))
+}
+
+fn parse_retry_after(value: &str) -> Option<Duration> {
+    let seconds = value.trim().parse::<u64>().ok()?;
+    bounded_delay(Duration::from_secs(seconds))
+}
+
+fn bounded_delay(delay: Duration) -> Option<Duration> {
+    (delay <= MAX_RETRY_DELAY).then_some(delay)
+}
+
 fn validate_api_base(text: &str) -> Result<Url, GistError> {
     let url = Url::parse(text).map_err(|_| GistError::invalid_api_base())?;
     if !url.has_authority()
@@ -785,7 +964,24 @@ mod tests {
     use envsync_crypto::sealed::SecretId;
     use envsync_crypto::suite::{KeyEpoch, Plaintext};
     use envsync_domain::WorkspaceId;
+    use reqwest::header::{self, HeaderMap};
     use reqwest::Url;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct RecordingSleeper {
+        durations: Mutex<Vec<Duration>>,
+    }
+
+    impl super::Sleeper for RecordingSleeper {
+        fn sleep(&self, duration: Duration) {
+            self.durations
+                .lock()
+                .expect("记录 sleeper duration")
+                .push(duration);
+        }
+    }
 
     #[test]
     fn github_uses_the_gist_backend_descriptor() {
@@ -911,6 +1107,7 @@ mod tests {
             client: reqwest::blocking::Client::builder()
                 .build()
                 .expect("测试客户端"),
+            sleeper: Arc::new(super::ThreadSleeper),
         };
 
         let debug = format!("{backend:?}");
@@ -918,6 +1115,32 @@ mod tests {
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("gist.example.test"));
         assert!(!debug.contains("/api/"));
+    }
+
+    #[test]
+    fn rate_limit_retry_uses_injected_sleeper() {
+        let sleeper = Arc::new(RecordingSleeper::default());
+        let backend = GistBackend {
+            api_base: Url::parse("https://gist.example.test/api/").expect("合法 API 基址"),
+            client: reqwest::blocking::Client::builder()
+                .build()
+                .expect("测试客户端"),
+            sleeper: sleeper.clone(),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RETRY_AFTER, header::HeaderValue::from_static("7"));
+
+        let delay = super::bounded_retry_delay(&headers).expect("Retry-After 必须可解析");
+        backend.sleep_for_rate_limit_retry(delay);
+
+        assert_eq!(
+            sleeper
+                .durations
+                .lock()
+                .expect("读取 sleeper 记录")
+                .as_slice(),
+            &[Duration::from_secs(7)]
+        );
     }
 
     #[test]
