@@ -61,7 +61,6 @@ thiserror.workspace = true
 #![warn(clippy::all)]
 
 pub mod manifest;
-pub mod rpc;
 ~~~
 
 - [ ] **Step 2: 写 manifest 失败测试与可复用合法 fixture**
@@ -242,6 +241,7 @@ git commit -m "feat(plugins): 定义严格插件 manifest"
 
 **Files:**
 
+- Modify: crates/envsync-plugin-api/src/lib.rs
 - Modify: crates/envsync-plugin-api/tests/compatibility.rs
 - Create: crates/envsync-plugin-api/tests/fixtures/initialize-request-v1.0.json
 - Create: crates/envsync-plugin-api/tests/fixtures/describe-response-v1.1.json
@@ -314,7 +314,7 @@ cargo test -p envsync-plugin-api --test compatibility golden_
 **Files:**
 
 - Create: crates/envsync-plugin-api/src/rpc.rs
-- Modify: crates/envsync-plugin-api/src/lib.rs
+- Modify: crates/envsync-plugin-api/src/lib.rs（在 rpc.rs 完整实现后才加入 pub mod rpc）
 - Modify: crates/envsync-plugin-api/tests/compatibility.rs
 
 - [ ] **Step 1: 定义封闭协议模型**
