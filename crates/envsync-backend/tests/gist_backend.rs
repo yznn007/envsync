@@ -495,7 +495,7 @@ fn read_transport_failure_is_safe() {
 }
 
 #[test]
-fn create_sends_one_private_post_without_implicit_read() {
+fn create_sends_one_secret_post_without_implicit_read() {
     let mock = MockGithub::start().expect("启动 GitHub mock");
     let (workspace, bundle, _) = sealed_bundles();
     let filename = gist_bundle_filename(workspace);

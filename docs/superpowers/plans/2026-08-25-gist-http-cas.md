@@ -37,8 +37,10 @@ CAS 语义与 Gist 的单文件、服务端非原子更新模型不相容。
    `inspect()` 的 wire-format 约束。
 4. 先写以下失败测试：
 
-   - `create_then_read_then_publish_sends_expected_contract`：`POST /gists` 的 body 为 private
-     Gist、唯一 `envsync-<workspace>.bundle` 文件；`GET /gists/<id>` 保存 ETag；`PATCH` 带
+   - `create_then_read_then_publish_sends_expected_contract`：`POST /gists` 的 body 为 secret
+     （`public: false`）Gist、唯一 `envsync-<workspace>.bundle` 文件；secret Gist 不被索引或
+     搜索，但 URL 持有者仍可读取；内容保密依赖 sealed bundle，不能把它作为访问控制。
+     `GET /gists/<id>` 保存 ETag；`PATCH` 带
      `If-Match`，成功后再 `GET`，并且新 bundle bytes、revision 与 head 都一致。
    - `descriptor_explicitly_reports_weak_cas`：`kind == "gist"` 且
      `supports_strong_cas == false`。
@@ -110,7 +112,7 @@ cargo test -p envsync-backend --test gist_backend
    GET 重试；所有 API
    请求固定 `Accept: application/vnd.github+json`、`X-GitHub-Api-Version: 2022-11-28`、
    `User-Agent: envsync` 和 `Authorization: Bearer <vault token>`。
-2. POST body 固定为 `public: false`（GitHub 的 secret Gist，而非访问控制意义的 private Gist）、
+2. POST body 固定为 `public: false`（GitHub 的 secret Gist，而非访问控制）、
    稳定 description 与从已检查 header 派生的唯一文件名。
    POST 成功后只从结构化 JSON 取 id，返回由候选 bundle 构造的**待确认**记录；调用方须显式
    `read()` 取得 authoritative ETag、bundle bytes 和 header。这样 `create` 不会隐式增加一次

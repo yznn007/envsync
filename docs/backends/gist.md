@@ -12,7 +12,7 @@ envsync-<workspace-uuid>.bundle
 的最小公开 bootstrap，详见下文。
 
 实现位于 `crates/envsync-backend/src/gist_bundle.rs`。本格式只负责 pack/unpack；GitHub
-HTTP、ETag 与 CAS 在后续 Gist backend 中处理。
+HTTP、ETag 与 CAS 由 `crates/envsync-backend/src/gist.rs` 处理。
 
 ## HTTP 与凭据
 

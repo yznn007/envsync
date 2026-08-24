@@ -1,7 +1,7 @@
 //! 受限的 GitHub Gist 后端边界。
 //!
-//! 本模块只持有经过校验的 API 基址和 Vault 提供的 token。它实现 Gist 的创建和读取
-//! 边界；弱 CAS 协议仍由后续任务实现。
+//! 本模块只持有经过校验的 API 基址和 Vault 提供的 token。它实现 Gist 的创建、读取与弱 CAS
+//! 边界。
 
 use std::fmt;
 use std::io::Read;
