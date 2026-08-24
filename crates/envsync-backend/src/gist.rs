@@ -153,7 +153,7 @@ pub struct GistError {
     kind: GistErrorKind,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum GistErrorKind {
     InvalidApiBase,
     InvalidCredentials,
@@ -209,11 +209,13 @@ impl GistError {
 
     /// 返回稳定的机器可读错误码。
     pub fn code(&self) -> &'static str {
-        match self.kind {
+        match &self.kind {
             GistErrorKind::InvalidApiBase => "gist.invalid_api_base",
             GistErrorKind::InvalidCredentials => "gist.invalid_credentials",
             GistErrorKind::InvalidGistId => "gist.invalid_gist_id",
-            GistErrorKind::InvalidBundle("gist_bundle.encoded_too_large") => {
+            GistErrorKind::InvalidBundle(bundle_code)
+                if *bundle_code == "gist_bundle.encoded_too_large" =>
+            {
                 "gist.bundle_too_large"
             }
             GistErrorKind::InvalidBundle(_) => "gist.invalid_bundle",
@@ -226,7 +228,7 @@ impl GistError {
 
 impl fmt::Display for GistError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let message = match self.kind {
+        let message = match &self.kind {
             GistErrorKind::InvalidApiBase => "Gist API 基址不符合安全约束",
             GistErrorKind::InvalidCredentials => "Gist 凭据无效",
             GistErrorKind::InvalidGistId => "Gist 标识无效",
@@ -367,6 +369,7 @@ fn validate_api_base(text: &str) -> Result<Url, GistError> {
     let url = Url::parse(text).map_err(|_| GistError::invalid_api_base())?;
     if !url.has_authority()
         || !url.path().starts_with('/')
+        || !url.path().ends_with('/')
         || !url.username().is_empty()
         || url.password().is_some()
         || url.query().is_some()
@@ -395,6 +398,7 @@ mod tests {
     use envsync_crypto::sealed::SecretId;
     use envsync_crypto::suite::{KeyEpoch, Plaintext};
     use envsync_domain::WorkspaceId;
+    use reqwest::Url;
 
     #[test]
     fn github_uses_the_gist_backend_descriptor() {
@@ -444,19 +448,42 @@ mod tests {
     }
 
     #[test]
-    fn api_base_refuses_unsafe_urls_without_echoing_them() {
-        let unsafe_url = "http://token@example.test/private?secret=token#fragment";
-        let error = GistBackend::with_api_base(unsafe_url, std::time::Duration::from_secs(1))
-            .expect_err("非 loopback HTTP、userinfo、query 与 fragment 均必须拒绝");
+    fn api_base_requires_trailing_slash_for_path_segments() {
+        let https_without_trailing_slash = "https://gist.example.test/api";
+        let error = GistBackend::with_api_base(
+            https_without_trailing_slash,
+            std::time::Duration::from_secs(1),
+        )
+        .expect_err("HTTPS 路径必须以斜杠结尾");
         assert_eq!(error.code(), "gist.invalid_api_base");
-        assert!(!error.to_string().contains("token"));
-        assert!(!format!("{error:?}").contains("token"));
+        assert!(!error.to_string().contains(https_without_trailing_slash));
+        assert!(!format!("{error:?}").contains(https_without_trailing_slash));
+
+        let loopback_without_trailing_slash = "http://127.0.0.1:8080/api";
+        let error = GistBackend::with_api_base(
+            loopback_without_trailing_slash,
+            std::time::Duration::from_secs(1),
+        )
+        .expect_err("回环 HTTP 路径必须以斜杠结尾");
+        assert_eq!(error.code(), "gist.invalid_api_base");
+        assert!(!error.to_string().contains(loopback_without_trailing_slash));
+        assert!(!format!("{error:?}").contains(loopback_without_trailing_slash));
 
         GistBackend::with_api_base(
             "http://127.0.0.1:8080/api/",
             std::time::Duration::from_secs(1),
         )
         .expect("loopback HTTP 仅供测试与本地 mock 使用");
+    }
+
+    #[test]
+    fn api_base_refuses_unsafe_urls_without_echoing_them() {
+        let unsafe_url = "http://token@example.test/private?secret=token#fragment";
+        let error = GistBackend::with_api_base(unsafe_url, std::time::Duration::from_secs(1))
+            .expect_err("非 loopback HTTP、userinfo、query 与 fragment 均必须拒绝");
+        assert_eq!(error.code(), "gist.invalid_api_base");
+        assert!(!error.to_string().contains(unsafe_url));
+        assert!(!format!("{error:?}").contains(unsafe_url));
     }
 
     #[test]
@@ -488,6 +515,22 @@ mod tests {
         assert!(!debug.contains("encoded-bundle-must-not-appear"));
         assert!(!debug.contains("gist-id-must-not-appear"));
         assert!(!debug.contains("etag-must-not-appear"));
+    }
+
+    #[test]
+    fn backend_debug_redacts_the_controlled_api_base() {
+        let backend = GistBackend {
+            api_base: Url::parse("https://gist.example.test/api/").expect("合法 API 基址"),
+            client: reqwest::blocking::Client::builder()
+                .build()
+                .expect("测试客户端"),
+        };
+
+        let debug = format!("{backend:?}");
+        assert!(debug.contains("GistBackend"));
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("gist.example.test"));
+        assert!(!debug.contains("/api/"));
     }
 
     #[test]
