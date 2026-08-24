@@ -21,6 +21,9 @@
     "allow-operation-rollback-review",
     "allow-operation-rollback",
     "allow-vault-metadata",
+    "allow-vault-set-secret",
+    "allow-device-list",
+    "allow-device-revoke",
     "allow-bundle-review",
     "allow-operation-cancel"
   ]

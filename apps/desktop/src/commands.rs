@@ -3,6 +3,7 @@
 //! 所有 command 都只接收 API v1 信封、强类型 ID 与已注册 workspace；本模块没有任意
 //! 路径、shell、HTTP 或 Vault 明文入口。失败一律映射成脱敏的 [`ApiResponse`]。
 
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::thread;
 
@@ -12,16 +13,18 @@ use envsync_backend::GitAuth;
 use envsync_core::{
     ApiEvent, ApiRequest, ApiRequestId, ApiResponse, ApplyCancellation, ApplyOutcome,
     ApplyStartView, ApplyView, CancellationView, ConflictDetailView, ConflictListView,
-    ConflictResolutionView, CoreError, CoreResult, DiffListView, EnvSyncService,
-    OperationDetailView, OperationHistoryView, OperationView, PlanView, RollbackReviewView,
-    RootCapabilityView, StatusView, ViewData, ViewDiagnostic, WorkspaceConfig,
-    WorkspaceRegistrationView, WorkspaceSummary,
+    ConflictResolutionView, CoreError, CoreResult, DeviceListView, DeviceRevocationView,
+    DiffListView, EnvSyncService, OperationDetailView, OperationHistoryView, OperationView,
+    PlanView, RollbackReviewView, RootCapabilityView, SecretInput, StatusView, VaultMetadataView,
+    VaultSetView, ViewData, ViewDiagnostic, WorkspaceConfig, WorkspaceRegistrationView,
+    WorkspaceSummary,
 };
 use envsync_domain::{ConflictId, OperationId, PlanId, ResolutionChoice, WorkspaceId};
 use envsync_platform::AuthorizedRoot;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::{DialogExt, FilePath};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::state::{DesktopState, DesktopStateError};
 
@@ -32,7 +35,7 @@ pub const OPERATION_EVENT: &str = "envsync://operation";
 ///
 /// 此列表也会写入 Tauri build manifest；新增 command 必须先添加安全测试、明确输入 View
 /// 和最小 capability，不能通过插件自动扩展。
-pub const ALLOWED_COMMANDS: [&str; 17] = [
+pub const ALLOWED_COMMANDS: [&str; 20] = [
     "onboarding_select_root",
     "onboarding_create_workspace",
     "onboarding_open_workspace",
@@ -48,6 +51,9 @@ pub const ALLOWED_COMMANDS: [&str; 17] = [
     "operation_rollback_review",
     "operation_rollback",
     "vault_metadata",
+    "vault_set_secret",
+    "device_list",
+    "device_revoke",
     "bundle_review",
     "operation_cancel",
 ];
@@ -205,6 +211,42 @@ pub struct RollbackExecutionRequest {
     pub review_token: String,
     /// 必须与审核响应中所有 inverse action 的序号一一对应。
     pub confirmations: Vec<u32>,
+}
+
+/// 一次性的 Vault 写入意图。
+///
+/// `secret_value` 只在当前 command 的栈中存在。该类型在离开作用域时主动清零，且成功
+/// response 不会回显它；Pinia、日志、诊断和 Rust 进程状态都不保存这个字段。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VaultSetSecretRequest {
+    /// 已注册工作区。
+    pub workspace_id: WorkspaceId,
+    /// 逻辑 Secret ID，不是路径。
+    pub secret_id: String,
+    /// 单次 modal buffer 里的明文；绝不被序列化进响应。
+    pub secret_value: String,
+}
+
+impl Drop for VaultSetSecretRequest {
+    fn drop(&mut self) {
+        self.secret_value.zeroize();
+    }
+}
+
+/// 撤销设备的受限意图。
+///
+/// 前端只能引用成员链中已有的设备标识，并在本地输入完全匹配的公开 ID 作为防误触
+/// 确认。core 仍会强制管理员、成员关系和轮换规则。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceRevokeRequest {
+    /// 已注册工作区。
+    pub workspace_id: WorkspaceId,
+    /// 待撤销设备的公开标识。
+    pub device_id: envsync_domain::DeviceId,
+    /// 必须与 `device_id` 完全一致的公开文本确认。
+    pub confirmation: String,
 }
 
 /// 让用户通过系统目录选择器授予一个目录能力。
@@ -693,16 +735,105 @@ pub fn operation_cancel(
     }
 }
 
-/// 返回 Vault metadata endpoint 的受控未配置状态。
+/// 返回 Vault metadata-only 清单。
 ///
-/// M4 后续 Vault 页面会将此 command 接到 metadata-only provider；在此之前不提供任何
-/// Vault get/reveal 回退路径。
+/// 服务层每次都从系统安全存储与当前后端重新打开 Vault；WebView 得到的仅是 Secret ID、
+/// 更新时间与引用资源，不能借此读取、复制或默认显示秘密值。
 #[tauri::command]
 pub fn vault_metadata(
     state: State<'_, DesktopState>,
     request: ApiRequest<WorkspaceRequest>,
-) -> ApiResponse<WorkspaceSummary> {
-    checked_unavailable(state.inner(), request, "desktop.vault_metadata_unavailable")
+) -> ApiResponse<VaultMetadataView> {
+    let request_id = request.request_id().clone();
+    if let Some(response) = schema_error(&request) {
+        return response;
+    }
+    match call_service(state.inner(), request.data().workspace_id, |service| {
+        service.vault_metadata_view()
+    }) {
+        Ok(view) => ApiResponse::ok(request_id, view, Vec::new()),
+        Err(error) => command_error(request_id, error),
+    }
+}
+
+/// 将单次 modal buffer 写入 Vault。
+///
+/// request 在 schema 校验后被消费，值移入 [`Zeroizing`] 并通过 `SecretInput` 交给 core；
+/// 期间没有日志、事件或 response 会携带明文。UI 只能传逻辑 ID，不能指定对象、路径或
+/// 输出目的地。
+#[tauri::command]
+pub fn vault_set_secret(
+    state: State<'_, DesktopState>,
+    request: ApiRequest<VaultSetSecretRequest>,
+) -> ApiResponse<VaultSetView> {
+    let request_id = request.request_id().clone();
+    if let Some(response) = schema_error(&request) {
+        return response;
+    }
+    let mut data = request.into_data();
+    let workspace = data.workspace_id;
+    let secret_id = std::mem::take(&mut data.secret_id);
+    let secret_value = Zeroizing::new(std::mem::take(&mut data.secret_value));
+    let mut reader = Cursor::new(secret_value.as_bytes());
+    let input = match SecretInput::from_reader(&mut reader) {
+        Ok(input) => input,
+        Err(error) => return command_error(request_id, CommandFailure::Core(error)),
+    };
+    match call_service(state.inner(), workspace, |service| {
+        service.set_vault_secret(&secret_id, input)
+    }) {
+        Ok(view) => ApiResponse::ok(request_id, view, Vec::new()),
+        Err(error) => command_error(request_id, error),
+    }
+}
+
+/// 列出已经过成员链验证的设备元数据。
+///
+/// 不传输设备私钥、公开材料、邀请内容或恢复短语；这些要么从系统安全存储读取，要么仍
+/// 留在受控的后端/CLI 流程中。
+#[tauri::command]
+pub fn device_list(
+    state: State<'_, DesktopState>,
+    request: ApiRequest<WorkspaceRequest>,
+) -> ApiResponse<DeviceListView> {
+    let request_id = request.request_id().clone();
+    if let Some(response) = schema_error(&request) {
+        return response;
+    }
+    match call_service(state.inner(), request.data().workspace_id, |service| {
+        service.device_list_view()
+    }) {
+        Ok(view) => ApiResponse::ok(request_id, view, Vec::new()),
+        Err(error) => command_error(request_id, error),
+    }
+}
+
+/// 撤销指定设备并触发 core 管理的密钥轮换。
+///
+/// 文本确认只防止误触；是否可执行始终由 core 重新验证。当前设备不能撤销自己，且任意
+/// 已撤销设备都必须经新的管理员邀请重新授权，不能用旧身份恢复访问。
+#[tauri::command]
+pub fn device_revoke(
+    state: State<'_, DesktopState>,
+    request: ApiRequest<DeviceRevokeRequest>,
+) -> ApiResponse<DeviceRevocationView> {
+    let request_id = request.request_id().clone();
+    if let Some(response) = schema_error(&request) {
+        return response;
+    }
+    let data = request.data();
+    if data.confirmation != data.device_id.to_string() {
+        return error_response(request_id, "device.revoke_confirmation_required");
+    }
+    let workspace = data.workspace_id;
+    let device = data.device_id;
+    let _operation_guard = state.inner().begin_operation();
+    match call_service(state.inner(), workspace, |service| {
+        service.revoke_device_for_desktop(device)
+    }) {
+        Ok(view) => ApiResponse::ok(request_id, view, Vec::new()),
+        Err(error) => command_error(request_id, error),
+    }
 }
 
 /// 返回 Bundle review endpoint 的受控未配置状态。
@@ -966,7 +1097,7 @@ fn checked_unavailable(
     }
 }
 
-fn schema_error<T: ViewData, P: Serialize>(request: &ApiRequest<P>) -> Option<ApiResponse<T>> {
+fn schema_error<T: ViewData, P>(request: &ApiRequest<P>) -> Option<ApiResponse<T>> {
     request.validate_schema().err().map(|_| {
         error_response(
             request.request_id().clone(),

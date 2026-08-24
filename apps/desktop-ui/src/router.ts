@@ -3,7 +3,11 @@ import { createRouter, createWebHashHistory } from 'vue-router'
 
 import ChangesPage from './pages/ChangesPage.vue'
 import ConflictsPage from './pages/ConflictsPage.vue'
+import DevicesPage from './pages/DevicesPage.vue'
 import HistoryPage from './pages/HistoryPage.vue'
+import AgentsPage from './pages/AgentsPage.vue'
+import PackagesPage from './pages/PackagesPage.vue'
+import VaultPage from './pages/VaultPage.vue'
 import WorkspacePage from './pages/WorkspacePage.vue'
 
 export const navigationItems = [
@@ -53,6 +57,14 @@ function pageFor(key: NavigationKey, label: string) {
       return ChangesPage
     case 'conflicts':
       return ConflictsPage
+    case 'packages':
+      return PackagesPage
+    case 'agents':
+      return AgentsPage
+    case 'vault':
+      return VaultPage
+    case 'devices':
+      return DevicesPage
     case 'history':
       return HistoryPage
     default:

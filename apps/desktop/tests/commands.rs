@@ -4,7 +4,8 @@ use envsync_core::ApiRequest;
 use envsync_desktop::{
     commands::{
         is_allowed_command, ApplyPlanRequest, ConflictResolutionRequest, CreateWorkspaceRequest,
-        OperationRequest, RollbackExecutionRequest, WorkspaceRequest, ALLOWED_COMMANDS,
+        DeviceRevokeRequest, OperationRequest, RollbackExecutionRequest, VaultSetSecretRequest,
+        WorkspaceRequest, ALLOWED_COMMANDS,
     },
     parse_safe_deep_link, SafeDeepLinkAction,
 };
@@ -30,6 +31,9 @@ fn only_reviewed_application_commands_are_exposed() {
             "operation_rollback_review",
             "operation_rollback",
             "vault_metadata",
+            "vault_set_secret",
+            "device_list",
+            "device_revoke",
             "bundle_review",
             "operation_cancel",
         ]
@@ -197,6 +201,36 @@ fn mutating_command_payloads_only_accept_registered_ids() {
     assert!(
         serde_json::from_value::<ApiRequest<RollbackExecutionRequest>>(direct_rollback).is_err(),
         "回滚必须携带原生审核 token 与逐项确认，不能从 UI 直接执行"
+    );
+
+    let unsafe_vault_set = serde_json::json!({
+        "schema_version": 1,
+        "request_id": "req-vault-path-injection",
+        "data": {
+            "workspace_id": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+            "secret_id": "ci/npm-token",
+            "secret_value": "must-never-echo",
+            "path": "/Users/alice/.ssh/id_ed25519"
+        }
+    });
+    assert!(
+        serde_json::from_value::<ApiRequest<VaultSetSecretRequest>>(unsafe_vault_set).is_err(),
+        "Vault 写入只接受逻辑 ID 与一次性值，不能接受路径"
+    );
+
+    let unsafe_revoke = serde_json::json!({
+        "schema_version": 1,
+        "request_id": "req-device-revoke-injection",
+        "data": {
+            "workspace_id": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+            "device_id": "1111111111111111111111111111111111111111111111111111111111111111",
+            "confirmation": "1111111111111111111111111111111111111111111111111111111111111111",
+            "shell": "rm -rf /"
+        }
+    });
+    assert!(
+        serde_json::from_value::<ApiRequest<DeviceRevokeRequest>>(unsafe_revoke).is_err(),
+        "设备撤销不得接受 shell 或其他未审核字段"
     );
 }
 

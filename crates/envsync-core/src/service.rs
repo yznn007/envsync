@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use envsync_backend::git_auth::validate_remote_url;
 use envsync_backend::{Backend, BackendError, GitBackend, GitConfig, LocalBackend};
+use envsync_crypto::sealed::SecretId;
 use envsync_domain::{
     Blob, BlobId, CborCodec, Conflict, ConflictId, ConflictKind, ConflictResolution,
     DesiredDisposition, DeviceId, DeviceProfile, FileMode, ObjectId, ObjectKind, Observation,
@@ -32,6 +33,7 @@ use envsync_domain::{
     ResourceId, SnapshotBody, SnapshotId, SnapshotSignature, StateRoot, StateRootId, WorkspaceId,
     WorkspaceRef,
 };
+use envsync_platform::secure_store::{open_system_store, SecureStore};
 use envsync_platform::{AuthorizedRoot, RelativeTarget, RootRegistry, SafeWriter};
 use envsync_storage::{ConflictRecord, ConflictStore, DraftStore, Journal, OperationState};
 
@@ -49,9 +51,11 @@ use crate::recovery::{PlanSource, RecoveryDiagnosis, RecoveryEngine, RecoveryRep
 use crate::render;
 use crate::sync::{self, ConflictDetail, FetchOutcome, MergeContext, MergeOutcome};
 use crate::view::{
-    ConflictDetailView, ConflictResolutionView, DiffListView, DiffView, OperationDetailView,
-    OperationHistoryView, RollbackReviewView,
+    ConflictDetailView, ConflictResolutionView, DeviceListView, DeviceRevocationView, DiffListView,
+    DiffView, OperationDetailView, OperationHistoryView, RollbackReviewView, VaultMetadataView,
+    VaultSetView,
 };
+use crate::{device_admin, vault, SecretInput, VaultDeps, VaultService};
 
 /// 桌面端单次手动冲突裁决正文的硬上限。
 ///
@@ -496,6 +500,59 @@ impl EnvSyncService {
     /// 只读访问操作日志。
     pub fn journal(&self) -> &Journal {
         &self.journal
+    }
+
+    /// 返回 Vault 的 metadata-only 清单。
+    ///
+    /// 这条 application-service 入口每次都新开 Vault，避免把成员链、密钥环或后端头的
+    /// 旧缓存跨越两次桌面 command 复用。返回值只包含逻辑 ID、更新时间与引用资源，不能
+    /// 用它读取、复制或显示任何秘密值。
+    pub fn vault_metadata_view(&self) -> CoreResult<VaultMetadataView> {
+        let service = self.open_vault_service()?;
+        let entries = service.list()?;
+        let index_missing = service.vault_index_missing()?;
+        Ok(VaultMetadataView::new(
+            self.config.workspace_id,
+            index_missing,
+            &entries,
+        ))
+    }
+
+    /// 通过已经打开的系统安全存储写入一条 Vault 值，并仅返回无明文回执。
+    ///
+    /// `SecretInput` 没有 `Debug` / `Display` / serialization，因此调用端无法把它误塞进
+    /// View API。桌面壳必须让它只在一次 IPC 调用栈中存在，并在响应前丢弃。
+    pub fn set_vault_secret(&mut self, id: &str, input: SecretInput) -> CoreResult<VaultSetView> {
+        let id = SecretId::parse(id)?;
+        let mut service = self.open_vault_service()?;
+        service.set(&id, input)?;
+        Ok(VaultSetView::new(id.as_str()))
+    }
+
+    /// 列出已经过成员链验证的设备；不暴露私钥、公开材料、邀请或恢复短语。
+    pub fn device_list_view(&self) -> CoreResult<DeviceListView> {
+        let service = self.open_vault_service()?;
+        let membership = service.membership()?;
+        let devices = device_admin::list_devices(&service)?;
+        Ok(DeviceListView::new(
+            self.config.workspace_id,
+            membership.epoch,
+            membership.sequence,
+            &devices,
+        ))
+    }
+
+    /// 撤销一台非本机设备并完成或恢复密钥轮换。
+    ///
+    /// 核心层会再次验证管理员身份、成员关系与“不能撤销当前设备”等不变量；桌面端的
+    /// 文本确认仅是防误触，绝不是安全决策。
+    pub fn revoke_device_for_desktop(
+        &mut self,
+        device: DeviceId,
+    ) -> CoreResult<DeviceRevocationView> {
+        let mut service = self.open_vault_service()?;
+        let outcome = service.revoke_device(device)?;
+        Ok(DeviceRevocationView::from(&outcome))
     }
 
     // ---- capture -------------------------------------------------------------
@@ -1561,6 +1618,25 @@ impl EnvSyncService {
                 },
             )
             .as_ref()
+    }
+
+    /// 为单次 Vault / 设备管理 command 重新打开服务。
+    ///
+    /// 普通同步服务与 Vault 使用同一份工作区配置、后端类型和时钟，但 Vault 必须从系统
+    /// 凭据库取得设备私钥与密钥环。这里没有任何明文文件回退：系统存储不可用时直接把
+    /// 平台错误交给上层，由 UI 显示稳定错误码并要求用户解锁凭据库。
+    fn open_vault_service(&self) -> CoreResult<VaultService> {
+        let secure: Arc<dyn SecureStore> = Arc::from(open_system_store()?);
+        let checkpoints: Arc<dyn CheckpointStore> =
+            Arc::new(SecureCheckpointStore::new(Arc::clone(&secure)));
+        let deps = VaultDeps {
+            workspace: self.config.workspace_id,
+            backend: vault::open_backend(&self.config.backend)?,
+            secure,
+            checkpoints,
+            clock: Arc::clone(&self.clock),
+        };
+        VaultService::open(deps, &self.config.vault_dir())
     }
 
     /// 读取后端引用，读不到时降级为本地记录的**上次已知** Ref。

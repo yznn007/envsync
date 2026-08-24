@@ -42,22 +42,22 @@ Playwright、shadcn-vue、reqwest、JSON-RPC、WASI Preview 2（实验适配器�
 - Test: `crates/envsync-core/tests/view_api.rs`
 - Create: `docs/api/application-service-v1.md`
 
-- [ ] **Step 1: 写脱敏 view 测试**
+- [x] **Step 1: 写脱敏 view 测试**
 
 WorkspaceSummary、StatusView、PlanView、DiffView、ConflictView、OperationView 均可
 序列化；放入 canary secret 后任何 JSON 不出现 canary。
 
-- [ ] **Step 2: 定义版本化 Request/Response**
+- [x] **Step 2: 定义版本化 Request/Response**
 
 所有 response 含 `schema_version`、request ID、status、data、diagnostics。长操作通过
 operation ID 和 event stream 更新；取消是显式 command。
 
-- [ ] **Step 3: 写兼容性 golden tests**
+- [x] **Step 3: 写兼容性 golden tests**
 
 将 v1 JSON 保存为 fixture，字段顺序不作为契约；删除/改名已有字段使测试失败。新增字段
 必须有默认或 minor version 规则。
 
-- [ ] **Step 4: 验证并提交**
+- [x] **Step 4: 验证并提交**
 
 ```bash
 cargo test -p envsync-core --test view_api
@@ -77,27 +77,27 @@ git commit -am "feat(api): 冻结桌面应用服务契约"
 - Create: `apps/desktop/capabilities/default.json`
 - Test: `apps/desktop/tests/commands.rs`
 
-- [ ] **Step 1: 写 command allowlist 测试**
+- [x] **Step 1: 写 command allowlist 测试**
 
 前端只能调用 workspace/status/plan/apply/rollback/conflict/vault metadata/bundle review
 命令；没有任意路径读写、任意 shell、任意 HTTP 或直接 secret get command。
 
-- [ ] **Step 2: 初始化 Tauri 壳**
+- [x] **Step 2: 初始化 Tauri 壳**
 
 CSP 禁止 remote script、`eval` 和任意 connect-src；只打包本地 UI。关闭不需要的
 shell/fs/http 插件。single-instance 仅转发安全的 deep-link action，不转发 secret。
 
-- [ ] **Step 3: command 参数验证**
+- [x] **Step 3: command 参数验证**
 
 所有 path 使用已经注册的 Workspace ID/Resource ID，不接收前端绝对路径。apply 必须接收
 Plan ID；Rust core 再次检查新鲜度。
 
-- [ ] **Step 4: 事件与取消**
+- [x] **Step 4: 事件与取消**
 
 事件只发送 view API；窗口关闭不杀死正在 journaled apply，后台完成后通知。取消只在安全
 边界生效并留下 operation 状态。
 
-- [ ] **Step 5: 验证并提交**
+- [x] **Step 5: 验证并提交**
 
 ```bash
 cargo test -p envsync-desktop
@@ -116,22 +116,22 @@ git commit -am "feat(desktop): 建立安全 Tauri 应用壳"
 - Create: `apps/desktop-ui/src/router.ts`
 - Test: `apps/desktop-ui/src/App.test.ts`
 
-- [ ] **Step 1: 建立设计 token**
+- [x] **Step 1: 建立设计 token**
 
 定义中性背景、语义状态色、4/8px spacing、字体层级、focus ring、motion duration；支持
 dark/light/high-contrast 和 reduced-motion。
 
-- [ ] **Step 2: 写导航测试**
+- [x] **Step 2: 写导航测试**
 
 Workspace、Changes、Conflicts、Packages、Agents、Vault、Devices、History、Settings。
 键盘可达，当前页面有 `aria-current`，窄窗口降级为 drawer。
 
-- [ ] **Step 3: 实现 app shell**
+- [x] **Step 3: 实现 app shell**
 
 Pinia 只存 view model 与 UI 状态，不存 secret plaintext。error boundary 展示 request ID
 和脱敏诊断。
 
-- [ ] **Step 4: lint/typecheck/test**
+- [x] **Step 4: lint/typecheck/test**
 
 ```bash
 pnpm --dir apps/desktop-ui lint
@@ -141,7 +141,7 @@ pnpm --dir apps/desktop-ui test
 
 Expected: 全部 exit 0。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add apps/desktop-ui
@@ -158,21 +158,21 @@ git commit -m "feat(ui): 建立桌面导航与设计系统"
 - Create: `apps/desktop-ui/src/stores/workspace.ts`
 - Test: `apps/desktop-ui/src/pages/OnboardingPage.test.ts`
 
-- [ ] **Step 1: 写 onboarding 测试**
+- [x] **Step 1: 写 onboarding 测试**
 
 创建/打开 Workspace、选择 Local/Git/Gist、授权根、设备 Profile。路径选择通过 Tauri
 dialog 后由 Rust 注册 capability，前端不保留绝对路径。
 
-- [ ] **Step 2: 实现状态 dashboard**
+- [x] **Step 2: 实现状态 dashboard**
 
 显示后端、head、设备、最近 sync、drift、未收敛 operation、安全告警。每个异常都有明确
 下一动作，不能只显示通用 error。
 
-- [ ] **Step 3: offline 与 loading 状态**
+- [x] **Step 3: offline 与 loading 状态**
 
 Git/Gist 不可达时展示本地最后状态及其时间；不得把不可达显示为 clean。
 
-- [ ] **Step 4: 验证并提交**
+- [x] **Step 4: 验证并提交**
 
 ```bash
 pnpm --dir apps/desktop-ui test -- OnboardingPage
@@ -226,27 +226,27 @@ git commit -am "feat(ui): 添加差异冲突与历史恢复"
 - Create: `apps/desktop-ui/src/pages/DevicesPage.vue`
 - Test: `apps/desktop-ui/src/pages/SecurityPages.test.ts`
 
-- [ ] **Step 1: Package 风险测试**
+- [x] **Step 1: Package 风险测试**
 
 install/upgrade/downgrade/uninstall/elevation 有不同标签。批量批准不能包含被 policy deny 的
 action。
 
-- [ ] **Step 2: Bundle 审核测试**
+- [x] **Step 2: Bundle 审核测试**
 
 显示 signer、digest、文件、capability、SecretRef 和版本 diff。新 capability 必须单独
 确认；quarantine 内容不能从 UI 直接执行。
 
-- [ ] **Step 3: Vault UI**
+- [x] **Step 3: Vault UI**
 
 列表只显示 Secret ID、更新时间、引用者。设置 secret 使用单次 modal buffer，提交或关闭后
 清空；不提供复制全部 vault 或 reveal-by-default。
 
-- [ ] **Step 4: Device UI**
+- [x] **Step 4: Device UI**
 
 邀请二维码/短码不得含 private material；撤销展示将触发 key rotation。恢复流程要求明确
 展示旧设备重新授权影响。
 
-- [ ] **Step 5: 验证并提交**
+- [x] **Step 5: 验证并提交**
 
 ```bash
 pnpm --dir apps/desktop-ui test -- SecurityPages

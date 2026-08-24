@@ -87,6 +87,10 @@ View：
 | `ApplyStartView` | 已交给后台 worker 的 apply | 文件内容、路径、后端 URL |
 | `CancellationView` | 已送达 worker 的取消请求 | 是否跨过发布边界之外的内部状态 |
 | `ApplyView` | apply 的最终 no-op 或完成结果 | 文件内容、收据、错误正文 |
+| `VaultMetadataView` | Secret ID、更新时间、引用资源与索引缺失状态 | 值、密文对象、密钥纪元、批量读取入口 |
+| `VaultSetView` | 单次写入的 Secret ID 回执 | 写入值、长度、密钥纪元、密文、对象 ID、路径或输出目标 |
+| `DeviceListView` | 已验证成员设备、角色、纪元和成员链序号 | 私钥、设备公开材料、邀请、恢复短语 |
+| `DeviceRevocationView` | 已撤销设备与密钥轮换阶段摘要 | 轮换密钥、旧条目内容、恢复材料 |
 
 敏感动作的 `DiffView` 仅报告 `sensitive: true` 与变化类型；`before_digest`、
 `after_digest`、`content_bytes` 均为 `null`。`presentation` 只决定 UI 显示“文本、结构化、
@@ -162,8 +166,10 @@ worker 随后发出 `operation.cancelled` 错误事件。发布后或 worker 已
 ## 宿主边界
 
 桌面壳只可传递已注册的 workspace/resource/plan/operation 标识。它不得提供任意文件路径、
-shell 命令、HTTP 请求或 Vault 明文参数。实际 command allowlist、Tauri capability 与参数
-解析将在桌面壳中执行，但必须继续使用本契约的 request、response 和 event 信封。
+shell 命令、HTTP 请求或 Vault 明文参数；唯一例外是下面定义的 `vault_set_secret` 一次性
+输入，它必须在 IPC 调用结束时清零且不得出现在任何 response、event、日志或 store 中。实际
+command allowlist、Tauri capability 与参数解析将在桌面壳中执行，但必须继续使用本契约的
+request、response 和 event 信封。
 
 ### 原生首次使用
 
@@ -193,3 +199,22 @@ shell 命令、HTTP 请求或 Vault 明文参数。实际 command allowlist、Ta
   且响应不会回显该内容。保存裁决不等于重新 merge 或同步成功。
 - `operation_history` 与 `operation_detail` 只返回状态、稳定错误码、动作进度与收据保证；
   它们不提供备份路径、对象摘要、任意文件读取或错误正文。
+
+### Vault 与设备管理扩展
+
+- `vault_metadata` 的负载仅为 `{ workspace_id }`，返回 `VaultMetadataView`。每条 entry
+  只有 `id`、`updated_at_unix_ms` 和 `referenced_by`；没有 `get`、批量复制或默认 reveal
+  command。若 `index_missing=true`，空条目列表表示“读不到”，不是“Vault 为空”。
+- `vault_set_secret` 是唯一允许一次性秘密输入的桌面 command。负载为
+  `{ workspace_id, secret_id, secret_value }`：`secret_id` 是受限逻辑 ID，不是路径；
+  `secret_value` 仅在本次 IPC 调用中移入零化 buffer，成功/失败 response、诊断、事件和
+  前端 store 均不会回显或保存它。该 command 不提供任意文件输出、`vault get` 或复制 API。
+- `device_list` 的负载仅为 `{ workspace_id }`，返回已验证成员链的 `DeviceListView`。
+  `device_revoke` 只接受 `{ workspace_id, device_id, confirmation }`，其中
+  `confirmation` 必须逐字匹配公开的 `device_id`；这只是防误触，core 仍会强制管理员身份、
+  成员关系以及“不能撤销当前设备”。成功后返回 `DeviceRevocationView`，明确轮换阶段。
+- 设备邀请 payload 可以是不含私钥的已签名公开材料，但短码/QR 的跨设备传输服务尚未进入
+  此 API；桌面端不得伪造可加入的邀请码，也不得把恢复短语、私钥或 key envelope 放进 UI。
+- 包计划和 Bundle manifest 尚无持久化 application-service 来源时，页面必须呈现“无受控
+  审核数据”，不能伪造 policy、签名、capability、SecretRef 或版本差异，更不能从 UI 直接
+  执行 quarantine 内容。

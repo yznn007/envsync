@@ -15,8 +15,11 @@ use serde::Serialize;
 
 use crate::api::{private, ViewData};
 use crate::config::ResourceConfig;
+use crate::device_admin::DeviceSummary;
+use crate::rotation::RotationOutcome;
 use crate::service::{ResourceStatus, StatusReport};
 use crate::sync::ConflictDetail;
+use crate::vault::SecretMetadata;
 
 /// 一个工作区的无内容摘要。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -772,6 +775,162 @@ impl ApplyView {
     }
 }
 
+/// Vault 中一条秘密的脱敏元数据。
+///
+/// 这个 View 故意没有密钥纪元、对象摘要或值长度等额外字段。Vault 页面所需的信息只有
+/// 逻辑标识、最近更新时间和引用者；少给一项元数据就少一条可被外部观察到的关联线索。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VaultSecretMetadataView {
+    /// 稳定的逻辑 Secret ID，而非值、密文或后端对象标识。
+    pub id: String,
+    /// 最近一次写入时刻。
+    pub updated_at_unix_ms: u64,
+    /// 引用这条秘密的资源标识。
+    pub referenced_by: Vec<String>,
+}
+
+impl From<&SecretMetadata> for VaultSecretMetadataView {
+    fn from(entry: &SecretMetadata) -> Self {
+        VaultSecretMetadataView {
+            id: entry.id.as_str().to_owned(),
+            updated_at_unix_ms: entry.updated_at_unix_ms,
+            referenced_by: entry
+                .referenced_by
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        }
+    }
+}
+
+/// Vault 元数据清单。
+///
+/// 此接口是 metadata-only：它没有单条读取、批量复制、明文 reveal 或密文对象入口。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VaultMetadataView {
+    /// 所属工作区。
+    pub workspace: String,
+    /// 当前头快照是否缺失 Vault 索引。为真时空清单不代表 Vault 本身为空。
+    pub index_missing: bool,
+    /// 仅限安全元数据的秘密列表。
+    pub entries: Vec<VaultSecretMetadataView>,
+}
+
+impl VaultMetadataView {
+    /// 由已打开 Vault 的元数据构造页面 View。
+    pub fn new(workspace: WorkspaceId, index_missing: bool, entries: &[SecretMetadata]) -> Self {
+        VaultMetadataView {
+            workspace: workspace.to_string(),
+            index_missing,
+            entries: entries.iter().map(VaultSecretMetadataView::from).collect(),
+        }
+    }
+}
+
+/// 单次 Vault 写入的无明文回执。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VaultSetView {
+    /// 被写入的逻辑 Secret ID。
+    pub id: String,
+}
+
+impl VaultSetView {
+    /// 构造没有明文回显的写入回执。
+    pub fn new(id: impl Into<String>) -> Self {
+        VaultSetView { id: id.into() }
+    }
+}
+
+/// 一台已加入工作区的设备摘要。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeviceMetadataView {
+    /// 设备公开标识。
+    pub device: String,
+    /// `admin` 或 `member`。
+    pub role: String,
+    /// 设备加入成员链时的序号。
+    pub added_at_sequence: u64,
+    /// 是否为当前设备。
+    pub is_self: bool,
+    /// 是否持有当前纪元的信封。
+    pub has_current_envelope: bool,
+}
+
+impl From<&DeviceSummary> for DeviceMetadataView {
+    fn from(device: &DeviceSummary) -> Self {
+        DeviceMetadataView {
+            device: device.device.to_string(),
+            role: device.role.as_str().to_owned(),
+            added_at_sequence: device.added_at_sequence,
+            is_self: device.is_self,
+            has_current_envelope: device.has_current_envelope,
+        }
+    }
+}
+
+/// 已验证成员设备的无私钥清单。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeviceListView {
+    /// 所属工作区。
+    pub workspace: String,
+    /// 当前工作区密钥纪元。
+    pub key_epoch: u64,
+    /// 已验证成员链头的序号。
+    pub membership_sequence: u64,
+    /// 设备清单。
+    pub devices: Vec<DeviceMetadataView>,
+}
+
+impl DeviceListView {
+    /// 从已验证成员链与设备摘要构造 View。
+    pub fn new(
+        workspace: WorkspaceId,
+        key_epoch: u64,
+        membership_sequence: u64,
+        devices: &[DeviceSummary],
+    ) -> Self {
+        DeviceListView {
+            workspace: workspace.to_string(),
+            key_epoch,
+            membership_sequence,
+            devices: devices.iter().map(DeviceMetadataView::from).collect(),
+        }
+    }
+}
+
+/// 撤销设备并完成（或恢复）密钥轮换后的脱敏回执。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeviceRevocationView {
+    /// 被撤销的设备公开标识。
+    pub revoked: String,
+    /// 轮换前纪元。
+    pub from_epoch: u64,
+    /// 轮换后纪元。
+    pub to_epoch: u64,
+    /// 轮换停下时的稳定阶段名称。
+    pub stage: String,
+    /// 已发布的新信封数量。
+    pub envelopes: usize,
+    /// 等待 lazy rewrap 的旧纪元条目数量。
+    pub pending_rewrap: usize,
+    /// 本次是否恢复了先前中断的轮换。
+    pub resumed: bool,
+}
+
+impl From<&RotationOutcome> for DeviceRevocationView {
+    fn from(outcome: &RotationOutcome) -> Self {
+        DeviceRevocationView {
+            revoked: outcome.revoked.to_string(),
+            from_epoch: outcome.from_epoch,
+            to_epoch: outcome.to_epoch,
+            stage: outcome.stage.as_str().to_owned(),
+            envelopes: outcome.envelopes,
+            pending_rewrap: outcome.pending_rewrap,
+            resumed: outcome.resumed,
+        }
+    }
+}
+
 impl private::Sealed for WorkspaceSummary {}
 impl private::Sealed for RootCapabilityView {}
 impl private::Sealed for WorkspaceRegistrationView {}
@@ -790,6 +949,10 @@ impl private::Sealed for RollbackReviewView {}
 impl private::Sealed for ApplyStartView {}
 impl private::Sealed for CancellationView {}
 impl private::Sealed for ApplyView {}
+impl private::Sealed for VaultMetadataView {}
+impl private::Sealed for VaultSetView {}
+impl private::Sealed for DeviceListView {}
+impl private::Sealed for DeviceRevocationView {}
 impl ViewData for WorkspaceSummary {}
 impl ViewData for RootCapabilityView {}
 impl ViewData for WorkspaceRegistrationView {}
@@ -808,6 +971,10 @@ impl ViewData for RollbackReviewView {}
 impl ViewData for ApplyStartView {}
 impl ViewData for CancellationView {}
 impl ViewData for ApplyView {}
+impl ViewData for VaultMetadataView {}
+impl ViewData for VaultSetView {}
+impl ViewData for DeviceListView {}
+impl ViewData for DeviceRevocationView {}
 
 fn disposition_name(disposition: DesiredDisposition) -> &'static str {
     match disposition {

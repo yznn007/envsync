@@ -140,9 +140,10 @@ pub use vault::{
 };
 pub use view::{
     ApplyStartView, ApplyView, CancellationView, ConflictDetailView, ConflictListView,
-    ConflictResolutionView, ConflictView, DiffListView, DiffView, OperationActionView,
-    OperationDetailView, OperationHistoryView, OperationReceiptView, OperationStatusView,
-    OperationView, PlanActionView, PlanView, ResourceStatusView, RollbackActionView,
-    RollbackReviewView, RootCapabilityView, StatusView, ViewDiagnostic, WorkspaceRegistrationView,
-    WorkspaceSummary,
+    ConflictResolutionView, ConflictView, DeviceListView, DeviceMetadataView, DeviceRevocationView,
+    DiffListView, DiffView, OperationActionView, OperationDetailView, OperationHistoryView,
+    OperationReceiptView, OperationStatusView, OperationView, PlanActionView, PlanView,
+    ResourceStatusView, RollbackActionView, RollbackReviewView, RootCapabilityView, StatusView,
+    VaultMetadataView, VaultSecretMetadataView, VaultSetView, ViewDiagnostic,
+    WorkspaceRegistrationView, WorkspaceSummary,
 };

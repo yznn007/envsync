@@ -82,6 +82,9 @@ pub fn run() -> tauri::Result<()> {
             commands::operation_rollback_review,
             commands::operation_rollback,
             commands::vault_metadata,
+            commands::vault_set_secret,
+            commands::device_list,
+            commands::device_revoke,
             commands::bundle_review,
             commands::operation_cancel,
         ])

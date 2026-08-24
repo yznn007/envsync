@@ -722,6 +722,109 @@ a:focus-visible {
   border-left: 2px solid var(--border);
 }
 
+.security-panel {
+  max-width: 1080px;
+}
+
+.security-tags,
+.security-card__heading,
+.secret-modal__heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.security-tags {
+  justify-content: flex-start;
+  margin-top: var(--space-3);
+}
+
+.risk-tag--warning {
+  border-color: var(--warning);
+  background: var(--warning-wash);
+  color: var(--text-strong);
+}
+
+.bundle-review__section,
+.security-guidance {
+  margin-top: var(--space-5);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  background: var(--surface-raised);
+}
+
+.bundle-review__section h3,
+.security-guidance h3,
+.secret-modal h3 {
+  margin: 0;
+  color: var(--text-strong);
+  font-size: var(--text-md);
+}
+
+.security-list {
+  display: grid;
+  gap: var(--space-2);
+  margin: var(--space-3) 0 0;
+  padding-left: var(--space-5);
+}
+
+.security-list li {
+  overflow-wrap: anywhere;
+}
+
+.security-list--cards {
+  padding: 0;
+  list-style: none;
+}
+
+.security-card {
+  padding: var(--space-4);
+  border: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.security-card .danger-action {
+  margin-top: var(--space-4);
+}
+
+.security-muted,
+.security-guidance p {
+  margin: var(--space-3) 0 0;
+  color: var(--text-muted);
+  line-height: 1.55;
+}
+
+.capability-confirmations {
+  display: grid;
+  gap: var(--space-2);
+  margin: var(--space-5) 0 0;
+  padding: var(--space-3);
+  border: 1px solid var(--warning);
+}
+
+.capability-confirmations legend {
+  padding: 0 var(--space-1);
+  color: var(--text-strong);
+  font-weight: 700;
+}
+
+.secret-modal {
+  display: grid;
+  gap: var(--space-4);
+  max-width: 680px;
+  margin-top: var(--space-6);
+  padding: var(--space-5);
+  border: 1px solid var(--brand);
+  background: var(--surface);
+  box-shadow: var(--shadow-rail);
+}
+
+.secret-modal .onboarding-field {
+  margin-top: 0;
+}
+
 @media (max-width: 800px) {
   .conflicts-layout,
   .history-layout {
