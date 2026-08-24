@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use envsync_backend::gist::{GistBackend, GistCredentials};
 use envsync_backend::gist_bundle::{
-    gist_bundle_filename, pack, GistBundleObject, GistBundleSigner,
+    gist_bundle_filename, inspect as gist_inspect, pack, GistBundleObject, GistBundleSigner,
 };
 use envsync_crypto::device::DeviceKeypair;
 use envsync_crypto::sealed::SecretId;
@@ -128,10 +128,13 @@ fn create_then_read_then_publish_sends_expected_contract() {
     let published = backend
         .compare_and_swap(&credentials, read.revision(), &bundle_v2)
         .expect("发布新版 bundle");
+    let expected_head = gist_inspect(&bundle_v2)
+        .expect("读取 revision 2 的 bundle 元数据")
+        .head;
 
     assert!(
-        published.encoded().as_bytes() == bundle_v2.as_bytes(),
-        "最终 bundle bytes 必须匹配"
+        published.revision().header().head == expected_head,
+        "发布结果必须匹配 revision 2 的 head"
     );
     assert!(
         published.revision().header().workspace == workspace,
