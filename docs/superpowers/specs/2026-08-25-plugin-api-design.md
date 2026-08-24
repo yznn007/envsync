@@ -115,8 +115,9 @@ request/response 混合形状一律拒绝。响应必须恰有 `result` 或 `err
 Host 支持唯一 major `1` 的两个 minor：`1.0` 和 `1.1`。major 不等于 `1`、minor 大于 `1` 或
 小于 `0` 均拒绝，不能通过“忽略未知字段”悄悄接受不兼容协议。声明为已支持 minor 的消息可
 携带未知扩展字段，解码器在所有必填字段与方法已验证后忽略它们；新增会改变语义的字段必须
-同时增加 minor，且由 `initialize` 结果中的 `selected_schema_version` 协商出双方共同版本。
-这样旧端不会把未知 method 或未知版本误当作安全的无操作。
+同时增加 minor。`initialize` 的 result 由 Host 按 request ID 关联回原始 `initialize` 请求后检查
+其中的 `selected_schema_version`；通用 response frame 本身没有 method，不能在失去关联时臆测其
+payload 语义。这样旧端不会把未知 method 或未知版本误当作安全的无操作。
 
 `params`、`result` 与错误的结构化 `data` 保持 `serde_json::Value`，因为其具体 proposal schema
 由后续 Host capability 层解释；API crate 绝不把它们转换成路径、命令、环境变量或秘密。

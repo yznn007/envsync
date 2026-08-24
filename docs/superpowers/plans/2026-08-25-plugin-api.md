@@ -21,7 +21,7 @@
 - crates/envsync-plugin-api/tests/fixtures/initialize-request-v1.0.json：固定初始化请求 payload。
 - crates/envsync-plugin-api/tests/fixtures/describe-response-v1.1.json：固定 describe 成功响应。
 
-### Task 1: 建立 crate 与 manifest 红灯合约
+### Task 1: 建立并实现 manifest（原 M4 Task 1/2 合并为一个原子 TDD 任务）
 
 **Files:**
 
@@ -129,15 +129,11 @@ cargo test -p envsync-plugin-api --test compatibility
 
 预期：编译失败，提示 manifest 模块或 PluginManifest 尚未定义；不得以 ignore、空断言或放宽测试绕过。
 
-- [ ] **Step 4: 提交红灯合约骨架**
+- [ ] **Step 4: 保留红灯状态，不单独提交无法编译的 workspace**
 
-~~~bash
-git add Cargo.toml crates/envsync-plugin-api/Cargo.toml \
-  crates/envsync-plugin-api/src/lib.rs crates/envsync-plugin-api/tests/compatibility.rs
-git commit -m "test(plugins): 添加 manifest 红灯合约"
-~~~
+不要提交此时的红灯骨架。立即继续本任务的实现步骤，使最终 commit 始终保持 workspace 可编译、可测试；红灯命令与失败原因记入实现报告即可。
 
-### Task 2: 实现严格 manifest 值对象与签名 payload
+#### 后续步骤：实现严格 manifest 值对象与签名 payload
 
 **Files:**
 
@@ -238,12 +234,11 @@ cargo clippy -p envsync-plugin-api --all-targets -- -D warnings
 - [ ] **Step 5: 提交 manifest 实现**
 
 ~~~bash
-git add crates/envsync-plugin-api/src/manifest.rs \
-  crates/envsync-plugin-api/src/lib.rs crates/envsync-plugin-api/tests/compatibility.rs
+git add Cargo.toml crates/envsync-plugin-api
 git commit -m "feat(plugins): 定义严格插件 manifest"
 ~~~
 
-### Task 3: 添加版本化 RPC 红灯测试与 golden fixtures
+### Task 2: 添加并实现版本化 RPC（原 M4 Task 3/4 合并为一个原子 TDD 任务）
 
 **Files:**
 
@@ -262,7 +257,7 @@ initialize-request-v1.0.json 必须是：
 describe-response-v1.1.json 必须是：
 
 ~~~json
-{"jsonrpc":"2.0","schema_version":{"major":1,"minor":1},"id":"request-0001","result":{"selected_schema_version":{"major":1,"minor":1},"name":"calendar"}}
+{"jsonrpc":"2.0","schema_version":{"major":1,"minor":1},"id":"request-0001","result":{"name":"calendar"}}
 ~~~
 
 - [ ] **Step 2: 写 frame 与兼容性红灯合约**
@@ -310,15 +305,11 @@ cargo test -p envsync-plugin-api --test compatibility golden_
 
 预期：无法解析 RPC API 或断言失败；不得在测试中使用真实子进程、sleep 或超过上限的实际 8 MiB 分配。
 
-- [ ] **Step 4: 提交 RPC 合约和 fixture**
+- [ ] **Step 4: 保留红灯状态，不单独提交不完整协议**
 
-~~~bash
-git add crates/envsync-plugin-api/tests/compatibility.rs \
-  crates/envsync-plugin-api/tests/fixtures
-git commit -m "test(plugins): 添加 RPC 兼容红灯合约"
-~~~
+不要在缺少 rpc.rs 的状态下提交。继续同一任务的实现步骤，在最终 green gate 后一次提交完整协议。
 
-### Task 4: 实现帧编解码、版本策略与完整验证
+#### 后续步骤：实现帧编解码、版本策略与完整验证
 
 **Files:**
 
@@ -365,7 +356,7 @@ SchemaVersion::validate_supported 只接受 (1, 0) 和 (1, 1)。RequestId::parse
 
 先将输入 parse 为 serde_json::Value，拒绝顶层 array。验证 jsonrpc == "2.0"、schema_version、id 和 request/response 的互斥字段，再将已验证字段反序列化到私有 Raw 结构；不能在 serde untagged 的宽松分支中把 request 错当 response。
 
-有 method 时只能是 request；没有 method 时必须有且仅有 result 或 error。版本校验通过后忽略顶层未知 extension fields；未知 method 和未支持 major/minor 仍立即失败。initialize 的成功 result 必须含 selected_schema_version，并再次验证其属于支持集合。任何 params、result 或 error.data 保持 serde_json::Value，不执行路径、命令或 env 解释。
+有 method 时只能是 request；没有 method 时必须有且仅有 result 或 error。版本校验通过后忽略顶层未知 extension fields；未知 method 和未支持 major/minor 仍立即失败。通用 response 只校验 envelope；Host 按 request ID 将 initialize response 关联回 initialize request 后，使用公开的 parse_initialize_result helper 检查 selected_schema_version 属于支持集合。任何 params、result 或 error.data 保持 serde_json::Value，不执行路径、命令或 env 解释。
 
 - [ ] **Step 3: 实现 bounded frame I/O**
 
@@ -374,6 +365,8 @@ SchemaVersion::validate_supported 只接受 (1, 0) 和 (1, 1)。RequestId::parse
 ~~~rust
 pub fn encode_frame(message: &RpcMessage) -> Result<Vec<u8>, PluginRpcError>;
 pub fn decode_frame(frame: &[u8]) -> Result<RpcMessage, PluginRpcError>;
+pub fn parse_initialize_result(result: &serde_json::Value)
+    -> Result<SchemaVersion, PluginRpcError>;
 impl RpcMessage {
     pub fn from_json_slice(json: &[u8]) -> Result<Self, PluginRpcError>;
     pub fn from_json_value(value: serde_json::Value) -> Result<Self, PluginRpcError>;
@@ -389,7 +382,7 @@ encode_frame 对 serde_json::to_vec 的结果检查 <= MAX_RPC_FRAME_BYTES，使
 
 - [ ] **Step 4: 导出 API、运行完整 crate 门禁**
 
-在 lib.rs re-export manifest 与 RPC 的全部公共类型和四个 frame 函数。补齐 fixture 断言：1.0/1.1 的 frame round-trip、支持 minor 的 extension 忽略、未知 method/version 拒绝、frame 长度安全、response 异或条件和 write/read round-trip。
+在 lib.rs re-export manifest 与 RPC 的全部公共类型、四个 frame 函数与 parse_initialize_result。补齐 fixture 断言：1.0/1.1 的 frame round-trip、支持 minor 的 extension 忽略、未知 method/version 拒绝、frame 长度安全、response 异或条件、write/read round-trip，以及关联后的 initialize result 版本检查。
 
 ~~~bash
 cargo fmt --all --check
@@ -409,7 +402,7 @@ git commit -m "feat(plugins): 定义插件 manifest 与 RPC"
 
 ## 计划自检
 
-- M4 Task 9 的 manifest 字段、绝对/穿越 entrypoint、重复 ID、未知 capability、不兼容 API、资源限制与签名均映射到 Task 1/2。
-- 长度前缀 JSON-RPC、七个封闭方法、schema version、request ID、8 MiB 上限、两个 minor、未知字段与未知 method/version 的差异均映射到 Task 3/4。
+- M4 Task 9 的 manifest 字段、绝对/穿越 entrypoint、重复 ID、未知 capability、不兼容 API、资源限制与签名均映射到 Task 1。
+- 长度前缀 JSON-RPC、七个封闭方法、schema version、request ID、8 MiB 上限、两个 minor、未知字段与未知 method/version 的差异均映射到 Task 2。
 - Task 10 的隔离/授权职责明确不在本 crate，避免本计划错误扩大为进程 Host 实现。
-- 本文每一步均有明确实现与验证内容；所有新公开类型均在 Task 2 或 Task 4 定义，并且所有测试命令有明确通过条件。
+- 本文每一步均有明确实现与验证内容；所有新公开类型均在 Task 1 或 Task 2 定义，并且所有测试命令有明确通过条件。
