@@ -13,6 +13,7 @@ members = [
     "crates/envsync-e2e",
     "crates/envsync-crypto",
     "crates/envsync-policy",
+    "crates/envsync-plugin-api",
 ]
 
 [workspace.package]
