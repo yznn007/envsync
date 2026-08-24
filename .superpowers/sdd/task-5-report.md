@@ -117,3 +117,21 @@ Exit code: 0
 ## 网络声明
 
 未调用真实 GitHub。所有 HTTP 行为验证均使用现有 `127.0.0.1` `MockGithub`；`GistBackend::github()` 的单元测试只构造默认后端，不发送网络请求。
+
+## 安全复审修复（Task 5）
+
+- PATCH 收到 2xx、412 或 5xx 时，在进入 `verify_after_patch` 前显式 `drop(response)`；PATCH body 从未被读取或记录。其他确定性状态先从安全 headers 构造错误，再显式释放 response。
+- API GET 的限流重试在计算状态、request id 与退避 duration 后，先显式释放未消费的 response，随后才 sleep/continue；非限流错误同样在构造安全错误后释放 response。
+- `X-RateLimit-Remaining` 现在以 `trim().parse::<u64>() == 0` 识别零配额，接受 `"00"` 和周围空白，拒绝 malformed 与非零值。
+- 新增 gist.rs 单元测试：验证零配额的等价数字解析；验证 fake Sleeper 记录解析出的非零 `Retry-After`、其优先于 Reset，且超过 60 秒不会重试。未扩展 `GistBackend` 公开构造 API。
+
+### 本次验证
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo fmt --check` | Exit code 0 |
+| `cargo test -p envsync-backend --lib` | Exit code 0，19 passed |
+| `cargo test -p envsync-backend --test gist_backend` | Exit code 0，25 passed |
+| `git diff --check` | Exit code 0 |
+
+本次同样未调用真实网络；集成测试仅使用现有 loopback MockGithub。

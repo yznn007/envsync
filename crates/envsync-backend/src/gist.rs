@@ -584,22 +584,25 @@ impl GistBackend {
                 .map_err(|error| GistError::request_error(operation, &error))?;
             let (status, request_id) = response_context(&response);
             if !status.is_success() {
-                if is_read_rate_limited(status, response.headers()) {
-                    if retry_rate_limit && !retried {
-                        if let Some(delay) = bounded_retry_delay(response.headers()) {
-                            self.sleep_for_rate_limit_retry(delay);
-                            retried = true;
-                            continue;
-                        }
+                let rate_limited = is_read_rate_limited(status, response.headers());
+                let retry_delay = (rate_limited && retry_rate_limit && !retried)
+                    .then(|| bounded_retry_delay(response.headers()))
+                    .flatten();
+                if rate_limited {
+                    if let Some(delay) = retry_delay {
+                        drop(response);
+                        self.sleep_for_rate_limit_retry(delay);
+                        retried = true;
+                        continue;
                     }
-                    return Err(GistError::rate_limited(operation, status, request_id));
+                    let error = GistError::rate_limited(operation, status, request_id);
+                    drop(response);
+                    return Err(error);
                 }
-                return Err(GistError::status_error(
-                    operation,
-                    status,
-                    response.headers(),
-                    request_id,
-                ));
+                let error =
+                    GistError::status_error(operation, status, response.headers(), request_id);
+                drop(response);
+                return Err(error);
             }
 
             return self
@@ -718,14 +721,13 @@ impl GistBackend {
             || status == StatusCode::PRECONDITION_FAILED
             || status.is_server_error()
         {
+            drop(response);
             return self.verify_after_patch(credentials, expected, encoded);
         }
-        Err(GistError::status_error(
-            "compare_and_swap",
-            status,
-            response.headers(),
-            request_id,
-        ))
+        let error =
+            GistError::status_error("compare_and_swap", status, response.headers(), request_id);
+        drop(response);
+        Err(error)
     }
 
     fn verify_after_patch(
@@ -899,7 +901,9 @@ fn validated_etag(headers: &HeaderMap) -> Option<String> {
 fn is_rate_limited(headers: &HeaderMap) -> bool {
     headers
         .get("X-RateLimit-Remaining")
-        .is_some_and(|value| value.as_bytes() == b"0")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .is_some_and(|remaining| remaining == 0)
         || headers.contains_key(header::RETRY_AFTER)
 }
 
@@ -1141,6 +1145,63 @@ mod tests {
                 .as_slice(),
             &[Duration::from_secs(7)]
         );
+    }
+
+    #[test]
+    fn rate_limit_retry_prefers_retry_after_and_rejects_unbounded_delay() {
+        let sleeper = Arc::new(RecordingSleeper::default());
+        let backend = GistBackend {
+            api_base: Url::parse("https://gist.example.test/api/").expect("合法 API 基址"),
+            client: reqwest::blocking::Client::builder()
+                .build()
+                .expect("测试客户端"),
+            sleeper: sleeper.clone(),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RETRY_AFTER, header::HeaderValue::from_static("7"));
+        headers.insert("X-RateLimit-Reset", header::HeaderValue::from_static("0"));
+
+        let delay = super::bounded_retry_delay(&headers).expect("非零 Retry-After 必须可解析");
+        backend.sleep_for_rate_limit_retry(delay);
+
+        headers.insert(header::RETRY_AFTER, header::HeaderValue::from_static("61"));
+        assert!(
+            super::bounded_retry_delay(&headers).is_none(),
+            "超过 60 秒的 Retry-After 不得退避重试"
+        );
+        assert_eq!(
+            sleeper
+                .durations
+                .lock()
+                .expect("读取 sleeper 记录")
+                .as_slice(),
+            &[Duration::from_secs(7)],
+            "Retry-After 必须优先于 Reset，且解析出的非零 duration 必须被 fake 记录"
+        );
+    }
+
+    #[test]
+    fn rate_limit_remaining_accepts_only_trimmed_numeric_zero() {
+        for value in ["0", "00", " \t0 "] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "X-RateLimit-Remaining",
+                header::HeaderValue::from_bytes(value.as_bytes()).expect("合法测试 header"),
+            );
+            assert!(super::is_rate_limited(&headers), "{value:?} 必须视为零配额");
+        }
+
+        for value in ["1", "01", "zero", "0x0", ""] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "X-RateLimit-Remaining",
+                header::HeaderValue::from_bytes(value.as_bytes()).expect("合法测试 header"),
+            );
+            assert!(
+                !super::is_rate_limited(&headers),
+                "{value:?} 不得视为零配额"
+            );
+        }
     }
 
     #[test]
