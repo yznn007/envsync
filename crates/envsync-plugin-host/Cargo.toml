@@ -1,0 +1,24 @@
+[package]
+name = "envsync-plugin-host"
+description = "EnvSync 插件 Host 的隔离、验签、审批与撤销状态机"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+blake3.workspace = true
+envsync-core.workspace = true
+envsync-crypto.workspace = true
+envsync-domain.workspace = true
+envsync-plugin-api.workspace = true
+envsync-policy.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+base64.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true

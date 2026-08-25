@@ -1433,6 +1433,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "envsync-plugin-host"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "blake3",
+ "envsync-core",
+ "envsync-crypto",
+ "envsync-domain",
+ "envsync-plugin-api",
+ "envsync-policy",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "envsync-policy"
 version = "0.1.0"
 dependencies = [

@@ -14,6 +14,7 @@ members = [
     "crates/envsync-crypto",
     "crates/envsync-policy",
     "crates/envsync-plugin-api",
+    "crates/envsync-plugin-host",
 ]
 
 [workspace.package]
@@ -34,6 +35,7 @@ envsync-core = { path = "crates/envsync-core", version = "0.1.0" }
 envsync-adapters = { path = "crates/envsync-adapters", version = "0.1.0" }
 envsync-crypto = { path = "crates/envsync-crypto", version = "0.1.0" }
 envsync-policy = { path = "crates/envsync-policy", version = "0.1.0" }
+envsync-plugin-api = { path = "crates/envsync-plugin-api", version = "0.1.0" }
 
 blake3 = "1"
 cap-std = "3"
