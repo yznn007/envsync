@@ -1422,6 +1422,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "envsync-plugin-api"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "semver",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "envsync-policy"
 version = "0.1.0"
 dependencies = [
