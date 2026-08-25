@@ -26,7 +26,7 @@ quarantine 与 Host-mediated capability。manifest 中的 capability 和资源�
           │
           ▼
 envsync-plugin-api
-  ├─ Manifest::validate()       仅结构与上限
+  ├─ PluginManifest::from_json_value() 仅结构与上限
   └─ RPC frame decode()         仅协议与版本
           │
           ▼
@@ -69,7 +69,7 @@ envsync-core 的普通 Plan / policy / apply 流程
 
 `id` 与 `publisher.id` 为小写反向域名式标识（ASCII、点分段、最长 128 字节）；`version` 必须
 是 `semver::Version`；`api` 是 `semver::VersionReq`，且必须匹配 Host 当前支持的至少一个
-协议版本（`1.0.0` 或 `1.1.0`）。`PluginCatalog::validate()` 额外拒绝同一安装批次中规范化后
+协议版本（`1.0.0` 或 `1.1.0`）。`PluginCatalog::new(...)` 额外拒绝同一安装批次中规范化后
 相同的 `id`。
 
 `entrypoint` 是最大 512 字节的相对 Unix 风格路径：不得为空、绝对、含 `.` / `..` 段、反斜杠、
