@@ -24,6 +24,12 @@ use envsync_plugin_host::{
 use envsync_policy::{
     Decision, FactPredicate, MatchExpr, Operation, PolicySet, ResourceKind, Rule, RuleId,
 };
+#[cfg(not(target_os = "macos"))]
+use nix::errno::Errno;
+#[cfg(not(target_os = "macos"))]
+use nix::sys::signal::kill;
+#[cfg(not(target_os = "macos"))]
+use nix::unistd::Pid;
 use tempfile::TempDir;
 
 const NOW: u64 = 1_777_777_777_000;
@@ -570,6 +576,143 @@ fn test_runner_shutdown_times_out_when_plugin_ignores_the_request() {
     };
 
     assert_eq!(error.code(), "plugin.host.shutdown_timeout");
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn test_runner_rejects_wrong_response_id_and_malformed_frame() {
+    let fixture = Fixture::new();
+    let device = profile();
+    let allow = policy(Decision::Allow);
+
+    let wrong_id = PluginId::parse("com.example.wrong-id").expect("id");
+    let mut wrong_id_host = fixture.test_host(fixture.registry(), runner_path());
+    wrong_id_host
+        .quarantine(
+            fixture.artifact(
+                wrong_id.as_str(),
+                &environment_check_script("different_request"),
+                &["observe"],
+            ),
+            NOW,
+        )
+        .expect("quarantine");
+    let approval = wrong_id_host
+        .approve(&wrong_id, "work", &device, &allow, true, NOW + 1)
+        .expect("approve");
+    wrong_id_host
+        .enable(&wrong_id, &approval, "work", &device, &allow, true, NOW + 2)
+        .expect("enable");
+    let mut wrong_id_session = wrong_id_host
+        .start(&wrong_id, NOW + 3)
+        .expect("start runner");
+    let request = RpcRequest::new(
+        SchemaVersion::new(1, 0),
+        RequestId::parse("expected_request").expect("request id"),
+        PluginMethod::Observe,
+        serde_json::json!({}),
+    )
+    .expect("request");
+    let error = match wrong_id_session.call(request) {
+        Ok(_) => panic!("wrong response ID must be rejected"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), "plugin.host.protocol");
+
+    let malformed = PluginId::parse("com.example.bad-frame").expect("id");
+    let mut malformed_host = fixture.test_host(fixture.registry(), runner_path());
+    malformed_host
+        .quarantine(
+            fixture.artifact(
+                malformed.as_str(),
+                b"#!/bin/sh\nprintf '%b' '\\000\\000\\000\\001}'\n",
+                &["observe"],
+            ),
+            NOW + 4,
+        )
+        .expect("quarantine");
+    let approval = malformed_host
+        .approve(&malformed, "work", &device, &allow, true, NOW + 5)
+        .expect("approve");
+    malformed_host
+        .enable(
+            &malformed,
+            &approval,
+            "work",
+            &device,
+            &allow,
+            true,
+            NOW + 6,
+        )
+        .expect("enable");
+    let mut malformed_session = malformed_host
+        .start(&malformed, NOW + 7)
+        .expect("start runner");
+    let request = RpcRequest::new(
+        SchemaVersion::new(1, 0),
+        RequestId::parse("bad_frame").expect("request id"),
+        PluginMethod::Observe,
+        serde_json::json!({}),
+    )
+    .expect("request");
+    let error = match malformed_session.call(request) {
+        Ok(_) => panic!("malformed frame must be rejected"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), "plugin.host.protocol");
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn test_runner_timeout_kills_descendants_in_the_same_process_group() {
+    let fixture = Fixture::new();
+    let mut host = fixture.test_host(fixture.registry(), runner_path());
+    let id = PluginId::parse("com.example.process-tree").expect("id");
+    let device = profile();
+    let allow = policy(Decision::Allow);
+    let marker = fixture.temp.path().join("descendant.pid");
+    let marker = marker.to_string_lossy().replace('\'', "'\"'\"'");
+    let script = format!(
+        "#!/bin/sh\n/bin/sleep 30 &\nprintf '%s' \"$!\" > '{marker}'\nwhile :; do :; done\n"
+    );
+    let request = RpcRequest::new(
+        SchemaVersion::new(1, 0),
+        RequestId::parse("process_tree").expect("request id"),
+        PluginMethod::Observe,
+        serde_json::json!({}),
+    )
+    .expect("request");
+
+    host.quarantine(
+        fixture.artifact(id.as_str(), script.as_bytes(), &["observe"]),
+        NOW,
+    )
+    .expect("quarantine");
+    let approval = host
+        .approve(&id, "work", &device, &allow, true, NOW + 1)
+        .expect("approve");
+    host.enable(&id, &approval, "work", &device, &allow, true, NOW + 2)
+        .expect("enable");
+
+    let mut session = host.start(&id, NOW + 3).expect("start runner");
+    let error = match session.call(request) {
+        Ok(_) => panic!("process tree fixture must time out"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), "plugin.host.timeout");
+
+    let child_pid = fs::read_to_string(fixture.temp.path().join("descendant.pid"))
+        .expect("fixture wrote descendant PID")
+        .trim()
+        .parse::<i32>()
+        .expect("valid descendant PID");
+    for _ in 0..50 {
+        if matches!(kill(Pid::from_raw(child_pid), None), Err(Errno::ESRCH)) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("descendant process survived process-group termination");
 }
 
 #[test]
