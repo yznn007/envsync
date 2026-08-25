@@ -370,9 +370,8 @@ impl<R: Read> Read for BudgetedReader<R> {
         if buffer.is_empty() {
             return Ok(0);
         }
-        let read = self
-            .inner
-            .read(&mut buffer[..buffer.len().min(OUTPUT_READ_CHUNK)])?;
+        let read_len = buffer.len().min(OUTPUT_READ_CHUNK);
+        let read = self.inner.read(&mut buffer[..read_len])?;
         if read == 0 {
             return Ok(0);
         }

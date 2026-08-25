@@ -327,7 +327,7 @@ fn read_rejects_oversized_response_before_json_parsing() {
             .declared_content_length(MAX_ENCODED_BUNDLE_LEN + 128 * 1024 + 1)
             .delay_after_headers(Duration::from_millis(200)),
     );
-    let backend = GistBackend::with_api_base(mock.base_url(), Duration::from_millis(25))
+    let backend = GistBackend::with_api_base(mock.base_url(), Duration::from_secs(1))
         .expect("构造 Gist 后端");
 
     let error = backend
