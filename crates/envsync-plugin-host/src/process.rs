@@ -22,8 +22,8 @@ use std::time::{Duration, Instant};
 
 #[cfg(all(unix, not(target_os = "macos")))]
 use envsync_plugin_api::{
-    read_frame, write_frame, PluginMethod, PluginRpcError, RequestId, ResourceLimits, RpcMessage,
-    RpcRequest, RpcResponse, SchemaVersion,
+    read_frame_with_limit, write_frame, PluginMethod, PluginRpcError, RequestId, ResourceLimits,
+    RpcMessage, RpcRequest, RpcResponse, SchemaVersion,
 };
 #[cfg(all(unix, not(target_os = "macos")))]
 use nix::sys::signal::{killpg, Signal};
@@ -92,9 +92,16 @@ impl PluginSession {
                 }
             };
         let budget = Arc::new(OutputBudget::new(limits.max_output_bytes));
+        let max_stdout_frame_bytes = usize::try_from(limits.max_output_bytes.saturating_sub(4))
+            .expect("manifest max output fits usize");
         let (sender, events) = mpsc::sync_channel(4);
         let readers = vec![
-            spawn_stdout_reader(stdout, Arc::clone(&budget), sender.clone()),
+            spawn_stdout_reader(
+                stdout,
+                Arc::clone(&budget),
+                max_stdout_frame_bytes,
+                sender.clone(),
+            ),
             spawn_stderr_reader(stderr, budget, sender),
         ];
         Ok(Self {
@@ -382,25 +389,27 @@ impl<R: Read> Read for BudgetedReader<R> {
 fn spawn_stdout_reader(
     stdout: ChildStdout,
     budget: Arc<OutputBudget>,
+    max_payload_bytes: usize,
     sender: SyncSender<ProcessEvent>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut reader = BudgetedReader::new(stdout, budget.clone());
         loop {
-            match read_frame(&mut reader) {
+            match read_frame_with_limit(&mut reader, max_payload_bytes) {
                 Ok(message) => {
                     if !send_event(&sender, ProcessEvent::Frame(message)) {
                         return;
                     }
                 }
                 Err(error) => {
-                    let event = if budget.exceeded() {
-                        ProcessEvent::OutputLimit
-                    } else if matches!(error, PluginRpcError::TruncatedFrame) {
-                        ProcessEvent::ProcessExited
-                    } else {
-                        ProcessEvent::Protocol
-                    };
+                    let event =
+                        if budget.exceeded() || matches!(error, PluginRpcError::FrameTooLarge) {
+                            ProcessEvent::OutputLimit
+                        } else if matches!(error, PluginRpcError::TruncatedFrame) {
+                            ProcessEvent::ProcessExited
+                        } else {
+                            ProcessEvent::Protocol
+                        };
                     let _ = send_event(&sender, event);
                     return;
                 }

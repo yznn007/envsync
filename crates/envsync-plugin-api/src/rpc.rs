@@ -470,11 +470,22 @@ pub fn decode_frame(frame: &[u8]) -> Result<RpcMessage, PluginRpcError> {
 
 /// 从 reader 读取一个完整 frame，并在分配 payload 前拒绝超长声明。
 pub fn read_frame<R: Read>(reader: &mut R) -> Result<RpcMessage, PluginRpcError> {
+    read_frame_with_limit(reader, MAX_RPC_FRAME_BYTES)
+}
+
+/// 从 reader 读取一个完整 frame，并在分配 payload 前同时执行协议与调用方上限。
+///
+/// max_payload_bytes 只能进一步收紧 MAX_RPC_FRAME_BYTES，适合 Host 将每个会话的资源配额
+/// 传入协议层，避免插件用长度前缀触发超过 Host 预算的分配。
+pub fn read_frame_with_limit<R: Read>(
+    reader: &mut R,
+    max_payload_bytes: usize,
+) -> Result<RpcMessage, PluginRpcError> {
     let mut prefix = [0_u8; 4];
     reader.read_exact(&mut prefix).map_err(map_read_error)?;
 
     let declared_len = u32::from_be_bytes(prefix) as usize;
-    if declared_len > MAX_RPC_FRAME_BYTES {
+    if declared_len > max_payload_bytes.min(MAX_RPC_FRAME_BYTES) {
         return Err(PluginRpcError::FrameTooLarge);
     }
 

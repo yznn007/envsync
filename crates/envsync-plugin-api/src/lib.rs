@@ -18,8 +18,8 @@ pub use manifest::{
     SignatureAlgorithm, HOST_PLUGIN_API_VERSIONS,
 };
 pub use rpc::{
-    decode_frame, encode_frame, parse_initialize_result, read_frame, write_frame, PluginMethod,
-    PluginRpcError, RequestId, RpcErrorObject, RpcMessage, RpcRequest, RpcResponse, SchemaVersion,
-    MAX_RPC_FRAME_BYTES, MAX_SUPPORTED_SCHEMA_MINOR, MIN_SUPPORTED_SCHEMA_MINOR,
-    SUPPORTED_SCHEMA_MAJOR,
+    decode_frame, encode_frame, parse_initialize_result, read_frame, read_frame_with_limit,
+    write_frame, PluginMethod, PluginRpcError, RequestId, RpcErrorObject, RpcMessage, RpcRequest,
+    RpcResponse, SchemaVersion, MAX_RPC_FRAME_BYTES, MAX_SUPPORTED_SCHEMA_MINOR,
+    MIN_SUPPORTED_SCHEMA_MINOR, SUPPORTED_SCHEMA_MAJOR,
 };
