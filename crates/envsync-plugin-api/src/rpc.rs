@@ -481,11 +481,30 @@ pub fn read_frame_with_limit<R: Read>(
     reader: &mut R,
     max_payload_bytes: usize,
 ) -> Result<RpcMessage, PluginRpcError> {
+    read_frame_with_limit_and_reservation(reader, max_payload_bytes, |_| true)
+}
+
+/// 从 reader 读取一个完整 frame，并在分配 payload 前预留整个 frame 的外部资源预算。
+///
+/// `reserve_frame_bytes` 接收包含 4 字节长度前缀在内的完整 frame 大小。它必须原子地
+/// 预留该预算；返回 `false` 时，函数会在分配或读取 payload 前以
+/// [`PluginRpcError::FrameTooLarge`] 失败。适合多个 I/O 管道共享单个输出配额的 Host。
+pub fn read_frame_with_limit_and_reservation<R: Read>(
+    reader: &mut R,
+    max_payload_bytes: usize,
+    reserve_frame_bytes: impl FnOnce(usize) -> bool,
+) -> Result<RpcMessage, PluginRpcError> {
     let mut prefix = [0_u8; 4];
     reader.read_exact(&mut prefix).map_err(map_read_error)?;
 
     let declared_len = u32::from_be_bytes(prefix) as usize;
     if declared_len > max_payload_bytes.min(MAX_RPC_FRAME_BYTES) {
+        return Err(PluginRpcError::FrameTooLarge);
+    }
+    let frame_bytes = declared_len
+        .checked_add(prefix.len())
+        .ok_or(PluginRpcError::FrameTooLarge)?;
+    if !reserve_frame_bytes(frame_bytes) {
         return Err(PluginRpcError::FrameTooLarge);
     }
 

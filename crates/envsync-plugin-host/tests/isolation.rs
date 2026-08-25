@@ -666,6 +666,77 @@ fn test_runner_enforces_a_combined_stderr_output_limit_without_echoing_diagnosti
 
 #[cfg(not(target_os = "macos"))]
 #[test]
+fn test_runner_kills_a_late_stderr_flood_after_a_valid_response() {
+    let fixture = Fixture::new();
+    let mut host = fixture.test_host(fixture.registry(), runner_path());
+    let id = PluginId::parse("com.example.late-stderr-flood").expect("id");
+    let device = profile();
+    let allow = policy(Decision::Allow);
+    let request = RpcRequest::new(
+        SchemaVersion::new(1, 0),
+        RequestId::parse("late_stderr_flood").expect("request id"),
+        PluginMethod::Observe,
+        serde_json::json!({}),
+    )
+    .expect("request");
+    let response = RpcMessage::new_success_response(
+        SchemaVersion::new(1, 0),
+        request.id().clone(),
+        serde_json::json!({ "accepted": true }),
+    )
+    .expect("response");
+    let escaped_frame = encode_frame(&response)
+        .expect("frame")
+        .iter()
+        .map(|byte| format!("\\{byte:03o}"))
+        .collect::<String>();
+    let survivor_marker = fixture.temp.path().join("stderr-flood-survivor");
+    let survivor_marker = survivor_marker.to_string_lossy().replace('\'', "'\"'\"'");
+    let script = format!(
+        "#!/bin/sh\nprintf '%b' '{escaped_frame}'\n/bin/sleep 0.05\nprintf '%b' '{escaped_frame}'\nprintf '%b' '{escaped_frame}'\nprintf '%b' '{escaped_frame}'\nprintf '%b' '{escaped_frame}'\n(/bin/sleep 0.2; printf survived > '{survivor_marker}') &\nwhile :; do printf 'fixture-secret-stderr' >&2; done\n"
+    );
+
+    host.quarantine(
+        fixture.artifact(id.as_str(), script.as_bytes(), &["observe"]),
+        NOW,
+    )
+    .expect("quarantine");
+    let approval = host
+        .approve(&id, "work", &device, &allow, true, NOW + 1)
+        .expect("approve");
+    host.enable(&id, &approval, "work", &device, &allow, true, NOW + 2)
+        .expect("enable");
+
+    let mut session = host.start(&id, NOW + 3).expect("start runner");
+    let first_response = session
+        .call(request)
+        .expect("first response before late flood");
+    assert_eq!(
+        first_response.result().expect("success result"),
+        &serde_json::json!({ "accepted": true })
+    );
+
+    std::thread::sleep(Duration::from_millis(350));
+    assert!(
+        !fixture.temp.path().join("stderr-flood-survivor").exists(),
+        "output-limit handling must kill descendants before they can survive"
+    );
+
+    let follow_up = RpcRequest::new(
+        SchemaVersion::new(1, 0),
+        RequestId::parse("late_stderr_flood_follow_up").expect("request id"),
+        PluginMethod::Observe,
+        serde_json::json!({}),
+    )
+    .expect("request");
+    let error = session
+        .call(follow_up)
+        .expect_err("late stderr flood must remain an output-limit failure");
+    assert_eq!(error.code(), "plugin.host.output_limit");
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
 fn test_runner_shutdown_times_out_when_plugin_ignores_the_request() {
     let fixture = Fixture::new();
     let mut host = fixture.test_host(fixture.registry(), runner_path());

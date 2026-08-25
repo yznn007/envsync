@@ -3,8 +3,9 @@ use std::io::{self, Cursor, Read, Write};
 
 use envsync_plugin_api::{
     decode_frame, encode_frame, parse_initialize_result, read_frame, read_frame_with_limit,
-    write_frame, PluginCatalog, PluginManifest, PluginManifestError, PluginMethod, PluginRpcError,
-    RequestId, RpcErrorObject, RpcMessage, SchemaVersion, MAX_RPC_FRAME_BYTES,
+    read_frame_with_limit_and_reservation, write_frame, PluginCatalog, PluginManifest,
+    PluginManifestError, PluginMethod, PluginRpcError, RequestId, RpcErrorObject, RpcMessage,
+    SchemaVersion, MAX_RPC_FRAME_BYTES,
 };
 
 fn valid_manifest_json() -> serde_json::Value {
@@ -462,6 +463,36 @@ fn frame_reader_respects_host_limit_before_allocating_body() {
     };
     let error = read_frame_with_limit(&mut reader, 1020)
         .expect_err("超过 Host 限额的 frame 必须在读取 body 前拒绝");
+    assert_rpc_error_code(error, "plugin.rpc.frame_too_large");
+}
+
+#[test]
+fn frame_reader_reservation_rejects_before_allocating_body() {
+    let declared_len = 1020_u32;
+
+    struct PrefixOnlyReader {
+        prefix: [u8; 4],
+        consumed: bool,
+    }
+
+    impl Read for PrefixOnlyReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            assert!(!self.consumed, "预算拒绝后的 body 不得被读取或分配");
+            buffer[..4].copy_from_slice(&self.prefix);
+            self.consumed = true;
+            Ok(4)
+        }
+    }
+
+    let mut reader = PrefixOnlyReader {
+        prefix: declared_len.to_be_bytes(),
+        consumed: false,
+    };
+    let error = read_frame_with_limit_and_reservation(&mut reader, 1020, |frame_bytes| {
+        assert_eq!(frame_bytes, 1024);
+        false
+    })
+    .expect_err("共享预算不足的 frame 必须在读取 body 前拒绝");
     assert_rpc_error_code(error, "plugin.rpc.frame_too_large");
 }
 

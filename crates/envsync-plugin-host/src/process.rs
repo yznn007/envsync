@@ -22,8 +22,8 @@ use std::time::{Duration, Instant};
 
 #[cfg(all(unix, not(target_os = "macos")))]
 use envsync_plugin_api::{
-    read_frame_with_limit, write_frame, PluginMethod, PluginRpcError, RequestId, ResourceLimits,
-    RpcMessage, RpcRequest, RpcResponse, SchemaVersion,
+    read_frame_with_limit_and_reservation, write_frame, PluginMethod, PluginRpcError, RequestId,
+    ResourceLimits, RpcMessage, RpcRequest, RpcResponse, SchemaVersion,
 };
 #[cfg(all(unix, not(target_os = "macos")))]
 use nix::sys::signal::{killpg, Signal};
@@ -47,6 +47,7 @@ pub struct PluginSession {
     child: Child,
     stdin: Option<ChildStdin>,
     events: Receiver<ProcessEvent>,
+    budget: Arc<OutputBudget>,
     readers: Vec<JoinHandle<()>>,
     limits: ResourceLimits,
     pending_frame: Option<RpcMessage>,
@@ -78,10 +79,14 @@ impl PluginSession {
         let mut child = command
             .spawn()
             .map_err(|error| HostError::io("spawn_runner", &error))?;
-        if let Ok(raw_pid) = i32::try_from(child.id()) {
-            let pid = Pid::from_raw(raw_pid);
-            let _ = setpgid(pid, pid);
-        }
+        let process_group = match i32::try_from(child.id()) {
+            Ok(raw_pid) => Pid::from_raw(raw_pid),
+            Err(_) => {
+                terminate_child(&mut child);
+                return Err(HostError::ProcessExited);
+            }
+        };
+        let _ = setpgid(process_group, process_group);
 
         let (stdin, stdout, stderr) =
             match (child.stdin.take(), child.stdout.take(), child.stderr.take()) {
@@ -100,14 +105,16 @@ impl PluginSession {
                 stdout,
                 Arc::clone(&budget),
                 max_stdout_frame_bytes,
+                process_group,
                 sender.clone(),
             ),
-            spawn_stderr_reader(stderr, budget, sender),
+            spawn_stderr_reader(stderr, Arc::clone(&budget), process_group, sender),
         ];
         Ok(Self {
             child,
             stdin: Some(stdin),
             events,
+            budget,
             readers,
             limits,
             pending_frame: None,
@@ -121,10 +128,20 @@ impl PluginSession {
         if self.closed {
             return Err(HostError::InvalidState);
         }
+        if self.budget.exceeded() {
+            return self.fail(HostError::OutputLimit);
+        }
         let deadline =
             Instant::now() + Duration::from_millis(u64::from(self.limits.max_runtime_ms));
         self.write_request(RpcMessage::Request(request.clone()), deadline)?;
-        self.read_response(&request, deadline)
+        if self.budget.exceeded() {
+            return self.fail(HostError::OutputLimit);
+        }
+        let response = self.read_response(&request, deadline)?;
+        if self.budget.exceeded() {
+            return self.fail(HostError::OutputLimit);
+        }
+        Ok(response)
     }
 
     /// 请求插件自行关闭，并在固定宽限期后回收整个进程组。
@@ -160,6 +177,11 @@ impl PluginSession {
         });
 
         loop {
+            if self.budget.exceeded() {
+                self.terminate();
+                let _ = writer.join();
+                return Err(HostError::OutputLimit);
+            }
             match completion.try_recv() {
                 Ok((stdin, true)) => {
                     self.stdin = Some(stdin);
@@ -220,6 +242,9 @@ impl PluginSession {
         if now >= deadline {
             return self.fail(HostError::Timeout);
         }
+        if self.budget.exceeded() {
+            return self.fail(HostError::OutputLimit);
+        }
         if let Some(message) = self.pending_frame.take() {
             return self.validate_response(message, request);
         }
@@ -227,6 +252,9 @@ impl PluginSession {
             .events
             .recv_timeout(deadline.saturating_duration_since(now))
         {
+            Ok(ProcessEvent::Frame(_)) if self.budget.exceeded() => {
+                self.fail(HostError::OutputLimit)
+            }
             Ok(ProcessEvent::Frame(message)) => self.validate_response(message, request),
             Ok(event) => self.fail(event.error()),
             Err(mpsc::RecvTimeoutError::Timeout) => self.fail(HostError::Timeout),
@@ -239,11 +267,17 @@ impl PluginSession {
         message: RpcMessage,
         request: &RpcRequest,
     ) -> Result<RpcResponse, HostError> {
+        if self.budget.exceeded() {
+            return self.fail(HostError::OutputLimit);
+        }
         let Some(response) = message.response() else {
             return self.fail(HostError::Protocol);
         };
         if response.id() != request.id() {
             return self.fail(HostError::Protocol);
+        }
+        if self.budget.exceeded() {
+            return self.fail(HostError::OutputLimit);
         }
         Ok(response.clone())
     }
@@ -308,7 +342,7 @@ impl ProcessEvent {
 #[cfg(all(unix, not(target_os = "macos")))]
 struct OutputBudget {
     limit: u64,
-    consumed: AtomicU64,
+    reserved: AtomicU64,
     exceeded: AtomicBool,
 }
 
@@ -317,24 +351,25 @@ impl OutputBudget {
     fn new(limit: u64) -> Self {
         Self {
             limit,
-            consumed: AtomicU64::new(0),
+            reserved: AtomicU64::new(0),
             exceeded: AtomicBool::new(false),
         }
     }
 
-    fn consume(&self, bytes: usize) -> bool {
+    /// 原子预留输出预算；stdout 在分配 frame body 前、stderr 在读取实际字节后调用它。
+    fn reserve(&self, bytes: usize) -> bool {
         let bytes = u64::try_from(bytes).expect("usize fits u64");
         loop {
-            let consumed = self.consumed.load(Ordering::Acquire);
-            let Some(updated) = consumed.checked_add(bytes) else {
+            let reserved = self.reserved.load(Ordering::Acquire);
+            let Some(updated) = reserved.checked_add(bytes) else {
                 return false;
             };
             if updated > self.limit {
                 return false;
             }
             if self
-                .consumed
-                .compare_exchange(consumed, updated, Ordering::AcqRel, Ordering::Acquire)
+                .reserved
+                .compare_exchange(reserved, updated, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
                 return true;
@@ -375,7 +410,7 @@ impl<R: Read> Read for BudgetedReader<R> {
         if read == 0 {
             return Ok(0);
         }
-        if self.budget.consume(read) {
+        if self.budget.reserve(read) {
             Ok(read)
         } else {
             self.budget.mark_exceeded();
@@ -389,12 +424,17 @@ fn spawn_stdout_reader(
     stdout: ChildStdout,
     budget: Arc<OutputBudget>,
     max_payload_bytes: usize,
+    process_group: Pid,
     sender: SyncSender<ProcessEvent>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
-        let mut reader = BudgetedReader::new(stdout, budget.clone());
+        let mut reader = stdout;
         loop {
-            match read_frame_with_limit(&mut reader, max_payload_bytes) {
+            match read_frame_with_limit_and_reservation(
+                &mut reader,
+                max_payload_bytes,
+                |frame_bytes| budget.reserve(frame_bytes),
+            ) {
                 Ok(message) => {
                     if !send_event(&sender, ProcessEvent::Frame(message)) {
                         return;
@@ -409,7 +449,7 @@ fn spawn_stdout_reader(
                         } else {
                             ProcessEvent::Protocol
                         };
-                    let _ = send_event(&sender, event);
+                    report_reader_failure(&sender, event, &budget, process_group);
                     return;
                 }
             }
@@ -421,6 +461,7 @@ fn spawn_stdout_reader(
 fn spawn_stderr_reader(
     stderr: ChildStderr,
     budget: Arc<OutputBudget>,
+    process_group: Pid,
     sender: SyncSender<ProcessEvent>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
@@ -436,7 +477,7 @@ fn spawn_stderr_reader(
                     } else {
                         ProcessEvent::ProcessExited
                     };
-                    let _ = send_event(&sender, event);
+                    report_reader_failure(&sender, event, &budget, process_group);
                     return;
                 }
             }
@@ -445,14 +486,33 @@ fn spawn_stderr_reader(
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
+fn report_reader_failure(
+    sender: &SyncSender<ProcessEvent>,
+    event: ProcessEvent,
+    budget: &OutputBudget,
+    process_group: Pid,
+) {
+    if matches!(&event, ProcessEvent::OutputLimit) {
+        budget.mark_exceeded();
+    }
+    terminate_process_group(process_group);
+    let _ = send_event(sender, event);
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
 fn send_event(sender: &SyncSender<ProcessEvent>, event: ProcessEvent) -> bool {
     sender.try_send(event).is_ok()
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
+fn terminate_process_group(process_group: Pid) {
+    let _ = killpg(process_group, Signal::SIGKILL);
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
 fn terminate_child(child: &mut Child) {
     if let Ok(raw_pid) = i32::try_from(child.id()) {
-        let _ = killpg(Pid::from_raw(raw_pid), Signal::SIGKILL);
+        terminate_process_group(Pid::from_raw(raw_pid));
     }
     let _ = child.kill();
     let _ = child.wait();
