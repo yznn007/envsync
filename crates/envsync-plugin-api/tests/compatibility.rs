@@ -110,7 +110,7 @@ fn manifest_signing_payload_preserves_v1_wire_order_and_bytes() {
     json["targets"] = serde_json::json!(["windows", "wasi-p2", "macos", "linux"]);
     json["capabilities"] = serde_json::json!(["verify", "render", "plan-command", "observe"]);
 
-    let manifest = PluginManifest::from_json_value(json).expect("合法 manifest");
+    let manifest = PluginManifest::from_json_value(json.clone()).expect("合法 manifest");
     let payload = manifest.signing_payload().expect("payload 必须可序列化");
     assert_eq!(
         payload,
@@ -129,9 +129,11 @@ fn manifest_signing_payload_preserves_v1_wire_order_and_bytes() {
         serde_json::json!(["observe", "render", "plan-command", "verify"])
     );
 
-    let mut changed_digest = valid_manifest_json();
+    let mut changed_digest = json.clone();
+    let mut digest = [3u8; 32];
+    digest[0] = 4;
     changed_digest["entrypoint_digest"] =
-        serde_json::json!(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([4u8; 32]));
+        serde_json::json!(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest));
     let changed_payload = PluginManifest::from_json_value(changed_digest)
         .expect("合法 manifest")
         .signing_payload()
