@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","schema_version":{"major":1,"minor":0},"id":"request-0001","method":"initialize","params":{"supported_minors":[0,1]}}

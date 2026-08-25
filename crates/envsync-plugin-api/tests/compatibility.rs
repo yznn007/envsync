@@ -1,5 +1,11 @@
 use base64::Engine;
-use envsync_plugin_api::{PluginCatalog, PluginManifest, PluginManifestError};
+use std::io::{self, Cursor, Read, Write};
+
+use envsync_plugin_api::{
+    decode_frame, encode_frame, parse_initialize_result, read_frame, write_frame, PluginCatalog,
+    PluginManifest, PluginManifestError, PluginMethod, PluginRpcError, RequestId, RpcErrorObject,
+    RpcMessage, SchemaVersion, MAX_RPC_FRAME_BYTES,
+};
 
 fn valid_manifest_json() -> serde_json::Value {
     serde_json::json!({
@@ -27,6 +33,27 @@ fn valid_manifest_json() -> serde_json::Value {
 
 fn assert_error_code(json: serde_json::Value, expected: &str) {
     let error = PluginManifest::from_json_value(json).expect_err("必须拒绝不可信 manifest");
+    assert_eq!(error.code(), expected);
+}
+
+fn request_json(method: &str, version: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "schema_version": version,
+        "id": "request-0001",
+        "method": method,
+        "params": {},
+    })
+}
+
+fn frame_with_payload(payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(4 + payload.len());
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+
+fn assert_rpc_error_code(error: PluginRpcError, expected: &str) {
     assert_eq!(error.code(), expected);
 }
 
@@ -224,4 +251,519 @@ fn error_type_is_exposed_for_callers() {
     let mut json = valid_manifest_json();
     json["id"] = serde_json::json!("invalid");
     accepts_manifest_error(PluginManifest::from_json_value(json).expect_err("ID 必须被拒绝"));
+}
+
+#[test]
+fn golden_initialize_frame_is_length_prefixed_and_round_trips() {
+    let json = include_bytes!("fixtures/initialize-request-v1.0.json");
+    let message = RpcMessage::from_json_slice(json).expect("fixture 合法");
+    let frame = encode_frame(&message).expect("可编码");
+    assert_eq!(&frame[..4], &(json.len() as u32).to_be_bytes());
+    assert_eq!(&frame[4..], json);
+    let decoded = decode_frame(&frame).expect("frame 可读");
+    assert_eq!(
+        decoded.request().expect("request").method(),
+        PluginMethod::Initialize
+    );
+    assert_eq!(decoded.schema_version(), SchemaVersion::new(1, 0));
+}
+
+#[test]
+fn golden_describe_response_frame_is_length_prefixed_and_round_trips() {
+    let json = include_bytes!("fixtures/describe-response-v1.1.json");
+    let message = RpcMessage::from_json_slice(json).expect("fixture 合法");
+    let frame = encode_frame(&message).expect("可编码");
+    assert_eq!(&frame[..4], &(json.len() as u32).to_be_bytes());
+    assert_eq!(&frame[4..], json);
+    let decoded = decode_frame(&frame).expect("frame 可读");
+    assert!(decoded.response().is_some());
+    assert_eq!(decoded.schema_version(), SchemaVersion::new(1, 1));
+}
+
+#[test]
+fn supported_minors_ignore_extensions_but_unknown_methods_and_versions_fail() {
+    let mut value: serde_json::Value =
+        serde_json::from_slice(include_bytes!("fixtures/describe-response-v1.1.json"))
+            .expect("fixture JSON");
+    value["future_extension"] = serde_json::json!({"safe": true});
+    assert!(RpcMessage::from_json_value(value).is_ok());
+
+    for (method, version, code) in [
+        (
+            "erase-everything",
+            serde_json::json!({"major": 1, "minor": 1}),
+            "plugin.rpc.unknown_method",
+        ),
+        (
+            "describe",
+            serde_json::json!({"major": 2, "minor": 0}),
+            "plugin.rpc.unsupported_version",
+        ),
+        (
+            "describe",
+            serde_json::json!({"major": 1, "minor": 2}),
+            "plugin.rpc.unsupported_version",
+        ),
+    ] {
+        let request = request_json(method, version);
+        assert_eq!(
+            RpcMessage::from_json_value(request).unwrap_err().code(),
+            code
+        );
+    }
+}
+
+#[test]
+fn frame_reader_rejects_oversized_prefix_before_allocating_body() {
+    let declared_len = (MAX_RPC_FRAME_BYTES + 1) as u32;
+
+    struct PrefixOnlyReader {
+        prefix: [u8; 4],
+        consumed: bool,
+    }
+
+    impl Read for PrefixOnlyReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            assert!(!self.consumed, "超长 prefix 后不得继续读取 body");
+            buffer[..4].copy_from_slice(&self.prefix);
+            self.consumed = true;
+            Ok(4)
+        }
+    }
+
+    let mut reader = PrefixOnlyReader {
+        prefix: declared_len.to_be_bytes(),
+        consumed: false,
+    };
+    let error = read_frame(&mut reader).expect_err("超长 frame 必须在读取 body 前拒绝");
+    assert_rpc_error_code(error, "plugin.rpc.frame_too_large");
+}
+
+#[test]
+fn frame_reader_rejects_truncated_prefix_and_body() {
+    let mut prefix = Cursor::new([0_u8, 0, 0]);
+    let error = read_frame(&mut prefix).expect_err("截断 prefix 必须被拒绝");
+    assert_rpc_error_code(error, "plugin.rpc.truncated_frame");
+
+    let mut body = Cursor::new([0_u8, 0, 0, 5, b'{', b'}']);
+    let error = read_frame(&mut body).expect_err("截断 body 必须被拒绝");
+    assert_rpc_error_code(error, "plugin.rpc.truncated_frame");
+}
+
+#[test]
+fn frame_decoder_rejects_non_utf8_invalid_json_and_length_mismatches() {
+    let error = decode_frame(&frame_with_payload(&[0xff])).expect_err("非 UTF-8 必须被拒绝");
+    assert_rpc_error_code(error, "plugin.rpc.invalid_utf8");
+
+    let error = decode_frame(&frame_with_payload(b"{")).expect_err("JSON 语法错误必须被拒绝");
+    assert_rpc_error_code(error, "plugin.rpc.invalid_json");
+
+    let mut truncated = 3_u32.to_be_bytes().to_vec();
+    truncated.extend_from_slice(b"{}");
+    let error = decode_frame(&truncated).expect_err("声明长度不足必须被拒绝");
+    assert_rpc_error_code(error, "plugin.rpc.truncated_frame");
+
+    let mut frame = frame_with_payload(b"{}");
+    frame.push(b'!');
+    let error = decode_frame(&frame).expect_err("尾随 bytes 必须被拒绝");
+    assert_rpc_error_code(error, "plugin.rpc.length_mismatch");
+}
+
+#[test]
+fn non_eof_io_errors_are_safe_and_not_reported_as_truncation() {
+    struct FailingReader;
+
+    impl Read for FailingReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "secret /Users/example/Vault-token",
+            ))
+        }
+    }
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "secret /Users/example/Vault-token",
+            ))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let error = read_frame(&mut FailingReader).expect_err("非 EOF 读取错误必须被分类");
+    assert_rpc_error_code(error, "plugin.rpc.io_error");
+    assert!(!error.to_string().contains("Vault-token"));
+    assert!(!format!("{error:?}").contains("Vault-token"));
+
+    let message =
+        RpcMessage::from_json_slice(include_bytes!("fixtures/initialize-request-v1.0.json"))
+            .expect("fixture 合法");
+    let error = write_frame(&mut FailingWriter, &message).expect_err("写入错误必须被分类");
+    assert_rpc_error_code(error, "plugin.rpc.io_error");
+    assert!(!error.to_string().contains("Vault-token"));
+    assert!(!format!("{error:?}").contains("Vault-token"));
+}
+
+#[test]
+fn request_id_boundaries_are_enforced_in_api_and_envelope() {
+    assert_eq!(RequestId::parse("a").expect("最短 ID 合法").as_str(), "a");
+    assert!(RequestId::parse(&"a".repeat(64)).is_ok());
+    assert_eq!(
+        RequestId::parse("").expect_err("空 ID 必须拒绝").code(),
+        "plugin.rpc.invalid_request"
+    );
+    assert_eq!(
+        RequestId::parse(&"a".repeat(65))
+            .expect_err("超长 ID 必须拒绝")
+            .code(),
+        "plugin.rpc.invalid_request"
+    );
+
+    for id in [
+        "has space",
+        "line\nbreak",
+        "nul\u{0000}byte",
+        "slash/id",
+        "非ascii",
+    ] {
+        assert_eq!(
+            RequestId::parse(id)
+                .expect_err("非法字符 ID 必须拒绝")
+                .code(),
+            "plugin.rpc.invalid_request"
+        );
+    }
+
+    let mut request = request_json("describe", serde_json::json!({"major": 1, "minor": 1}));
+    request["id"] = serde_json::json!("");
+    assert_eq!(
+        RpcMessage::from_json_value(request)
+            .expect_err("envelope 空 ID 必须被拒绝")
+            .code(),
+        "plugin.rpc.invalid_request"
+    );
+}
+
+#[test]
+fn all_methods_are_closed_and_round_trip_without_other_variant() {
+    for (wire, method) in [
+        ("initialize", PluginMethod::Initialize),
+        ("describe", PluginMethod::Describe),
+        ("observe", PluginMethod::Observe),
+        ("render", PluginMethod::Render),
+        ("plan-command", PluginMethod::PlanCommand),
+        ("verify", PluginMethod::Verify),
+        ("shutdown", PluginMethod::Shutdown),
+    ] {
+        assert_eq!(PluginMethod::parse(wire).expect("method 合法"), method);
+        assert_eq!(method.as_str(), wire);
+
+        let message = RpcMessage::from_json_value(request_json(
+            wire,
+            serde_json::json!({"major": 1, "minor": 1}),
+        ))
+        .expect("封闭 method 必须可解析");
+        assert_eq!(message.request().expect("request").method(), method);
+    }
+
+    assert_eq!(
+        PluginMethod::parse("initialize-now")
+            .expect_err("未知 method 必须拒绝")
+            .code(),
+        "plugin.rpc.unknown_method"
+    );
+}
+
+#[test]
+fn rpc_shape_rejects_bad_jsonrpc_id_batch_and_mixed_messages() {
+    let mut bad_jsonrpc = request_json("describe", serde_json::json!({"major": 1, "minor": 1}));
+    bad_jsonrpc["jsonrpc"] = serde_json::json!("1.0");
+    assert_eq!(
+        RpcMessage::from_json_value(bad_jsonrpc)
+            .expect_err("jsonrpc 必须是 2.0")
+            .code(),
+        "plugin.rpc.invalid_request"
+    );
+
+    let mut missing_id = request_json("describe", serde_json::json!({"major": 1, "minor": 1}));
+    missing_id.as_object_mut().expect("object").remove("id");
+    assert_eq!(
+        RpcMessage::from_json_value(missing_id)
+            .expect_err("缺失 ID 必须被拒绝")
+            .code(),
+        "plugin.rpc.invalid_request"
+    );
+
+    let mut missing_params = request_json("describe", serde_json::json!({"major": 1, "minor": 1}));
+    missing_params
+        .as_object_mut()
+        .expect("object")
+        .remove("params");
+    assert_eq!(
+        RpcMessage::from_json_value(missing_params)
+            .expect_err("缺失 params 必须被拒绝")
+            .code(),
+        "plugin.rpc.invalid_request"
+    );
+
+    for id in [serde_json::Value::Null, serde_json::json!(7)] {
+        let mut request = request_json("describe", serde_json::json!({"major": 1, "minor": 1}));
+        request["id"] = id;
+        assert_eq!(
+            RpcMessage::from_json_value(request)
+                .expect_err("非字符串 ID 必须被拒绝")
+                .code(),
+            "plugin.rpc.invalid_request"
+        );
+    }
+
+    let batch = serde_json::json!([request_json(
+        "describe",
+        serde_json::json!({"major": 1, "minor": 1})
+    )]);
+    assert_eq!(
+        RpcMessage::from_json_value(batch)
+            .expect_err("batch 必须被拒绝")
+            .code(),
+        "plugin.rpc.invalid_request"
+    );
+
+    let mut mixed = request_json("describe", serde_json::json!({"major": 1, "minor": 1}));
+    mixed["result"] = serde_json::json!({});
+    assert_eq!(
+        RpcMessage::from_json_value(mixed)
+            .expect_err("request/response 混形必须被拒绝")
+            .code(),
+        "plugin.rpc.invalid_request"
+    );
+
+    let mut mixed_error = request_json("describe", serde_json::json!({"major": 1, "minor": 1}));
+    mixed_error["error"] = serde_json::json!({"code": "plugin.failed", "message": "failed"});
+    assert_eq!(
+        RpcMessage::from_json_value(mixed_error)
+            .expect_err("request/error 混形必须被拒绝")
+            .code(),
+        "plugin.rpc.invalid_request"
+    );
+}
+
+#[test]
+fn response_requires_exactly_one_result_or_error() {
+    let base = serde_json::json!({
+        "jsonrpc": "2.0",
+        "schema_version": {"major": 1, "minor": 1},
+        "id": "request-0001",
+    });
+
+    let mut both = base.clone();
+    both["result"] = serde_json::json!({});
+    both["error"] = serde_json::json!({"code": "plugin.failed", "message": "failed"});
+    assert_eq!(
+        RpcMessage::from_json_value(both)
+            .expect_err("result/error 不能同时存在")
+            .code(),
+        "plugin.rpc.invalid_response"
+    );
+
+    assert_eq!(
+        RpcMessage::from_json_value(base)
+            .expect_err("response 必须包含 result 或 error")
+            .code(),
+        "plugin.rpc.invalid_response"
+    );
+
+    let response_with_params = serde_json::json!({
+        "jsonrpc": "2.0",
+        "schema_version": {"major": 1, "minor": 1},
+        "id": "request-0001",
+        "params": {},
+        "result": {},
+    });
+    assert_eq!(
+        RpcMessage::from_json_value(response_with_params)
+            .expect_err("response 不能携带 request params")
+            .code(),
+        "plugin.rpc.invalid_response"
+    );
+}
+
+#[test]
+fn write_and_read_frame_round_trip_supported_request() {
+    let message =
+        RpcMessage::from_json_slice(include_bytes!("fixtures/initialize-request-v1.0.json"))
+            .expect("fixture 合法");
+    let mut bytes = Vec::new();
+    write_frame(&mut bytes, &message).expect("frame 可写");
+
+    let mut reader = Cursor::new(bytes);
+    let decoded = read_frame(&mut reader).expect("frame 可读");
+    assert_eq!(
+        decoded.request().expect("request").id().as_str(),
+        "request-0001"
+    );
+    assert_eq!(decoded.schema_version(), SchemaVersion::new(1, 0));
+}
+
+#[test]
+fn parse_initialize_result_checks_selected_supported_version_after_correlation() {
+    let selected = parse_initialize_result(&serde_json::json!({
+        "selected_schema_version": {"major": 1, "minor": 1}
+    }))
+    .expect("关联后的 initialize result 合法");
+    assert_eq!(selected, SchemaVersion::new(1, 1));
+
+    let error = parse_initialize_result(&serde_json::json!({
+        "selected_schema_version": {"major": 1, "minor": 2}
+    }))
+    .expect_err("future minor 必须被拒绝");
+    assert_rpc_error_code(error, "plugin.rpc.unsupported_version");
+
+    let error = parse_initialize_result(&serde_json::json!({"ok": true}))
+        .expect_err("缺失 selected_schema_version 必须被拒绝");
+    assert_rpc_error_code(error, "plugin.rpc.invalid_response");
+}
+
+#[test]
+fn generic_response_does_not_validate_initialize_payload_without_correlation() {
+    let message = RpcMessage::from_json_value(serde_json::json!({
+        "jsonrpc": "2.0",
+        "schema_version": {"major": 1, "minor": 1},
+        "id": "request-0001",
+        "result": {
+            "selected_schema_version": {"major": 1, "minor": 2}
+        }
+    }))
+    .expect("generic response 只校验 envelope");
+
+    let result = message
+        .response()
+        .expect("response")
+        .result()
+        .expect("success result");
+    assert_eq!(
+        parse_initialize_result(result)
+            .expect_err("关联为 initialize 后才验证 selected version")
+            .code(),
+        "plugin.rpc.unsupported_version"
+    );
+}
+
+#[test]
+fn public_constructors_build_supported_messages_and_reject_unsupported_versions() {
+    let request = RpcMessage::new_request(
+        SchemaVersion::new(1, 1),
+        RequestId::parse("request_0002").expect("ID 合法"),
+        PluginMethod::Describe,
+        serde_json::json!({}),
+    )
+    .expect("Host 可安全构造 request");
+    assert_eq!(
+        decode_frame(&encode_frame(&request).expect("可编码"))
+            .expect("可解码")
+            .request()
+            .expect("request")
+            .id()
+            .as_str(),
+        "request_0002"
+    );
+
+    let success = RpcMessage::new_success_response(
+        SchemaVersion::new(1, 1),
+        RequestId::parse("request_0005").expect("ID 合法"),
+        serde_json::json!({"name": "calendar"}),
+    )
+    .expect("Host 可安全构造 success response");
+    let decoded_success = decode_frame(&encode_frame(&success).expect("可编码")).expect("可解码");
+    assert_eq!(
+        decoded_success
+            .response()
+            .expect("response")
+            .result()
+            .expect("success result"),
+        &serde_json::json!({"name": "calendar"})
+    );
+
+    let response = RpcMessage::new_error_response(
+        SchemaVersion::new(1, 1),
+        RequestId::parse("request_0003").expect("ID 合法"),
+        RpcErrorObject::new(
+            "plugin.failed",
+            "failed",
+            Some(serde_json::json!({"retry": false})),
+        ),
+    )
+    .expect("Host 可安全构造 error response");
+    let decoded_response = decode_frame(&encode_frame(&response).expect("可编码")).expect("可解码");
+    let error = decoded_response
+        .response()
+        .expect("response")
+        .result()
+        .expect_err("error response");
+    assert_eq!(error.code, "plugin.failed");
+    assert_eq!(error.data, Some(serde_json::json!({"retry": false})));
+
+    assert_eq!(
+        RpcMessage::new_request(
+            SchemaVersion::new(1, 2),
+            RequestId::parse("request_0004").expect("ID 合法"),
+            PluginMethod::Describe,
+            serde_json::json!({}),
+        )
+        .expect_err("Host 构造时也必须拒绝 unsupported version")
+        .code(),
+        "plugin.rpc.unsupported_version"
+    );
+}
+
+#[test]
+fn rpc_error_object_preserves_untrusted_payload_but_parser_errors_are_sanitized() {
+    let message = RpcMessage::from_json_value(serde_json::json!({
+        "jsonrpc": "2.0",
+        "schema_version": {"major": 1, "minor": 1},
+        "id": "request-0001",
+        "error": {
+            "code": "plugin.failed",
+            "message": "secret /Users/example/Vault-token",
+            "data": {"path": "/Users/example/Vault-token"}
+        }
+    }))
+    .expect("error response envelope 合法");
+    let error = message
+        .response()
+        .expect("response")
+        .result()
+        .expect_err("error response");
+    assert!(error.message.contains("Vault-token"));
+
+    let parser_error = RpcMessage::from_json_value(serde_json::json!({
+        "jsonrpc": "2.0",
+        "schema_version": {"major": 1, "minor": 1},
+        "id": "request-0001",
+        "error": {
+            "code": "secret /Users/example/Vault-token"
+        }
+    }))
+    .expect_err("非法 error object 必须变成本地解析错误");
+    assert_rpc_error_code(parser_error, "plugin.rpc.invalid_response");
+    assert!(!parser_error.to_string().contains("Vault-token"));
+    assert!(!format!("{parser_error:?}").contains("Vault-token"));
+}
+
+#[test]
+fn rpc_error_text_does_not_echo_untrusted_input() {
+    let request = request_json(
+        "secret-/Users/example/Vault-token",
+        serde_json::json!({"major": 1, "minor": 1}),
+    );
+    let error = RpcMessage::from_json_value(request).expect_err("未知 method 必须被拒绝");
+    assert_eq!(error.code(), "plugin.rpc.unknown_method");
+    assert!(!error.to_string().contains("Vault-token"));
+    assert!(!format!("{error:?}").contains("Vault-token"));
 }
