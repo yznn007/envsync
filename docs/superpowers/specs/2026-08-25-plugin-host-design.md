@@ -23,7 +23,7 @@ manifest + entrypoint bytes
   │ parse / digest / publisher trust / Ed25519 verify
   ▼
 non-executable quarantine
-  │ policy + explicit approval（digest、能力、profile、signer）
+  │ policy + explicit approval（digest、能力、profile 名称及实际属性、signer）
   ▼
 verified runtime copy
   │ 每次启动前再比对 digest
@@ -31,13 +31,18 @@ verified runtime copy
 isolated runner
 ```
 
-quarantine 与 runtime 根都由 Host 自己创建，逐段拒绝符号链接。quarantine 文件去掉全部 execute 位；批准后才写入新的 runtime 目录，并且只给该入口文件执行位。失败、更新、能力扩张、签名不匹配或发布者撤销都不覆盖旧审计记录。
+quarantine 与 runtime 根必须是 Host 控制的绝对、规范化路径。Unix Host 从文件系统根逐段
+no-follow 打开它们，并让后续创建/读取始终相对已打开的目录句柄执行，不能因祖先或子路径
+在检查后被换成符号链接而越界。quarantine 文件去掉全部 execute 位；`Approved` 只表示
+批准已绑定，不表示可执行。普通构建没有可验证 sandbox 时绝不写入或公开 runtime 入口；
+仅受控 runner 在启动前再次比对 digest 后，才可私下创建新的 runtime 文件并给它执行位。
+失败、更新、能力扩张、签名不匹配或发布者撤销都不覆盖旧审计记录。
 
 `envsync_core::bundles::PublisherRegistry`、`publisher_namespace()` 与发布者指纹仍是唯一的发布者信任来源；插件使用独立的签名 domain `envsync-plugin`，避免与 Agent Bundle 重放。
 
 ## 生命周期与策略
 
-`PluginRecord` 的状态为 `Quarantined`、`Approved`、`Enabled`、`Blocked` 或 `Revoked`。批准绑定插件 ID、manifest/入口 digest、声明 capability、profile 和 signer。内容、signer 或 capability 扩张都会使批准失效并回到 quarantine。撤销是降级动作：立即把同一 signer 的已启用插件标为 `Revoked`，保留 append-only `PluginAuditEvent`。
+`PluginRecord` 的状态为 `Quarantined`、`Approved`、`Enabled`、`Blocked` 或 `Revoked`。批准绑定插件 ID、manifest/入口 digest、声明 capability、profile 名称、完整 `DeviceProfile` 的 canonical-CBOR 域分隔摘要和 signer；因此同名但 OS、架构或标签不同的实际 profile 不能复用批准。内容、signer 或 capability 扩张都会使批准失效并回到 quarantine。撤销是降级动作：立即把同一 signer 的已启用插件标为 `Revoked`，保留 append-only `PluginAuditEvent`。
 
 启用时使用 `ResourceKind::Plugin` / `Operation::Enable` / `Risk::High` 评估现有 policy。`Deny` 或缺失确认不会启动进程；发布者在批准和启动之间被撤销也会阻断启动。
 
@@ -47,7 +52,12 @@ quarantine 与 runtime 根都由 Host 自己创建，逐段拒绝符号链接。
 
 Host 为每次会话新建空临时 cwd，使用 `env_clear()`，仅注入固定的 `ENVSYNC_PLUGIN_PROTOCOL=stdio-v1`；stdin/stdout 是长度前缀 RPC 管道，stderr 仅作为有上限的诊断字节流。Host 不继承 `PATH`、用户环境、工作目录、文件句柄或 Vault 句柄。
 
-本次不把 runner 的资源限制伪装成 OS filesystem/network sandbox。普通构建的 `PluginHost::new()` 报告 `SandboxUnavailable` 并拒绝启用或运行插件。仅 `test-support` feature 提供明确命名的未隔离测试 launcher，用于运行恶意 fixture 来验证 Host 的超时、输出、环境清理、协议拒绝与进程组清理；该 feature 通过自引用 dev-dependency 仅在测试构建启用。未来真实 sandbox 后端必须先提供可验证的 mount/network/identity 隔离证明，才可替换默认拒绝。
+本次不把 runner 的资源限制伪装成 OS filesystem/network sandbox。普通构建的
+`PluginHost::enable()` 报告 `SandboxUnavailable` 并拒绝启用或运行插件。仅
+`test-support` feature 提供明确命名的未隔离测试 launcher，用于运行恶意 fixture 来验证
+Host 的超时、输出、环境清理、协议拒绝与进程组清理；该 feature 通过自引用
+dev-dependency 仅在测试构建启用。未来真实 sandbox 后端必须先提供可验证的
+mount/network/identity 隔离证明，才可替换默认拒绝。
 
 ## Host-mediated capability
 

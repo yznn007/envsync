@@ -318,6 +318,43 @@ fn default_host_refuses_to_create_an_executable_runtime() {
 }
 
 #[test]
+fn approval_cannot_cross_the_actual_device_profile() {
+    let fixture = Fixture::new();
+    let mut host = fixture.host(fixture.registry());
+    let id = PluginId::parse("com.example.profile-binding").expect("id");
+    let approved_profile = profile();
+    let other_profile = DeviceProfile::new(Os::Linux, Arch::X86_64).with_tag("work");
+    let allow = policy(Decision::Allow);
+
+    host.quarantine(fixture.artifact(id.as_str(), b"profile", &["observe"]), NOW)
+        .expect("quarantine");
+    let approval = host
+        .approve(&id, "work", &approved_profile, &allow, true, NOW + 1)
+        .expect("approve");
+
+    let error = host
+        .enable(
+            &id,
+            &approval,
+            "work",
+            &other_profile,
+            &allow,
+            true,
+            NOW + 2,
+        )
+        .expect_err("different actual profile must invalidate approval");
+
+    assert!(matches!(
+        error,
+        HostError::ApprovalStale(ApprovalGap::ProfileChanged)
+    ));
+    assert_eq!(
+        host.record(&id).expect("record").state(),
+        PluginState::Approved
+    );
+}
+
+#[test]
 fn quarantine_updates_and_capability_expansion_require_fresh_approval() {
     let fixture = Fixture::new();
     let mut host = fixture.host(fixture.registry());
@@ -336,7 +373,7 @@ fn quarantine_updates_and_capability_expansion_require_fresh_approval() {
         .expect("quarantine v2");
     assert_eq!(updated.state(), PluginState::Quarantined);
     assert!(matches!(
-        approval_v1.check_covers(updated, "work"),
+        approval_v1.check_covers(updated, "work", &device),
         Err(ApprovalGap::ArtifactDigestChanged | ApprovalGap::ManifestDigestChanged)
     ));
     let approval_v2 = host
@@ -351,7 +388,7 @@ fn quarantine_updates_and_capability_expansion_require_fresh_approval() {
         .expect("quarantine expanded");
     assert_eq!(expanded.state(), PluginState::Quarantined);
     assert!(matches!(
-        approval_v2.check_covers(expanded, "work"),
+        approval_v2.check_covers(expanded, "work", &device),
         Err(ApprovalGap::CapabilitiesExpanded { .. })
     ));
 }

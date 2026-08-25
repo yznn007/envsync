@@ -5,20 +5,25 @@
 //! 明确确认；任何验证失败都只产生阻断记录，绝不把不可信字节写入 runtime。
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::io::{Read, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
 use cap_primitives::fs::{
     create_dir as create_dir_at, open as open_at, open_dir_nofollow, DirOptions, FollowSymlinks,
     OpenOptions as CapabilityOpenOptions, OpenOptionsExt,
 };
+#[cfg(unix)]
+use std::fs;
+#[cfg(unix)]
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::path::Component;
 
 use envsync_core::bundles::{
     publisher_fingerprint, publisher_namespace, PublisherRegistry, PublisherStatus,
 };
 use envsync_crypto::device::{verify, DevicePublic, Signature};
+use envsync_domain::cbor::CborCodec;
 use envsync_domain::id::Digest32;
 use envsync_domain::{DeviceProfile, Risk};
 use envsync_plugin_api::{PluginCapability, PluginId, PluginManifest, PluginManifestError};
@@ -31,6 +36,7 @@ use envsync_policy::{Decision, Operation, PolicyFacts, PolicySet, ResourceKind};
 pub const PLUGIN_SIGNATURE_DOMAIN: &str = "envsync-plugin";
 
 const PLUGIN_MANIFEST_DIGEST_DOMAIN: &str = "envsync:plugin-manifest:v1";
+const PLUGIN_PROFILE_DIGEST_DOMAIN: &str = "envsync:plugin-profile:v1";
 const QUARANTINE_DIR_MODE: u32 = 0o700;
 const QUARANTINE_FILE_MODE: u32 = 0o600;
 
@@ -150,20 +156,26 @@ pub struct PluginApproval {
     artifact_digest: [u8; 32],
     capabilities: BTreeSet<PluginCapability>,
     profile: String,
+    profile_digest: Digest32,
     signer: [u8; 32],
     approved_at_unix_ms: u64,
 }
 
 impl PluginApproval {
     /// 检查这次批准是否覆盖给定记录在目标 profile 上的启用。
-    pub fn check_covers(&self, record: PluginRecord, profile: &str) -> Result<(), ApprovalGap> {
+    pub fn check_covers(
+        &self,
+        record: PluginRecord,
+        profile_name: &str,
+        profile: &DeviceProfile,
+    ) -> Result<(), ApprovalGap> {
         if self.id != record.id {
             return Err(ApprovalGap::DifferentPlugin);
         }
         if self.signer != record.signer {
             return Err(ApprovalGap::SignerChanged);
         }
-        if self.profile != profile {
+        if self.profile != profile_name || self.profile_digest != device_profile_digest(profile) {
             return Err(ApprovalGap::ProfileChanged);
         }
         let added: BTreeSet<PluginCapability> = record
@@ -199,8 +211,8 @@ pub enum ApprovalGap {
     /// 发布者变更。
     #[error("插件发布者已变更")]
     SignerChanged,
-    /// 目标 profile 变更。
-    #[error("插件批准不属于当前 profile")]
+    /// 目标 profile 名称或实际 Profile 属性变更。
+    #[error("插件批准不属于当前 Profile")]
     ProfileChanged,
     /// manifest 内容变更。
     #[error("插件 manifest 已变更")]
@@ -418,6 +430,7 @@ impl PluginHost {
             artifact_digest: record.artifact_digest,
             capabilities: record.capabilities.clone(),
             profile: profile_name.to_owned(),
+            profile_digest: device_profile_digest(profile),
             signer: record.signer,
             approved_at_unix_ms: now_unix_ms,
         };
@@ -451,7 +464,7 @@ impl PluginHost {
         if record.state != PluginState::Approved {
             return Err(HostError::InvalidState);
         }
-        approval.check_covers(record.clone(), profile_name)?;
+        approval.check_covers(record.clone(), profile_name, profile)?;
         if self.publishers.status(&record.signer) != PublisherStatus::Trusted {
             self.set_state(id, PluginState::Blocked, now_unix_ms)?;
             return Err(HostError::ArtifactTampered);
@@ -661,6 +674,10 @@ fn manifest_digest(manifest: &PluginManifest) -> Result<Digest32, HostError> {
         PLUGIN_MANIFEST_DIGEST_DOMAIN,
         &payload,
     ))
+}
+
+fn device_profile_digest(profile: &DeviceProfile) -> Digest32 {
+    Digest32::domain_hash(PLUGIN_PROFILE_DIGEST_DOMAIN, &profile.to_canonical_vec())
 }
 
 fn artifact_digest(bytes: &[u8]) -> [u8; 32] {
