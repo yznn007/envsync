@@ -5,9 +5,15 @@
 //! 明确确认；任何验证失败都只产生阻断记录，绝不把不可信字节写入 runtime。
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::fs;
+use std::io::{Read, Write};
+use std::path::{Component, Path, PathBuf};
+
+#[cfg(unix)]
+use cap_primitives::fs::{
+    create_dir as create_dir_at, open as open_at, open_dir_nofollow, DirOptions, FollowSymlinks,
+    OpenOptions as CapabilityOpenOptions, OpenOptionsExt,
+};
 
 use envsync_core::bundles::{
     publisher_fingerprint, publisher_namespace, PublisherRegistry, PublisherStatus,
@@ -27,7 +33,6 @@ pub const PLUGIN_SIGNATURE_DOMAIN: &str = "envsync-plugin";
 const PLUGIN_MANIFEST_DIGEST_DOMAIN: &str = "envsync:plugin-manifest:v1";
 const QUARANTINE_DIR_MODE: u32 = 0o700;
 const QUARANTINE_FILE_MODE: u32 = 0o600;
-const RUNTIME_FILE_MODE: u32 = 0o500;
 
 /// 插件在 Host 上的生命周期状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,7 +88,7 @@ impl PluginArtifact {
 
 /// 已隔离插件的当前记录。
 ///
-/// 该值不实现 `Debug`，以免绝对 quarantine/runtime 路径被意外写入日志。
+/// 该值不实现 `Debug`，以免 Host 控制的本机路径被意外写入日志。
 #[derive(Clone)]
 pub struct PluginRecord {
     id: PluginId,
@@ -93,7 +98,26 @@ pub struct PluginRecord {
     capabilities: BTreeSet<PluginCapability>,
     state: PluginState,
     quarantined_entry: Option<PathBuf>,
-    runtime_entry: Option<PathBuf>,
+    quarantine_relative: Option<PathBuf>,
+}
+
+struct HostRoot {
+    #[cfg(unix)]
+    display_path: PathBuf,
+    #[cfg(unix)]
+    directory: fs::File,
+}
+
+struct ArtifactDirectory {
+    #[cfg(unix)]
+    display_path: PathBuf,
+    #[cfg(unix)]
+    directory: fs::File,
+}
+
+struct StagedEntry {
+    display_path: PathBuf,
+    relative_path: PathBuf,
 }
 
 impl PluginRecord {
@@ -110,11 +134,6 @@ impl PluginRecord {
     /// 返回 quarantine 中的入口路径；阻断制品没有此路径。
     pub fn quarantined_entry(&self) -> Option<&Path> {
         self.quarantined_entry.as_deref()
-    }
-
-    /// 返回 runtime 中的入口路径；未启用或已阻断制品可能没有此路径。
-    pub fn runtime_entry(&self) -> Option<&Path> {
-        self.runtime_entry.as_deref()
     }
 
     /// 返回发布者的短指纹，而不是原始公钥。
@@ -260,6 +279,9 @@ pub enum HostError {
     /// policy 要求确认，但调用方没有给出确认。
     #[error("插件启用需要确认")]
     ConfirmationRequired,
+    /// 当前 Host 没有可验证的 sandbox runner，不能执行插件。
+    #[error("当前 Host 没有可验证的插件 sandbox")]
+    SandboxUnavailable,
     /// staging 后的入口字节与已签名摘要不一致。
     #[error("插件入口制品摘要不匹配")]
     ArtifactTampered,
@@ -289,6 +311,7 @@ impl HostError {
             Self::ApprovalStale(_) => "plugin.host.approval_stale",
             Self::PolicyDenied => "plugin.host.policy_denied",
             Self::ConfirmationRequired => "plugin.host.confirmation_required",
+            Self::SandboxUnavailable => "plugin.host.sandbox_unavailable",
             Self::ArtifactTampered => "plugin.host.artifact_tampered",
             Self::UnsafePath => "plugin.host.unsafe_path",
             Self::AlreadyStaged => "plugin.host.already_staged",
@@ -306,8 +329,7 @@ impl HostError {
 
 /// 受 Host 控制的插件隔离仓和生命周期。
 pub struct PluginHost {
-    quarantine_root: PathBuf,
-    runtime_root: PathBuf,
+    quarantine_root: HostRoot,
     publishers: PublisherRegistry,
     records: BTreeMap<PluginId, PluginRecord>,
     audit: BTreeMap<PluginId, Vec<PluginAuditEvent>>,
@@ -316,17 +338,20 @@ pub struct PluginHost {
 impl PluginHost {
     /// 打开或创建 Host 控制的 quarantine 和 runtime 根。
     ///
-    /// 两个根的父目录必须已存在且不是符号链接；这避免了从不可信路径隐式创建任意层级。
+    /// 根必须是绝对、规范化且不含符号链接的路径。Unix 上从文件系统根逐段 no-follow
+    /// 打开，并且所有后续 staging I/O 都相对已打开的目录句柄执行；普通构建在无法提供
+    /// 这条保证的平台上拒绝打开 Host。
     pub fn open(
         quarantine_root: impl AsRef<Path>,
         runtime_root: impl AsRef<Path>,
         publishers: PublisherRegistry,
     ) -> Result<Self, HostError> {
         let quarantine_root = open_root(quarantine_root.as_ref())?;
-        let runtime_root = open_root(runtime_root.as_ref())?;
+        // runtime 根仍由 Host 在打开时创建并验证；普通构建不保留其路径，也不会生成
+        // 可执行入口。受控 runner 在后续任务中以私有字段重新接管该目录。
+        let _ = open_root(runtime_root.as_ref())?;
         Ok(Self {
             quarantine_root,
-            runtime_root,
             publishers,
             records: BTreeMap::new(),
             audit: BTreeMap::new(),
@@ -357,13 +382,12 @@ impl PluginHost {
                     signer: artifact.manifest.publisher().public_key,
                     capabilities: artifact.manifest.capabilities().clone(),
                     state: PluginState::Quarantined,
-                    quarantined_entry: Some(staged_entry),
-                    runtime_entry: None,
+                    quarantined_entry: Some(staged_entry.display_path),
+                    quarantine_relative: Some(staged_entry.relative_path),
                 }
             }
         };
 
-        self.disarm_existing_runtime(&id);
         self.replace_record(record.clone(), now_unix_ms);
         Ok(record)
     }
@@ -401,7 +425,7 @@ impl PluginHost {
         Ok(approval)
     }
 
-    /// 在批准仍覆盖记录且 policy 允许时创建 runtime copy。
+    /// 校验批准与 policy 后尝试启用插件。
     ///
     /// 参数保持平铺，调用方必须在每次启用时显式提供批准、profile、策略、确认与时钟，
     /// 避免把安全上下文藏进一个可被误复用的可选配置对象。
@@ -434,16 +458,22 @@ impl PluginHost {
         }
         self.enforce_policy(&record, profile, policy, confirmed)?;
 
-        let staged = record.quarantined_entry().ok_or(HostError::InvalidState)?;
-        let entrypoint = fs::read(staged).map_err(|error| HostError::io("read_staged", &error))?;
+        let entrypoint = match self.read_staged_entry(&record) {
+            Ok(entrypoint) => entrypoint,
+            Err(error) => {
+                self.set_state(id, PluginState::Blocked, now_unix_ms)?;
+                return Err(error);
+            }
+        };
         if artifact_digest(&entrypoint) != record.artifact_digest {
             self.set_state(id, PluginState::Blocked, now_unix_ms)?;
             return Err(HostError::ArtifactTampered);
         }
-        let runtime_entry = self.write_runtime_entry(&record, &entrypoint)?;
-        let current = self.records.get_mut(id).ok_or(HostError::UnknownPlugin)?;
-        current.runtime_entry = Some(runtime_entry);
-        self.set_state(id, PluginState::Enabled, now_unix_ms)
+
+        // 普通构建没有可验证的 OS sandbox，因此即使制品已经通过批准，也绝不能把
+        // runtime 入口写成可执行文件。Task 10.3 的 test-only runner 会在真正启动前
+        // 再做一次摘要核验并以受控环境运行它。
+        Err(HostError::SandboxUnavailable)
     }
 
     /// 撤销一把发布者公钥并立即禁用受影响插件。
@@ -460,7 +490,6 @@ impl PluginHost {
             })
             .collect();
         for id in &affected_ids {
-            self.disarm_existing_runtime(id);
             let _ = self.set_state(id, PluginState::Revoked, now_unix_ms);
         }
         RevocationOutcome {
@@ -521,7 +550,7 @@ impl PluginHost {
             capabilities: artifact.manifest.capabilities().clone(),
             state: PluginState::Blocked,
             quarantined_entry: None,
-            runtime_entry: None,
+            quarantine_relative: None,
         })
     }
 
@@ -529,37 +558,33 @@ impl PluginHost {
         &self,
         artifact: &PluginArtifact,
         manifest_digest: Digest32,
-    ) -> Result<PathBuf, HostError> {
+    ) -> Result<StagedEntry, HostError> {
         let directory = create_artifact_dir(
             &self.quarantine_root,
             artifact.manifest.id(),
             manifest_digest,
         )?;
-        write_entry(
+        let display_path = write_entry(
             &directory,
             artifact.manifest.entrypoint().as_str(),
             &artifact.entrypoint,
             QUARANTINE_FILE_MODE,
-        )
+        )?;
+        let relative_path = PathBuf::from(artifact.manifest.id().as_str())
+            .join(manifest_digest.to_hex())
+            .join(artifact.manifest.entrypoint().as_str());
+        Ok(StagedEntry {
+            display_path,
+            relative_path,
+        })
     }
 
-    fn write_runtime_entry(
-        &self,
-        record: &PluginRecord,
-        entrypoint: &[u8],
-    ) -> Result<PathBuf, HostError> {
-        let directory =
-            create_artifact_dir(&self.runtime_root, &record.id, record.manifest_digest)?;
-        let staged_path = record.quarantined_entry().ok_or(HostError::InvalidState)?;
-        let relative = staged_path
-            .strip_prefix(
-                self.quarantine_root
-                    .join(record.id.as_str())
-                    .join(record.manifest_digest.to_hex()),
-            )
-            .map_err(|_| HostError::UnsafePath)?;
-        let relative = relative.to_str().ok_or(HostError::UnsafePath)?;
-        write_entry(&directory, relative, entrypoint, RUNTIME_FILE_MODE)
+    fn read_staged_entry(&self, record: &PluginRecord) -> Result<Vec<u8>, HostError> {
+        let relative = record
+            .quarantine_relative
+            .as_deref()
+            .ok_or(HostError::InvalidState)?;
+        read_entry(&self.quarantine_root, relative)
     }
 
     fn enforce_policy(
@@ -620,12 +645,6 @@ impl PluginHost {
             });
         Ok(())
     }
-
-    fn disarm_existing_runtime(&self, id: &PluginId) {
-        if let Some(path) = self.records.get(id).and_then(PluginRecord::runtime_entry) {
-            let _ = strip_execute_bits(path);
-        }
-    }
 }
 
 enum Verification {
@@ -661,157 +680,254 @@ fn capability_names(capabilities: &BTreeSet<PluginCapability>) -> BTreeSet<Strin
         .collect()
 }
 
-fn open_root(root: &Path) -> Result<PathBuf, HostError> {
-    let root = root.to_path_buf();
-    match fs::symlink_metadata(&root) {
-        Ok(_) => ensure_real_dir(&root)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let parent = root.parent().ok_or(HostError::UnsafePath)?;
-            ensure_real_dir(parent)?;
-            match fs::create_dir(&root) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    ensure_real_dir(&root)?;
-                }
-                Err(error) => return Err(HostError::io("create_root", &error)),
+#[cfg(unix)]
+fn open_root(root: &Path) -> Result<HostRoot, HostError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !root.is_absolute() {
+        return Err(HostError::UnsafePath);
+    }
+
+    let mut segments = Vec::new();
+    for component in root.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(segment) => segments.push(segment),
+            Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
+                return Err(HostError::UnsafePath)
             }
         }
-        Err(error) => return Err(HostError::io("stat_root", &error)),
     }
-    set_dir_mode(&root)?;
-    Ok(root)
+    if segments.is_empty() {
+        return Err(HostError::UnsafePath);
+    }
+
+    let mut directory =
+        fs::File::open("/").map_err(|error| HostError::io("open_fs_root", &error))?;
+    for (index, segment) in segments.iter().enumerate() {
+        let is_final = index + 1 == segments.len();
+        let next = match open_dir_nofollow(&directory, Path::new(segment)) {
+            Ok(next) => next,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && is_final => {
+                let mut options = DirOptions::new();
+                use cap_primitives::fs::DirBuilderExt;
+                options.mode(QUARANTINE_DIR_MODE);
+                match create_dir_at(&directory, Path::new(segment), &options) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(HostError::io("create_root", &error)),
+                }
+                open_dir_nofollow(&directory, Path::new(segment))
+                    .map_err(|_| HostError::UnsafePath)?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(HostError::io("open_root_parent", &error))
+            }
+            Err(_) => return Err(HostError::UnsafePath),
+        };
+
+        if is_final {
+            let mode = next
+                .metadata()
+                .map_err(|error| HostError::io("stat_root", &error))?
+                .permissions()
+                .mode();
+            if mode & 0o077 != 0 {
+                return Err(HostError::UnsafePath);
+            }
+        }
+        directory = next;
+    }
+
+    Ok(HostRoot {
+        display_path: root.to_path_buf(),
+        directory,
+    })
 }
 
+#[cfg(not(unix))]
+fn open_root(_: &Path) -> Result<HostRoot, HostError> {
+    Err(HostError::SandboxUnavailable)
+}
+
+#[cfg(unix)]
 fn create_artifact_dir(
-    root: &Path,
+    root: &HostRoot,
     id: &PluginId,
     manifest_digest: Digest32,
-) -> Result<PathBuf, HostError> {
-    let plugin_dir = ensure_child_dir(root, id.as_str())?;
+) -> Result<ArtifactDirectory, HostError> {
+    let plugin_dir = open_or_create_private_dir(&root.directory, id.as_str())?;
     let digest_name = manifest_digest.to_hex();
-    let directory = plugin_dir.join(&digest_name);
-    match fs::symlink_metadata(&directory) {
-        Ok(_) => return Err(HostError::AlreadyStaged),
+    let directory = create_new_private_dir(&plugin_dir, &digest_name)?;
+    Ok(ArtifactDirectory {
+        display_path: root.display_path.join(id.as_str()).join(digest_name),
+        directory,
+    })
+}
+
+#[cfg(not(unix))]
+fn create_artifact_dir(
+    _: &HostRoot,
+    _: &PluginId,
+    _: Digest32,
+) -> Result<ArtifactDirectory, HostError> {
+    Err(HostError::SandboxUnavailable)
+}
+
+#[cfg(unix)]
+fn open_or_create_private_dir(parent: &fs::File, segment: &str) -> Result<fs::File, HostError> {
+    match open_dir_nofollow(parent, Path::new(segment)) {
+        Ok(directory) => {
+            ensure_private_directory(&directory)?;
+            return Ok(directory);
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(HostError::io("stat_artifact_dir", &error)),
+        Err(_) => return Err(HostError::UnsafePath),
     }
-    match fs::create_dir(&directory) {
+
+    let mut options = DirOptions::new();
+    use cap_primitives::fs::DirBuilderExt;
+    options.mode(QUARANTINE_DIR_MODE);
+    match create_dir_at(parent, Path::new(segment), &options) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(HostError::io("create_dir", &error)),
+    }
+    let directory =
+        open_dir_nofollow(parent, Path::new(segment)).map_err(|_| HostError::UnsafePath)?;
+    ensure_private_directory(&directory)?;
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn create_new_private_dir(parent: &fs::File, segment: &str) -> Result<fs::File, HostError> {
+    let mut options = DirOptions::new();
+    use cap_primitives::fs::DirBuilderExt;
+    options.mode(QUARANTINE_DIR_MODE);
+    match create_dir_at(parent, Path::new(segment), &options) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             return Err(HostError::AlreadyStaged)
         }
         Err(error) => return Err(HostError::io("create_artifact_dir", &error)),
     }
-    set_dir_mode(&directory)?;
+    let directory =
+        open_dir_nofollow(parent, Path::new(segment)).map_err(|_| HostError::UnsafePath)?;
+    ensure_private_directory(&directory)?;
     Ok(directory)
 }
 
-fn ensure_child_dir(parent: &Path, segment: &str) -> Result<PathBuf, HostError> {
-    ensure_real_dir(parent)?;
-    let child = parent.join(segment);
-    match fs::symlink_metadata(&child) {
-        Ok(_) => ensure_real_dir(&child)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            match fs::create_dir(&child) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    ensure_real_dir(&child)?;
-                }
-                Err(error) => return Err(HostError::io("create_dir", &error)),
-            }
-            set_dir_mode(&child)?;
-        }
-        Err(error) => return Err(HostError::io("stat_dir", &error)),
-    }
-    Ok(child)
-}
+#[cfg(unix)]
+fn ensure_private_directory(directory: &fs::File) -> Result<(), HostError> {
+    use std::os::unix::fs::PermissionsExt;
 
-fn ensure_real_dir(path: &Path) -> Result<(), HostError> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| HostError::io("stat_dir", &error))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+    let metadata = directory
+        .metadata()
+        .map_err(|error| HostError::io("stat_dir", &error))?;
+    if !metadata.is_dir() || metadata.permissions().mode() & 0o077 != 0 {
         return Err(HostError::UnsafePath);
     }
     Ok(())
 }
 
+#[cfg(unix)]
 fn write_entry(
-    root: &Path,
+    root: &ArtifactDirectory,
     entrypoint: &str,
     bytes: &[u8],
     mode: u32,
 ) -> Result<PathBuf, HostError> {
-    let mut parent = root.to_path_buf();
+    let mut parent = root
+        .directory
+        .try_clone()
+        .map_err(|error| HostError::io("clone_dir", &error))?;
+    let mut display_path = root.display_path.clone();
     let mut segments = entrypoint.split('/').peekable();
     while let Some(segment) = segments.next() {
         if segments.peek().is_some() {
-            parent = ensure_child_dir(&parent, segment)?;
+            parent = open_or_create_private_dir(&parent, segment)?;
+            display_path.push(segment);
         } else {
-            let path = parent.join(segment);
-            write_file(&path, bytes, mode)?;
-            return Ok(path);
+            write_file_at(&parent, segment, bytes, mode)?;
+            display_path.push(segment);
+            return Ok(display_path);
         }
     }
     Err(HostError::UnsafePath)
 }
 
-fn write_file(path: &Path, bytes: &[u8], mode: u32) -> Result<(), HostError> {
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(mode & !0o111);
-    }
-    let mut file = options
-        .open(path)
+#[cfg(not(unix))]
+fn write_entry(_: &ArtifactDirectory, _: &str, _: &[u8], _: u32) -> Result<PathBuf, HostError> {
+    Err(HostError::SandboxUnavailable)
+}
+
+#[cfg(unix)]
+fn write_file_at(parent: &fs::File, name: &str, bytes: &[u8], mode: u32) -> Result<(), HostError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut options = CapabilityOpenOptions::new();
+    options
+        .write(true)
+        .create_new(true)
+        ._cap_fs_ext_follow(FollowSymlinks::No)
+        .mode(mode & !0o111);
+    let mut file = open_at(parent, Path::new(name), &options)
         .map_err(|error| HostError::io("create_file", &error))?;
     file.write_all(bytes)
         .map_err(|error| HostError::io("write_file", &error))?;
     file.sync_all()
         .map_err(|error| HostError::io("sync_file", &error))?;
-    set_file_mode(path, mode)
+    file.set_permissions(fs::Permissions::from_mode(mode & 0o777))
+        .map_err(|error| HostError::io("chmod_file", &error))
 }
 
-fn set_dir_mode(path: &Path) -> Result<(), HostError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(QUARANTINE_DIR_MODE))
-            .map_err(|error| HostError::io("chmod_dir", &error))?;
+#[cfg(unix)]
+fn read_entry(root: &HostRoot, relative: &Path) -> Result<Vec<u8>, HostError> {
+    let mut parent = root
+        .directory
+        .try_clone()
+        .map_err(|error| HostError::io("clone_dir", &error))?;
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        let Component::Normal(segment) = component else {
+            return Err(HostError::UnsafePath);
+        };
+        if components.peek().is_some() {
+            parent = open_existing_private_dir(&parent, segment)?;
+            continue;
+        }
+
+        let mut options = CapabilityOpenOptions::new();
+        options.read(true)._cap_fs_ext_follow(FollowSymlinks::No);
+        let mut file =
+            open_at(&parent, Path::new(segment), &options).map_err(|_| HostError::UnsafePath)?;
+        if !file
+            .metadata()
+            .map_err(|error| HostError::io("stat_staged", &error))?
+            .is_file()
+        {
+            return Err(HostError::UnsafePath);
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|error| HostError::io("read_staged", &error))?;
+        return Ok(bytes);
     }
-    #[cfg(not(unix))]
-    let _ = path;
-    Ok(())
+    Err(HostError::UnsafePath)
 }
 
-fn set_file_mode(path: &Path, mode: u32) -> Result<(), HostError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o777))
-            .map_err(|error| HostError::io("chmod_file", &error))?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (path, mode);
-    }
-    Ok(())
+#[cfg(not(unix))]
+fn read_entry(_: &HostRoot, _: &Path) -> Result<Vec<u8>, HostError> {
+    Err(HostError::SandboxUnavailable)
 }
 
-fn strip_execute_bits(path: &Path) -> Result<(), HostError> {
-    let metadata =
-        fs::symlink_metadata(path).map_err(|error| HostError::io("stat_file", &error))?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(HostError::UnsafePath);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(
-            path,
-            fs::Permissions::from_mode(metadata.permissions().mode() & !0o111),
-        )
-        .map_err(|error| HostError::io("chmod_file", &error))?;
-    }
-    Ok(())
+#[cfg(unix)]
+fn open_existing_private_dir(
+    parent: &fs::File,
+    segment: &std::ffi::OsStr,
+) -> Result<fs::File, HostError> {
+    let directory =
+        open_dir_nofollow(parent, Path::new(segment)).map_err(|_| HostError::UnsafePath)?;
+    ensure_private_directory(&directory)?;
+    Ok(directory)
 }

@@ -41,12 +41,9 @@ impl Fixture {
     }
 
     fn host(&self, registry: PublisherRegistry) -> PluginHost {
-        PluginHost::open(
-            self.temp.path().join("quarantine"),
-            self.temp.path().join("runtime"),
-            registry,
-        )
-        .expect("host roots")
+        let root = self.temp.path().canonicalize().expect("canonical tempdir");
+        PluginHost::open(root.join("quarantine"), root.join("runtime"), registry)
+            .expect("host roots")
     }
 
     fn artifact(&self, id: &str, bytes: &[u8], capabilities: &[&str]) -> PluginArtifact {
@@ -125,7 +122,6 @@ fn quarantine_unknown_signer_is_blocked_without_writing_entrypoint() {
 
     assert_eq!(record.state(), PluginState::Blocked);
     assert!(record.quarantined_entry().is_none());
-    assert!(record.runtime_entry().is_none());
     assert_eq!(host.audit_for(&id).len(), 1);
 }
 
@@ -179,7 +175,6 @@ fn quarantine_verified_entrypoint_has_no_execute_bits() {
         0
     );
     assert_eq!(fs::read(staged_entry).expect("read entry"), b"#!/bin/sh\n");
-    assert!(record.runtime_entry().is_none());
 }
 
 #[test]
@@ -205,6 +200,26 @@ fn quarantine_refuses_a_symlinked_plugin_directory() {
         .expect("read outside")
         .next()
         .is_none());
+}
+
+#[test]
+fn host_open_refuses_a_root_beneath_an_ancestor_symlink() {
+    let fixture = Fixture::new();
+    let outside = fixture.temp.path().join("outside");
+    fs::create_dir_all(outside.join("quarantine")).expect("outside quarantine");
+    let linked_parent = fixture.temp.path().join("linked-parent");
+    symlink(&outside, &linked_parent).expect("poison ancestor");
+
+    let error = match PluginHost::open(
+        linked_parent.join("quarantine"),
+        fixture.temp.path().join("runtime"),
+        fixture.registry(),
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("ancestor symlink must be rejected"),
+    };
+
+    assert!(matches!(error, HostError::UnsafePath));
 }
 
 #[test]
@@ -238,7 +253,68 @@ fn quarantine_tampering_after_approval_blocks_enable_before_runtime_copy() {
     assert!(matches!(error, HostError::ArtifactTampered));
     let record = host.record(&id).expect("record");
     assert_eq!(record.state(), PluginState::Blocked);
-    assert!(record.runtime_entry().is_none());
+}
+
+#[test]
+fn quarantine_symlink_replacement_blocks_enable() {
+    let fixture = Fixture::new();
+    let mut host = fixture.host(fixture.registry());
+    let id = PluginId::parse("com.example.symlink-replacement").expect("id");
+    let device = profile();
+    let allow = policy(Decision::Allow);
+
+    host.quarantine(
+        fixture.artifact(id.as_str(), b"verified", &["observe"]),
+        NOW,
+    )
+    .expect("quarantine");
+    let approval = host
+        .approve(&id, "work", &device, &allow, true, NOW + 1)
+        .expect("approve");
+    let staged = host
+        .record(&id)
+        .expect("record")
+        .quarantined_entry()
+        .expect("staged")
+        .to_path_buf();
+    fs::remove_file(&staged).expect("remove staged file");
+    symlink(fixture.temp.path().join("outside-entry"), &staged).expect("replace with symlink");
+
+    let error = host
+        .enable(&id, &approval, "work", &device, &allow, true, NOW + 2)
+        .expect_err("symlinked staging must block");
+
+    assert!(matches!(error, HostError::UnsafePath));
+    assert_eq!(
+        host.record(&id).expect("record").state(),
+        PluginState::Blocked
+    );
+}
+
+#[test]
+fn default_host_refuses_to_create_an_executable_runtime() {
+    let fixture = Fixture::new();
+    let mut host = fixture.host(fixture.registry());
+    let id = PluginId::parse("com.example.default-host").expect("id");
+    let device = profile();
+    let allow = policy(Decision::Allow);
+
+    host.quarantine(
+        fixture.artifact(id.as_str(), b"approved only", &["observe"]),
+        NOW,
+    )
+    .expect("quarantine");
+    let approval = host
+        .approve(&id, "work", &device, &allow, true, NOW + 1)
+        .expect("approve");
+
+    let error = host
+        .enable(&id, &approval, "work", &device, &allow, true, NOW + 2)
+        .expect_err("ordinary Host has no sandbox runner");
+
+    assert_eq!(error.code(), "plugin.host.sandbox_unavailable");
+    let record = host.record(&id).expect("record");
+    assert_eq!(record.state(), PluginState::Approved);
 }
 
 #[test]
@@ -254,11 +330,9 @@ fn quarantine_updates_and_capability_expansion_require_fresh_approval() {
     let approval_v1 = host
         .approve(&id, "work", &device, &allow, true, NOW + 1)
         .expect("approve v1");
-    host.enable(&id, &approval_v1, "work", &device, &allow, true, NOW + 2)
-        .expect("enable v1");
 
     let updated = host
-        .quarantine(fixture.artifact(id.as_str(), b"v2", &["observe"]), NOW + 3)
+        .quarantine(fixture.artifact(id.as_str(), b"v2", &["observe"]), NOW + 2)
         .expect("quarantine v2");
     assert_eq!(updated.state(), PluginState::Quarantined);
     assert!(matches!(
@@ -266,13 +340,13 @@ fn quarantine_updates_and_capability_expansion_require_fresh_approval() {
         Err(ApprovalGap::ArtifactDigestChanged | ApprovalGap::ManifestDigestChanged)
     ));
     let approval_v2 = host
-        .approve(&id, "work", &device, &allow, true, NOW + 4)
+        .approve(&id, "work", &device, &allow, true, NOW + 3)
         .expect("approve v2");
 
     let expanded = host
         .quarantine(
             fixture.artifact(id.as_str(), b"v3", &["observe", "plan-command"]),
-            NOW + 5,
+            NOW + 4,
         )
         .expect("quarantine expanded");
     assert_eq!(expanded.state(), PluginState::Quarantined);
@@ -283,7 +357,7 @@ fn quarantine_updates_and_capability_expansion_require_fresh_approval() {
 }
 
 #[test]
-fn quarantine_policy_and_confirmation_gate_runtime_copy() {
+fn quarantine_policy_and_confirmation_gate_activation() {
     let fixture = Fixture::new();
     let mut host = fixture.host(fixture.registry());
     let id = PluginId::parse("com.example.policy").expect("id");
@@ -295,7 +369,6 @@ fn quarantine_policy_and_confirmation_gate_runtime_copy() {
         .approve(&id, "work", &device, &policy(Decision::Deny), true, NOW + 1)
         .expect_err("deny approval");
     assert_eq!(error.code(), "plugin.host.policy_denied");
-    assert!(host.record(&id).expect("record").runtime_entry().is_none());
 
     let error = host
         .approve(
@@ -308,7 +381,6 @@ fn quarantine_policy_and_confirmation_gate_runtime_copy() {
         )
         .expect_err("confirmation required");
     assert!(matches!(error, HostError::ConfirmationRequired));
-    assert!(host.record(&id).expect("record").runtime_entry().is_none());
 
     let approval = host
         .approve(
@@ -332,23 +404,23 @@ fn quarantine_policy_and_confirmation_gate_runtime_copy() {
         )
         .expect_err("enable confirmation required");
     assert!(matches!(error, HostError::ConfirmationRequired));
-    assert!(host.record(&id).expect("record").runtime_entry().is_none());
 
-    host.enable(
-        &id,
-        &approval,
-        "work",
-        &device,
-        &policy(Decision::RequireConfirmation),
-        true,
-        NOW + 5,
-    )
-    .expect("confirmed enable");
+    let error = host
+        .enable(
+            &id,
+            &approval,
+            "work",
+            &device,
+            &policy(Decision::RequireConfirmation),
+            true,
+            NOW + 5,
+        )
+        .expect_err("ordinary Host has no sandbox runner");
+    assert_eq!(error.code(), "plugin.host.sandbox_unavailable");
     assert_eq!(
         host.record(&id).expect("record").state(),
-        PluginState::Enabled
+        PluginState::Approved
     );
-    assert!(host.record(&id).expect("record").runtime_entry().is_some());
 }
 
 #[test]
@@ -364,8 +436,10 @@ fn quarantine_publisher_revocation_disables_records_and_retains_audit() {
     let approval = host
         .approve(&id, "work", &device, &allow, true, NOW + 1)
         .expect("approve");
-    host.enable(&id, &approval, "work", &device, &allow, true, NOW + 2)
-        .expect("enable");
+    let error = host
+        .enable(&id, &approval, "work", &device, &allow, true, NOW + 2)
+        .expect_err("ordinary Host has no sandbox runner");
+    assert_eq!(error.code(), "plugin.host.sandbox_unavailable");
     let audit_before = host.audit_for(&id).len();
 
     let outcome = host.revoke_publisher(signer, NOW + 3);
@@ -379,20 +453,7 @@ fn quarantine_publisher_revocation_disables_records_and_retains_audit() {
     assert!(host
         .audit_for(&id)
         .iter()
-        .any(|event| event.to() == PluginState::Enabled));
-    let runtime = host
-        .record(&id)
-        .expect("record")
-        .runtime_entry()
-        .expect("runtime");
-    assert_eq!(
-        fs::metadata(runtime)
-            .expect("metadata")
-            .permissions()
-            .mode()
-            & 0o111,
-        0
-    );
+        .any(|event| event.to() == PluginState::Approved));
 
     let second = PluginId::parse("com.example.revoked-second").expect("id");
     let blocked = host

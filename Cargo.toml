@@ -39,6 +39,7 @@ envsync-plugin-api = { path = "crates/envsync-plugin-api", version = "0.1.0" }
 
 blake3 = "1"
 cap-std = "3"
+cap-primitives = "3"
 clap = { version = "4", features = ["derive"] }
 git2 = { version = "0.20", default-features = false, features = ["vendored-libgit2"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
