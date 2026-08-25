@@ -13,8 +13,8 @@ pub mod manifest;
 pub mod rpc;
 
 pub use manifest::{
-    PluginCapability, PluginCatalog, PluginEntrypoint, PluginId, PluginManifest,
-    PluginManifestError, PluginSignature, PluginTarget, Publisher, ResourceLimits,
+    PluginArtifactDigest, PluginCapability, PluginCatalog, PluginEntrypoint, PluginId,
+    PluginManifest, PluginManifestError, PluginSignature, PluginTarget, Publisher, ResourceLimits,
     SignatureAlgorithm, HOST_PLUGIN_API_VERSIONS,
 };
 pub use rpc::{

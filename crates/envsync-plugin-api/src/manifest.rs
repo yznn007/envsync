@@ -37,6 +37,7 @@ pub struct PluginManifest {
     publisher: Publisher,
     api: semver::VersionReq,
     entrypoint: PluginEntrypoint,
+    entrypoint_digest: PluginArtifactDigest,
     targets: BTreeSet<PluginTarget>,
     capabilities: BTreeSet<PluginCapability>,
     limits: ResourceLimits,
@@ -78,6 +79,13 @@ impl PluginManifest {
         &self.entrypoint
     }
 
+    /// 返回入口制品的已校验 BLAKE3 摘要字节。
+    ///
+    /// 本 crate 只解析 manifest 声明的摘要，不计算摘要；Host 负责将其与入口制品比对。
+    pub fn entrypoint_digest(&self) -> &PluginArtifactDigest {
+        &self.entrypoint_digest
+    }
+
     /// 返回非空且去重的目标平台集合。
     pub fn targets(&self) -> &BTreeSet<PluginTarget> {
         &self.targets
@@ -111,6 +119,7 @@ impl PluginManifest {
             },
             api: self.api.to_string(),
             entrypoint: self.entrypoint.as_str(),
+            entrypoint_digest: URL_SAFE_NO_PAD.encode(self.entrypoint_digest.as_bytes()),
             targets: signing_targets(&self.targets),
             capabilities: signing_capabilities(&self.capabilities),
             limits: UnsignedResourceLimits {
@@ -142,6 +151,7 @@ impl TryFrom<RawManifest> for PluginManifest {
         }
 
         let entrypoint = PluginEntrypoint::parse(&raw.entrypoint)?;
+        let entrypoint_digest = PluginArtifactDigest::parse(&raw.entrypoint_digest)?;
         let targets = parse_targets(raw.targets)?;
         let capabilities = parse_capabilities(raw.capabilities)?;
         let limits = ResourceLimits::try_from(raw.limits)?;
@@ -153,6 +163,7 @@ impl TryFrom<RawManifest> for PluginManifest {
             publisher,
             api,
             entrypoint,
+            entrypoint_digest,
             targets,
             capabilities,
             limits,
@@ -289,6 +300,33 @@ impl PluginEntrypoint {
 impl AsRef<str> for PluginEntrypoint {
     fn as_ref(&self) -> &str {
         self.as_str()
+    }
+}
+
+/// 形状已校验的入口制品 BLAKE3 摘要。
+///
+/// 此类型只保存 manifest 中的 32 字节摘要；它不计算 BLAKE3，也不表示制品已验证。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginArtifactDigest([u8; 32]);
+
+impl PluginArtifactDigest {
+    fn parse(value: &str) -> Result<Self, PluginManifestError> {
+        if value.len() != base64url_unpadded_len(32) {
+            return Err(PluginManifestError::InvalidArtifactDigest);
+        }
+
+        let decoded = URL_SAFE_NO_PAD
+            .decode(value)
+            .map_err(|_| PluginManifestError::InvalidArtifactDigest)?;
+        let bytes = decoded
+            .try_into()
+            .map_err(|_| PluginManifestError::InvalidArtifactDigest)?;
+        Ok(Self(bytes))
+    }
+
+    /// 返回长度恰为 32 字节的摘要。
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
     }
 }
 
@@ -460,6 +498,9 @@ pub enum PluginManifestError {
     /// 目标平台不受支持，或目标集合为空/重复。
     #[error("插件目标平台无效、为空或重复")]
     InvalidTarget,
+    /// 入口制品摘要的 base64url 编码或长度无效。
+    #[error("插件入口制品摘要格式无效")]
+    InvalidArtifactDigest,
 }
 
 impl PluginManifestError {
@@ -476,6 +517,7 @@ impl PluginManifestError {
             Self::InvalidLimit => "plugin.manifest.invalid_limit",
             Self::InvalidSignature => "plugin.manifest.invalid_signature",
             Self::InvalidTarget => "plugin.manifest.invalid_target",
+            Self::InvalidArtifactDigest => "plugin.manifest.invalid_artifact_digest",
         }
     }
 }
@@ -488,6 +530,7 @@ struct RawManifest {
     publisher: RawPublisher,
     api: String,
     entrypoint: String,
+    entrypoint_digest: String,
     targets: Vec<String>,
     capabilities: Vec<String>,
     limits: RawResourceLimits,
@@ -523,6 +566,7 @@ struct UnsignedManifest<'a> {
     publisher: UnsignedPublisher<'a>,
     api: String,
     entrypoint: &'a str,
+    entrypoint_digest: String,
     targets: Vec<&'static str>,
     capabilities: Vec<&'static str>,
     limits: UnsignedResourceLimits,

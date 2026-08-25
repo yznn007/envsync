@@ -17,6 +17,7 @@ fn valid_manifest_json() -> serde_json::Value {
         },
         "api": ">=1.0.0, <2.0.0",
         "entrypoint": "bin/plugin",
+        "entrypoint_digest": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([3u8; 32]),
         "targets": ["linux"],
         "capabilities": ["observe", "render"],
         "limits": {
@@ -64,6 +65,7 @@ fn manifest_accepts_valid_value_and_produces_stable_unsigned_payload() {
     assert_eq!(manifest.id().as_str(), "com.example.calendar");
     assert_eq!(manifest.version().to_string(), "1.2.0");
     assert_eq!(manifest.entrypoint().as_str(), "bin/plugin");
+    assert_eq!(manifest.entrypoint_digest().as_bytes(), &[3u8; 32]);
 
     let payload = manifest.signing_payload().expect("payload 必须可序列化");
     assert_eq!(
@@ -77,6 +79,10 @@ fn manifest_accepts_valid_value_and_produces_stable_unsigned_payload() {
     assert_eq!(
         payload_json["capabilities"],
         serde_json::json!(["observe", "render"])
+    );
+    assert_eq!(
+        payload_json["entrypoint_digest"],
+        serde_json::json!(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([3u8; 32]))
     );
 }
 
@@ -108,19 +114,48 @@ fn manifest_signing_payload_preserves_v1_wire_order_and_bytes() {
     let payload = manifest.signing_payload().expect("payload 必须可序列化");
     assert_eq!(
         payload,
-        br#"{"id":"com.example.calendar","version":"1.2.0","publisher":{"id":"com.example","public_key":"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"},"api":">=1.0.0, <2.0.0","entrypoint":"bin/plugin","targets":["macos","windows","linux","wasi-p2"],"capabilities":["observe","render","plan-command","verify"],"limits":{"max_runtime_ms":5000,"max_memory_bytes":67108864,"max_output_bytes":1048576}}"#,
+        br#"{"id":"com.example.calendar","version":"1.2.0","publisher":{"id":"com.example","public_key":"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"},"api":">=1.0.0, <2.0.0","entrypoint":"bin/plugin","entrypoint_digest":"AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM","targets":["macos","windows","linux","wasi-p2"],"capabilities":["observe","render","plan-command","verify"],"limits":{"max_runtime_ms":5000,"max_memory_bytes":67108864,"max_output_bytes":1048576}}"#,
         "签名 payload 的字段和 v1 数组顺序必须稳定",
     );
-    let payload: serde_json::Value = serde_json::from_slice(&payload).expect("payload 是 JSON");
+    let payload_json: serde_json::Value =
+        serde_json::from_slice(&payload).expect("payload 是 JSON");
 
     assert_eq!(
-        payload["targets"],
+        payload_json["targets"],
         serde_json::json!(["macos", "windows", "linux", "wasi-p2"])
     );
     assert_eq!(
-        payload["capabilities"],
+        payload_json["capabilities"],
         serde_json::json!(["observe", "render", "plan-command", "verify"])
     );
+
+    let mut changed_digest = valid_manifest_json();
+    changed_digest["entrypoint_digest"] =
+        serde_json::json!(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([4u8; 32]));
+    let changed_payload = PluginManifest::from_json_value(changed_digest)
+        .expect("合法 manifest")
+        .signing_payload()
+        .expect("payload 必须可序列化");
+    assert_ne!(
+        payload, changed_payload,
+        "任意摘要字节变化必须改变签名 payload"
+    );
+}
+
+#[test]
+fn manifest_rejects_missing_or_malformed_entrypoint_digest() {
+    let mut missing = valid_manifest_json();
+    missing
+        .as_object_mut()
+        .expect("fixture 是 object")
+        .remove("entrypoint_digest");
+    assert_error_code(missing, "plugin.manifest.invalid_manifest");
+
+    for value in ["a".repeat(42), "a".repeat(44), "!".repeat(43)] {
+        let mut malformed = valid_manifest_json();
+        malformed["entrypoint_digest"] = serde_json::json!(value);
+        assert_error_code(malformed, "plugin.manifest.invalid_artifact_digest");
+    }
 }
 
 #[test]
