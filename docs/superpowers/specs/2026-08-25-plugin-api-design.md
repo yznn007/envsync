@@ -81,9 +81,11 @@ NUL、盘符或 UNC 表示。它在任何平台按同一规则拒绝，避免 Wi
 
 资源限制采用固定请求上限：`100..=30_000` ms、`1 MiB..=256 MiB` memory、`1 KiB..=8 MiB`
 output。超出、零值与不合法签名编码都拒绝。`signature.algorithm` 仅接受 `ed25519`，公钥解码后
-必须正好 32 字节、签名必须正好 64 字节。签名覆盖除 `signature` 外的确定性 JSON payload；本
-crate 只构造 payload 并验证编码形状，Task 10 才将其与 PublisherRegistry 和 quarantine 状态
-结合进行密码学验证。
+必须正好 32 字节、签名必须正好 64 字节。签名覆盖除 `signature` 外的确定性 JSON payload；
+`targets` 与 `capabilities` 数组固定沿用 v1 协议顺序（分别为 `macos`、`windows`、`linux`、
+`wasi-p2` 和 `observe`、`render`、`plan-command`、`verify`），该顺序是签名字节兼容性的
+一部分，不能因 enum 重排或字典排序而改变。本 crate 只构造 payload 并验证编码形状，Task 10
+才将其与 PublisherRegistry 和 quarantine 状态结合进行密码学验证。
 
 错误类型为 `PluginManifestError`，提供稳定 `code()`；错误文本只包含字段名、长度/版本或受限
 标识片段，绝不回显 signature、任意 payload 或绝对路径。

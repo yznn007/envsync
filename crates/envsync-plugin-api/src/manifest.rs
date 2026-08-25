@@ -111,12 +111,8 @@ impl PluginManifest {
             },
             api: self.api.to_string(),
             entrypoint: self.entrypoint.as_str(),
-            targets: canonical_wire_values(self.targets.iter().map(|target| target.as_str())),
-            capabilities: canonical_wire_values(
-                self.capabilities
-                    .iter()
-                    .map(|capability| capability.as_str()),
-            ),
+            targets: signing_targets(&self.targets),
+            capabilities: signing_capabilities(&self.capabilities),
             limits: UnsignedResourceLimits {
                 max_runtime_ms: self.limits.max_runtime_ms,
                 max_memory_bytes: self.limits.max_memory_bytes,
@@ -577,10 +573,37 @@ fn parse_capabilities(
     Ok(capabilities)
 }
 
-fn canonical_wire_values(values: impl IntoIterator<Item = &'static str>) -> Vec<&'static str> {
-    let mut values = values.into_iter().collect::<Vec<_>>();
-    values.sort_unstable();
-    values
+/// 以 v1 已发布的协议顺序编排签名 payload 的目标数组。
+///
+/// 不能直接遍历 `BTreeSet`：它依赖 enum 的 `Ord` 派生顺序，日后重排变体会让同一份
+/// manifest 产生不同签名字节。这里显式保留 v1 原有顺序，避免破坏已签名的 manifest。
+fn signing_targets(targets: &BTreeSet<PluginTarget>) -> Vec<&'static str> {
+    [
+        PluginTarget::Macos,
+        PluginTarget::Windows,
+        PluginTarget::Linux,
+        PluginTarget::WasiP2,
+    ]
+    .into_iter()
+    .filter(|target| targets.contains(target))
+    .map(PluginTarget::as_str)
+    .collect()
+}
+
+/// 以 v1 已发布的协议顺序编排签名 payload 的 capability 数组。
+///
+/// 与 [`signing_targets`] 同理，显式顺序是跨版本签名兼容性的一部分。
+fn signing_capabilities(capabilities: &BTreeSet<PluginCapability>) -> Vec<&'static str> {
+    [
+        PluginCapability::Observe,
+        PluginCapability::Render,
+        PluginCapability::PlanCommand,
+        PluginCapability::Verify,
+    ]
+    .into_iter()
+    .filter(|capability| capabilities.contains(capability))
+    .map(PluginCapability::as_str)
+    .collect()
 }
 
 fn decode_fixed<const N: usize>(value: &str) -> Result<[u8; N], PluginManifestError> {

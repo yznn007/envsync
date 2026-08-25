@@ -99,23 +99,27 @@ fn manifest_rejects_structural_json_with_generic_safe_code() {
 }
 
 #[test]
-fn manifest_signing_payload_uses_lexicographic_wire_order() {
+fn manifest_signing_payload_preserves_v1_wire_order_and_bytes() {
     let mut json = valid_manifest_json();
     json["targets"] = serde_json::json!(["windows", "wasi-p2", "macos", "linux"]);
     json["capabilities"] = serde_json::json!(["verify", "render", "plan-command", "observe"]);
 
     let manifest = PluginManifest::from_json_value(json).expect("合法 manifest");
-    let payload: serde_json::Value =
-        serde_json::from_slice(&manifest.signing_payload().expect("payload 必须可序列化"))
-            .expect("payload 是 JSON");
+    let payload = manifest.signing_payload().expect("payload 必须可序列化");
+    assert_eq!(
+        payload,
+        br#"{"id":"com.example.calendar","version":"1.2.0","publisher":{"id":"com.example","public_key":"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"},"api":">=1.0.0, <2.0.0","entrypoint":"bin/plugin","targets":["macos","windows","linux","wasi-p2"],"capabilities":["observe","render","plan-command","verify"],"limits":{"max_runtime_ms":5000,"max_memory_bytes":67108864,"max_output_bytes":1048576}}"#,
+        "签名 payload 的字段和 v1 数组顺序必须稳定",
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&payload).expect("payload 是 JSON");
 
     assert_eq!(
         payload["targets"],
-        serde_json::json!(["linux", "macos", "wasi-p2", "windows"])
+        serde_json::json!(["macos", "windows", "linux", "wasi-p2"])
     );
     assert_eq!(
         payload["capabilities"],
-        serde_json::json!(["observe", "plan-command", "render", "verify"])
+        serde_json::json!(["observe", "render", "plan-command", "verify"])
     );
 }
 
@@ -228,6 +232,14 @@ fn manifest_rejects_bad_key_and_signature_shape() {
     bad_signature["signature"]["value"] =
         serde_json::json!(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([9u8; 63]));
     assert_error_code(bad_signature, "plugin.manifest.invalid_signature");
+
+    let mut malformed_key = valid_manifest_json();
+    malformed_key["publisher"]["public_key"] = serde_json::json!("!".repeat(43));
+    assert_error_code(malformed_key, "plugin.manifest.invalid_signature");
+
+    let mut malformed_signature = valid_manifest_json();
+    malformed_signature["signature"]["value"] = serde_json::json!("!".repeat(86));
+    assert_error_code(malformed_signature, "plugin.manifest.invalid_signature");
 }
 
 #[test]

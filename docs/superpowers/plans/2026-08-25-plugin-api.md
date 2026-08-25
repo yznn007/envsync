@@ -204,7 +204,7 @@ capabilities 和 targets 反序列化为封闭 enum；空 target/capability 集�
 
 - [x] **Step 3: 实现 publisher/signature 与确定性 payload**
 
-对 publisher.public_key 与 signature.value 使用 URL_SAFE_NO_PAD base64url 解码并严格要求 32/64 字节。PluginManifest::signing_payload() 构造一个不含 signature 的私有 UnsignedManifest，所有集合用 BTreeSet、字段以声明顺序由 serde_json::to_vec 输出。它返回 JSON bytes，供 Host 在固定插件签名 domain 下验签；本 crate 不调用 crypto verifier。
+对 publisher.public_key 与 signature.value 使用 URL_SAFE_NO_PAD base64url 解码并严格要求 32/64 字节。PluginManifest::signing_payload() 构造一个不含 signature 的私有 UnsignedManifest；集合去重用 BTreeSet，签名 payload 则固定使用 v1 wire order（targets：macos、windows、linux、wasi-p2；capabilities：observe、render、plan-command、verify），不能依赖 enum 派生顺序或字典序。它返回 JSON bytes，供 Host 在固定插件签名 domain 下验签；本 crate 不调用 crypto verifier。
 
 PluginCatalog::new 将已验证 manifest 的 PluginId 放入 BTreeMap，第二次插入同 ID 返回 duplicate_id，禁止后者覆盖前者。
 
