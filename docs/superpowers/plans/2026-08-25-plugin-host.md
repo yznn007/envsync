@@ -89,7 +89,7 @@ git commit -m "feat(plugins): 签名绑定入口制品摘要"
 - Create: `crates/envsync-plugin-host/src/quarantine.rs`
 - Test: `crates/envsync-plugin-host/tests/isolation.rs`
 
-- [ ] **Step 1: 写 lifecycle 红灯测试**
+- [x] **Step 1: 写 lifecycle 红灯测试**
 
 用 `DeviceKeypair` 对 manifest payload 签名，入口字节的 BLAKE3 摘要写入 manifest。覆盖未知 signer、篡改入口、quarantine 无 execute bit、内容/能力扩张重审、撤销后 retained audit：
 
@@ -100,19 +100,19 @@ assert_eq!(host.revoke_publisher(key, NOW).affected(), 1);
 assert_eq!(host.record(id).expect("record").state(), PluginState::Revoked);
 ```
 
-- [ ] **Step 2: 验证红灯**
+- [x] **Step 2: 验证红灯**
 
 Run: `cargo test -p envsync-plugin-host --test isolation quarantine`
 
 Expected: FAIL，因为 Host crate 尚不存在。
 
-- [ ] **Step 3: 实现 trust 和 staging**
+- [x] **Step 3: 实现 trust 和 staging**
 
 `PluginArtifact` 只拥有 `PluginManifest` 和入口字节；先以 `blake3::hash` 比对 `entrypoint_digest`，再通过 `envsync_crypto::device::verify`、`PublisherRegistry`、`publisher_namespace()` 和 domain `envsync-plugin` 验签。quarantine 路径逐段 no-follow，文件用 `create_new` 写入并去除 execute bit；错误不含绝对路径或原始 bytes。
 
 定义 `PluginApproval`（id、manifest digest、artifact digest、capabilities、profile、signer）和 append-only `PluginAuditEvent`。`approve`/`enable` 以 `ResourceKind::Plugin`、`Operation::Enable`、`Risk::High` 和 profile/signer/capability 事实执行 policy。未确认、policy deny 或不可信 signer 均不创建 runtime copy；`revoke_publisher` 永远可降级且保留审计。
 
-- [ ] **Step 4: 验证并提交**
+- [x] **Step 4: 验证并提交**
 
 Run: `cargo fmt --all --check && cargo test -p envsync-plugin-host --test isolation quarantine && cargo clippy -p envsync-plugin-host --all-targets -- -D warnings`
 
@@ -134,7 +134,7 @@ git commit -m "feat(plugins): 添加签名 quarantine 状态机"
 - Modify: `crates/envsync-plugin-host/src/lib.rs`
 - Modify: `crates/envsync-plugin-host/tests/isolation.rs`
 
-- [ ] **Step 1: 写恶意进程红灯测试**
+- [x] **Step 1: 写恶意进程红灯测试**
 
 fixture 模式包含 `loop`、`flood-stderr`、`crash`、`bad-frame`、`wrong-id`、`ignore-shutdown`。父测试设置 `ENVSYNC_PLUGIN_SECRET_CANARY`，并断言子进程看不到它、cwd 为空、timeout/输出/shutdown 返回稳定错误且整组进程已结束。
 
@@ -144,13 +144,13 @@ assert_eq!(host.shutdown(session).expect_err("must stop").code(), "plugin.host.s
 assert!(!stderr.contains("ENVSYNC_PLUGIN_SECRET_CANARY"));
 ```
 
-- [ ] **Step 2: 验证红灯**
+- [x] **Step 2: 验证红灯**
 
 Run: `cargo test -p envsync-plugin-host --test isolation process`
 
 Expected: FAIL，因为尚无 runner/session。
 
-- [ ] **Step 3: 实现 runner 和 session**
+- [x] **Step 3: 实现 runner 和 session**
 
 Unix runner 只接受 `--memory-bytes <u64> -- <absolute-entrypoint>`，拒绝任何其他 argv；使用安全 nix API 设置 `RLIMIT_AS`、建立自身 process group，再 `exec` 精确入口。Host 以 `Command::new(runner)` 启动，`env_clear()` 后只设置协议标记，设置空 `TempDir` cwd，管道化 stdio；不经过 shell、不转发环境、不接受 plugin argv。
 
@@ -158,7 +158,7 @@ Unix runner 只接受 `--memory-bytes <u64> -- <absolute-entrypoint>`，拒绝�
 
 `test-support` feature 只导出 `PluginHost::for_test_runner`；用自引用 dev-dependency 自动为 integration tests 启用，而普通 `cargo build` 没有此入口。
 
-- [ ] **Step 4: 验证并提交**
+- [x] **Step 4: 验证并提交**
 
 Run: `cargo fmt --all --check && cargo test -p envsync-plugin-host --test isolation process && cargo clippy -p envsync-plugin-host --all-targets -- -D warnings`
 
@@ -177,7 +177,7 @@ git commit -m "feat(plugins): 添加受限插件 runner"
 - Modify: `crates/envsync-plugin-host/src/lib.rs`
 - Modify: `crates/envsync-plugin-host/tests/isolation.rs`
 
-- [ ] **Step 1: 写 capability 红灯测试**
+- [x] **Step 1: 写 capability 红灯测试**
 
 对 `../../secret`、`/etc/passwd`、未注册 root、未知 command template、shell 元字符、NUL argv 和合法 observe/render/verify proposal 分别断言非法值在 Host 边界失败，合法值只形成 `ValidatedProposal`。
 
@@ -187,17 +187,17 @@ assert_eq!(mediator.validate(PluginMethod::Observe, proposal).expect_err("unsafe
 assert!(matches!(validated, ValidatedProposal::Observation { .. }));
 ```
 
-- [ ] **Step 2: 验证红灯**
+- [x] **Step 2: 验证红灯**
 
 Run: `cargo test -p envsync-plugin-host --test isolation capability`
 
 Expected: FAIL，因为 mediator 尚不存在。
 
-- [ ] **Step 3: 实现闭合 proposal schema**
+- [x] **Step 3: 实现闭合 proposal schema**
 
 用 `serde_json::Value` 填充私有 raw structs；`RootRegistry::get` 验证 opaque root alias，`RelativeTarget::parse` 验证相对目标。命令 proposal 只能引用 Host 的 `CommandProposalCatalog`，argv 最多 64 项、每项最多 4096 bytes，且不能含 NUL、控制字符或 shell 元字符。`ValidatedProposal` 不含绝对路径和秘密值；crate 不提供直接文件/命令/Vault 操作。
 
-- [ ] **Step 4: 验证并提交**
+- [x] **Step 4: 验证并提交**
 
 Run: `cargo fmt --all --check && cargo test -p envsync-plugin-host --test isolation capability && cargo clippy -p envsync-plugin-host --all-targets -- -D warnings`
 
@@ -216,19 +216,19 @@ git commit -m "feat(plugins): 代理插件 capability proposal"
 - Modify: `docs/superpowers/specs/2026-08-25-plugin-host-design.md`
 - Modify: `docs/superpowers/plans/2026-07-24-envsync-m4-desktop-gist-plugins.md`
 
-- [ ] **Step 1: 运行完整恶意 fixture 矩阵**
+- [x] **Step 1: 运行完整恶意 fixture 矩阵**
 
 Run: `cargo test -p envsync-plugin-host --test isolation`
 
 Expected: loop、输出洪泛、崩溃、协议欺骗、未授权路径、未知命令、环境泄漏和 shutdown 逃逸均有独立 PASS 断言；没有测试通过忽略错误或只检查 helper 自己。
 
-- [ ] **Step 2: 运行关联验证**
+- [x] **Step 2: 运行关联验证**
 
 Run: `cargo fmt --all --check && cargo test -p envsync-plugin-api && cargo test -p envsync-plugin-host && cargo clippy -p envsync-plugin-api -p envsync-plugin-host --all-targets -- -D warnings && git diff --check`
 
 Expected: PASS。
 
-- [ ] **Step 3: 标记 M4 Task 10 并提交**
+- [x] **Step 3: 标记 M4 Task 10 并提交**
 
 将原 M4 计划 Task 10 的五个步骤标为完成，并记录普通构建默认拒绝与 test-only feature 的边界。
 

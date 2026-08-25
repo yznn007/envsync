@@ -367,32 +367,38 @@ git commit -am "feat(plugins): 定义插件 manifest 与 RPC"
 - Create: `crates/envsync-plugin-host/src/capability.rs`
 - Test: `crates/envsync-plugin-host/tests/isolation.rs`
 
-- [ ] **Step 1: 写 malicious plugin fixtures**
+- [x] **Step 1: 写 malicious plugin fixtures**
 
 测试无限循环、超大输出、崩溃、协议欺骗、读取未授权路径、请求未知命令、泄露环境变量和在
 shutdown 后继续运行。
 
-- [ ] **Step 2: 独立进程执行**
+- [x] **Step 2: 独立进程执行**
 
 清空环境后只注入协议 channel；cwd 为临时空目录。timeout、内存/输出限制、进程树清理。
 平台 sandbox capability 不可用时，插件默认禁止启用，不伪称已隔离。
 
-- [ ] **Step 3: Host-mediated capability**
+- [x] **Step 3: Host-mediated capability**
 
 插件只返回 declarative observation/render/command proposal；Host 重新验证路径和命令，
 再进入普通 Plan/policy/apply 流程。插件不能获得 Vault plaintext。
 
-- [ ] **Step 4: 签名与 quarantine**
+- [x] **Step 4: 签名与 quarantine**
 
 复用 Bundle publisher trust；安装、更新、权限扩张均进入 quarantine 审核。撤销 publisher
 会禁用其插件但保留审计数据。
 
-- [ ] **Step 5: 验证并提交**
+- [x] **Step 5: 验证并提交**
 
 ```bash
 cargo test -p envsync-plugin-host --test isolation
 git commit -am "feat(plugins): 添加隔离插件 Host"
 ```
+
+> **完成记录（2026-08-25）：** 普通构建在缺少可验证 OS sandbox 时默认拒绝执行；
+> `test-support` runner 只用于恶意 fixture 隔离验证，不能作为生产隔离声明。stdout/stderr
+> 共用原子输出预算，stdout 在分配 frame body 前预留完整 frame；reader 发现终止性错误即杀掉
+> 进程组。完整 CI（Linux、macOS、Windows、Clippy、审计、桌面前端）已通过：
+> <https://github.com/yznn007/envsync/actions/runs/32810006946>。
 
 ### Task 11: 桌面 E2E、无障碍与视觉回归
 

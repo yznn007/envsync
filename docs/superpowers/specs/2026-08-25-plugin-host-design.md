@@ -50,7 +50,7 @@ no-follow 打开它们，并让后续创建/读取始终相对已打开的目录
 
 `envsync-plugin-runner` 是一个独立的 Unix helper：它只接收 Host 构造的绝对入口路径和数值内存上限，不使用 shell；先建立独立 process group、设置 `RLIMIT_AS`，再 `exec` 入口程序。Host 在 timeout、总 stdout/stderr 输出超限、协议错误或 shutdown 宽限期结束时用该 process group 终止整个进程树，而不是只 kill 直接子进程。
 
-Host 为每次会话新建空临时 cwd，使用 `env_clear()`，仅注入固定的 `ENVSYNC_PLUGIN_PROTOCOL=stdio-v1`；stdin/stdout 是长度前缀 RPC 管道，stderr 仅作为有上限的诊断字节流。Host 不继承 `PATH`、用户环境、工作目录、文件句柄或 Vault 句柄。
+Host 为每次会话新建空临时 cwd，使用 `env_clear()`，仅注入固定的 `ENVSYNC_PLUGIN_PROTOCOL=stdio-v1`；stdin/stdout 是长度前缀 RPC 管道，stderr 仅作为有上限的诊断字节流。stdout 在读取长度前缀后、分配 body 前，原子预留包含前缀在内的完整 frame 输出额度；它与 stderr 共用同一预算，因而不能借由另一条管道已消耗的额度触发额外大分配。任一 reader 发现输出超限、协议错误或异常关闭时都会立刻终止整个进程组；输出超限还写入不可遗漏的共享失败状态，不能因事件队列已满被误报为成功。Host 不继承 `PATH`、用户环境、工作目录、文件句柄或 Vault 句柄。
 
 本次不把 runner 的资源限制伪装成 OS filesystem/network sandbox。普通构建的
 `PluginHost::enable()` 报告 `SandboxUnavailable` 并拒绝启用或运行插件。仅
