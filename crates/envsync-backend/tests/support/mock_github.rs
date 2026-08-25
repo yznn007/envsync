@@ -167,7 +167,7 @@ pub struct MockGithub {
 impl MockGithub {
     pub fn start() -> io::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
-        listener.set_nonblocking(true)?;
+        // Drop 会通过本地连接唤醒 accept；保持阻塞可避免轮询带来的调度抖动。
         let addr = listener.local_addr()?;
         let requests = Arc::new(Mutex::new(Vec::new()));
         let responses = Arc::new(Mutex::new(VecDeque::new()));
@@ -224,9 +224,6 @@ impl MockGithub {
                         let _ = stream.write_all(&body);
                         let _ = stream.flush();
                         let _ = stream.shutdown(Shutdown::Both);
-                    }
-                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(5));
                     }
                     Err(_) => break,
                 }

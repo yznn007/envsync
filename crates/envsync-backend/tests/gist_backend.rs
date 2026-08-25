@@ -19,6 +19,9 @@ use serde_json::{json, Value};
 use support::mock_github::{MockGithub, ResponseSpec};
 use tempfile::NamedTempFile;
 
+// 普通 mock 请求不验证超时语义，给 CI 调度留出足够余量。
+const NORMAL_MOCK_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
+
 fn sealed_bundles() -> (WorkspaceId, String, String) {
     let (workspace, bundle_v1, bundle_v2, _) = sealed_bundle_versions();
     (workspace, bundle_v1, bundle_v2)
@@ -268,7 +271,7 @@ fn read_maps_auth_forbidden_and_not_found_to_safe_codes() {
         let mock = MockGithub::start().expect("启动 GitHub mock");
         let sentinel = "error-body-must-not-appear";
         mock.enqueue(ResponseSpec::new(status).body(sentinel));
-        let backend = GistBackend::with_api_base(mock.base_url(), Duration::from_millis(100))
+        let backend = GistBackend::with_api_base(mock.base_url(), NORMAL_MOCK_REQUEST_TIMEOUT)
             .expect("构造 Gist 后端");
 
         let error = backend
@@ -285,7 +288,7 @@ fn read_rejects_missing_etag_before_returning_unusable_revision() {
     let (workspace, bundle, _) = sealed_bundles();
     let filename = gist_bundle_filename(workspace);
     mock.enqueue(ResponseSpec::new(200).body(gist_response("gist-123", &filename, &bundle)));
-    let backend = GistBackend::with_api_base(mock.base_url(), Duration::from_millis(100))
+    let backend = GistBackend::with_api_base(mock.base_url(), NORMAL_MOCK_REQUEST_TIMEOUT)
         .expect("构造 Gist 后端");
 
     let error = backend
@@ -363,7 +366,7 @@ fn truncated_gist_file_uses_allowed_uncredentialed_raw_url() {
             )),
     );
     mock.enqueue(ResponseSpec::new(200).body_file(raw_file.path()));
-    let backend = match GistBackend::with_api_base(mock.base_url(), Duration::from_millis(100)) {
+    let backend = match GistBackend::with_api_base(mock.base_url(), NORMAL_MOCK_REQUEST_TIMEOUT) {
         Ok(backend) => backend,
         Err(_) => panic!("构造 Gist 后端失败"),
     };
@@ -423,7 +426,7 @@ fn truncated_gist_rejects_untrusted_raw_url_without_following_it() {
         mock.enqueue(ResponseSpec::new(200).header("etag", "\"v1\"").body(
             truncated_gist_response("gist-123", &filename, &raw_url, &bundle),
         ));
-        let backend = GistBackend::with_api_base(mock.base_url(), Duration::from_millis(100))
+        let backend = GistBackend::with_api_base(mock.base_url(), NORMAL_MOCK_REQUEST_TIMEOUT)
             .expect("构造 Gist 后端");
 
         let error = backend
@@ -449,7 +452,7 @@ fn loopback_api_rejects_public_github_raw_url_without_following_it() {
                 "gist-123", &filename, &raw_url, &bundle,
             )),
     );
-    let backend = GistBackend::with_api_base(mock.base_url(), Duration::from_millis(100))
+    let backend = GistBackend::with_api_base(mock.base_url(), NORMAL_MOCK_REQUEST_TIMEOUT)
         .expect("构造 loopback Gist 后端");
 
     let error = backend
@@ -469,7 +472,7 @@ fn read_transport_failure_is_safe() {
     let endpoint = mock.base_url();
     mock.enqueue(ResponseSpec::new(200).disconnect());
     let backend =
-        GistBackend::with_api_base(&endpoint, Duration::from_millis(100)).expect("构造 Gist 后端");
+        GistBackend::with_api_base(&endpoint, NORMAL_MOCK_REQUEST_TIMEOUT).expect("构造 Gist 后端");
 
     let error = backend
         .read(&credentials(), &gist_id(), WorkspaceId::generate())
@@ -500,7 +503,7 @@ fn create_sends_one_secret_post_without_implicit_read() {
     let (workspace, bundle, _) = sealed_bundles();
     let filename = gist_bundle_filename(workspace);
     mock.enqueue(ResponseSpec::new(201).body(json!({ "id": "gist-123" }).to_string()));
-    let backend = GistBackend::with_api_base(mock.base_url(), Duration::from_millis(100))
+    let backend = GistBackend::with_api_base(mock.base_url(), NORMAL_MOCK_REQUEST_TIMEOUT)
         .expect("构造 Gist 后端");
 
     let created = backend
@@ -556,7 +559,7 @@ fn create_then_read_then_publish_sends_expected_contract() {
             .body(gist_response("gist-123", &filename, &bundle_v2)),
     );
 
-    let backend = GistBackend::with_api_base(mock.base_url(), Duration::from_millis(100))
+    let backend = GistBackend::with_api_base(mock.base_url(), NORMAL_MOCK_REQUEST_TIMEOUT)
         .expect("构造 Gist 后端");
     let credentials = credentials();
     let created = backend.create(&credentials, &bundle_v1).expect("创建 Gist");
@@ -638,7 +641,7 @@ fn create_then_read_then_publish_sends_expected_contract() {
 #[test]
 fn descriptor_explicitly_reports_weak_cas() {
     let mock = MockGithub::start().expect("启动 GitHub mock");
-    let backend = GistBackend::with_api_base(mock.base_url(), Duration::from_millis(100))
+    let backend = GistBackend::with_api_base(mock.base_url(), NORMAL_MOCK_REQUEST_TIMEOUT)
         .expect("构造 Gist 后端");
 
     let descriptor = backend.descriptor();
@@ -663,7 +666,7 @@ fn old_verify_read_after_patch_is_a_cas_conflict_without_patch_retry() {
             .body(gist_response("gist-123", &filename, &bundle_v1)),
     );
 
-    let backend = GistBackend::with_api_base(mock.base_url(), Duration::from_millis(100))
+    let backend = GistBackend::with_api_base(mock.base_url(), NORMAL_MOCK_REQUEST_TIMEOUT)
         .expect("构造 Gist 后端");
     let credentials = credentials();
     let read = backend
@@ -727,7 +730,7 @@ fn cas_success_verifies_complete_candidate_and_returns_new_etag() {
             .header("etag", "\"v3\"")
             .body(gist_response("gist-123", &filename, &bundle_v3)),
     );
-    let backend = GistBackend::with_api_base(mock.base_url(), Duration::from_millis(100))
+    let backend = GistBackend::with_api_base(mock.base_url(), NORMAL_MOCK_REQUEST_TIMEOUT)
         .expect("构造 Gist 后端");
     let credentials = credentials();
     let read = read_for_cas(&backend, &credentials, workspace);
@@ -763,7 +766,7 @@ fn cas_412_verifies_candidate_once_and_reports_published() {
             .header("etag", "\"v2\"")
             .body(gist_response("gist-123", &filename, &bundle_v2)),
     );
-    let backend = GistBackend::with_api_base(mock.base_url(), Duration::from_millis(100))
+    let backend = GistBackend::with_api_base(mock.base_url(), NORMAL_MOCK_REQUEST_TIMEOUT)
         .expect("构造 Gist 后端");
     let credentials = credentials();
     let read = read_for_cas(&backend, &credentials, workspace);
@@ -795,7 +798,7 @@ fn cas_disconnect_verifies_candidate_once_and_reports_published() {
             .body(gist_response("gist-123", &filename, &bundle_v2)),
     );
     let backend =
-        GistBackend::with_api_base(&endpoint, Duration::from_millis(100)).expect("构造 Gist 后端");
+        GistBackend::with_api_base(&endpoint, NORMAL_MOCK_REQUEST_TIMEOUT).expect("构造 Gist 后端");
     let credentials = credentials();
     let read = read_for_cas(&backend, &credentials, workspace);
 
@@ -820,7 +823,7 @@ fn cas_412_with_failed_verification_reports_unknown_once() {
     );
     mock.enqueue(ResponseSpec::new(412).body("cas-412-body-sentinel"));
     mock.enqueue(ResponseSpec::new(500).body("verify-412-body-sentinel"));
-    let backend = GistBackend::with_api_base(mock.base_url(), Duration::from_millis(100))
+    let backend = GistBackend::with_api_base(mock.base_url(), NORMAL_MOCK_REQUEST_TIMEOUT)
         .expect("构造 Gist 后端");
     let credentials = credentials();
     let read = read_for_cas(&backend, &credentials, workspace);
@@ -850,7 +853,7 @@ fn cas_disconnect_with_failed_verification_reports_unknown_once() {
     );
     mock.enqueue(ResponseSpec::new(200).disconnect());
     mock.enqueue(ResponseSpec::new(500).body("verify-disconnect-body-sentinel"));
-    let backend = GistBackend::with_api_base(mock.base_url(), Duration::from_millis(100))
+    let backend = GistBackend::with_api_base(mock.base_url(), NORMAL_MOCK_REQUEST_TIMEOUT)
         .expect("构造 Gist 后端");
     let credentials = credentials();
     let read = read_for_cas(&backend, &credentials, workspace);
@@ -884,7 +887,7 @@ fn cas_verifies_other_valid_bundle_as_conflict_once() {
             .header("etag", "\"v2\"")
             .body(gist_response("gist-123", &filename, &bundle_v3)),
     );
-    let backend = GistBackend::with_api_base(mock.base_url(), Duration::from_millis(100))
+    let backend = GistBackend::with_api_base(mock.base_url(), NORMAL_MOCK_REQUEST_TIMEOUT)
         .expect("构造 Gist 后端");
     let credentials = credentials();
     let read = read_for_cas(&backend, &credentials, workspace);
@@ -933,7 +936,7 @@ fn cas_verifies_same_ref_different_ciphertext_as_conflict_once() {
                 &same_ref_different_ciphertext,
             )),
     );
-    let backend = GistBackend::with_api_base(mock.base_url(), Duration::from_millis(100))
+    let backend = GistBackend::with_api_base(mock.base_url(), NORMAL_MOCK_REQUEST_TIMEOUT)
         .expect("构造 Gist 后端");
     let credentials = credentials();
     let read = read_for_cas(&backend, &credentials, workspace);
@@ -966,7 +969,7 @@ fn cas_5xx_verifies_old_bundle_once_and_reports_conflict_without_leaks() {
             .body(gist_response("gist-123", &filename, &bundle_v1)),
     );
     let backend =
-        GistBackend::with_api_base(&endpoint, Duration::from_millis(100)).expect("构造 Gist 后端");
+        GistBackend::with_api_base(&endpoint, NORMAL_MOCK_REQUEST_TIMEOUT).expect("构造 Gist 后端");
     let credentials = credentials();
     let read = read_for_cas(&backend, &credentials, workspace);
 
@@ -1027,7 +1030,7 @@ fn read_retries_once_after_zero_retry_after_without_real_wait() {
             .header("etag", "\"v1\"")
             .body(gist_response("gist-123", &filename, &bundle)),
     );
-    let backend = GistBackend::with_api_base(mock.base_url(), Duration::from_millis(100))
+    let backend = GistBackend::with_api_base(mock.base_url(), NORMAL_MOCK_REQUEST_TIMEOUT)
         .expect("构造 Gist 后端");
 
     let started_at = Instant::now();
@@ -1054,7 +1057,7 @@ fn create_429_is_rate_limited_and_never_replays_post() {
     let sentinel = "post-rate-limit-body-sentinel";
     mock.enqueue(ResponseSpec::new(429).body(sentinel));
     let backend =
-        GistBackend::with_api_base(&endpoint, Duration::from_millis(100)).expect("构造 Gist 后端");
+        GistBackend::with_api_base(&endpoint, NORMAL_MOCK_REQUEST_TIMEOUT).expect("构造 Gist 后端");
 
     let error = backend
         .create(&credentials(), &bundle)
@@ -1082,7 +1085,7 @@ fn cas_patch_429_is_rate_limited_and_never_replays_patch() {
     );
     mock.enqueue(ResponseSpec::new(429).body(sentinel));
     let backend =
-        GistBackend::with_api_base(&endpoint, Duration::from_millis(100)).expect("构造 Gist 后端");
+        GistBackend::with_api_base(&endpoint, NORMAL_MOCK_REQUEST_TIMEOUT).expect("构造 Gist 后端");
     let credentials = credentials();
     let read = read_for_cas(&backend, &credentials, workspace);
 
