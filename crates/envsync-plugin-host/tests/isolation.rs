@@ -13,13 +13,14 @@ use envsync_core::bundles::{publisher_fingerprint, publisher_namespace};
 use envsync_core::PublisherRegistry;
 use envsync_crypto::device::DeviceKeypair;
 use envsync_domain::{Arch, DeviceProfile, Os};
+use envsync_platform::{AuthorizedRoot, RootRegistry};
 #[cfg(not(target_os = "macos"))]
-use envsync_plugin_api::{
-    encode_frame, PluginMethod, RequestId, RpcMessage, RpcRequest, SchemaVersion,
-};
-use envsync_plugin_api::{PluginId, PluginManifest};
+use envsync_plugin_api::{encode_frame, RequestId, RpcMessage, RpcRequest, SchemaVersion};
+use envsync_plugin_api::{PluginId, PluginManifest, PluginMethod};
 use envsync_plugin_host::{
-    ApprovalGap, HostError, PluginArtifact, PluginHost, PluginState, PLUGIN_SIGNATURE_DOMAIN,
+    ApprovalGap, CapabilityMediator, CommandArgumentRule, CommandProposalCatalog,
+    CommandProposalTemplate, HostError, PluginArtifact, PluginHost, PluginState, ValidatedProposal,
+    PLUGIN_SIGNATURE_DOMAIN,
 };
 use envsync_policy::{
     Decision, FactPredicate, MatchExpr, Operation, PolicySet, ResourceKind, Rule, RuleId,
@@ -132,6 +133,23 @@ fn policy(decision: Decision) -> PolicySet {
         ]),
     )])
     .expect("policy")
+}
+
+fn capability_context(temp: &TempDir) -> (RootRegistry, CommandProposalCatalog) {
+    let root_path = temp.path().join("workspace");
+    fs::create_dir(&root_path).expect("workspace root");
+    let root = AuthorizedRoot::open("workspace", &root_path).expect("authorized root");
+    let mut roots = RootRegistry::new();
+    roots.insert(root);
+
+    let mut commands = CommandProposalCatalog::new();
+    commands
+        .register(
+            CommandProposalTemplate::new("envsync.status", vec![CommandArgumentRule::token()])
+                .expect("command template"),
+        )
+        .expect("register command template");
+    (roots, commands)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -390,6 +408,107 @@ fn test_support_host_enables_a_verified_approved_entrypoint() {
         host.record(&id).expect("record").state(),
         PluginState::Enabled
     );
+}
+
+#[test]
+fn capability_mediator_returns_only_validated_file_declarations() {
+    let fixture = Fixture::new();
+    let (roots, commands) = capability_context(&fixture.temp);
+    let mediator = CapabilityMediator::new(&roots, &commands);
+    let proposal = serde_json::json!({ "root": "workspace", "target": "config/state.json" });
+
+    let observed = mediator
+        .validate(PluginMethod::Observe, proposal.clone())
+        .expect("observe proposal");
+    assert!(matches!(
+        observed,
+        ValidatedProposal::Observation { root, target }
+            if root == "workspace" && target.display_path() == "config/state.json"
+    ));
+
+    let rendered = mediator
+        .validate(PluginMethod::Render, proposal.clone())
+        .expect("render proposal");
+    assert!(matches!(rendered, ValidatedProposal::Render { .. }));
+
+    let verified = mediator
+        .validate(PluginMethod::Verify, proposal)
+        .expect("verify proposal");
+    assert!(matches!(verified, ValidatedProposal::Verification { .. }));
+}
+
+#[test]
+fn capability_mediator_rejects_unsafe_or_unregistered_targets() {
+    let fixture = Fixture::new();
+    let (roots, commands) = capability_context(&fixture.temp);
+    let mediator = CapabilityMediator::new(&roots, &commands);
+
+    for target in ["../../secret", "/etc/passwd"] {
+        let error = mediator
+            .validate(
+                PluginMethod::Observe,
+                serde_json::json!({ "root": "workspace", "target": target }),
+            )
+            .expect_err("unsafe target");
+        assert_eq!(error.code(), "plugin.host.invalid_target");
+    }
+
+    let error = mediator
+        .validate(
+            PluginMethod::Render,
+            serde_json::json!({ "root": "missing", "target": "config/state.json" }),
+        )
+        .expect_err("unknown root");
+    assert_eq!(error.code(), "plugin.host.unknown_root");
+
+    let error = mediator
+        .validate(
+            PluginMethod::Verify,
+            serde_json::json!({
+                "root": "workspace",
+                "target": "config/state.json",
+                "secret": "must-not-be-a-schema-field"
+            }),
+        )
+        .expect_err("unknown field");
+    assert_eq!(error.code(), "plugin.host.invalid_proposal");
+}
+
+#[test]
+fn capability_mediator_rejects_untrusted_commands_without_execution() {
+    let fixture = Fixture::new();
+    let (roots, commands) = capability_context(&fixture.temp);
+    let mediator = CapabilityMediator::new(&roots, &commands);
+
+    let valid = mediator
+        .validate(
+            PluginMethod::PlanCommand,
+            serde_json::json!({ "template_id": "envsync.status", "argv": ["workspace"] }),
+        )
+        .expect("valid command proposal");
+    assert!(matches!(valid, ValidatedProposal::Command { .. }));
+
+    let error = mediator
+        .validate(
+            PluginMethod::PlanCommand,
+            serde_json::json!({ "template_id": "missing", "argv": [] }),
+        )
+        .expect_err("unknown template");
+    assert_eq!(error.code(), "plugin.host.unknown_command");
+
+    for argv in [
+        serde_json::json!(["workspace;rm"]),
+        serde_json::json!(["workspace\u{0}secret"]),
+        serde_json::json!(vec!["workspace"; 65]),
+    ] {
+        let error = mediator
+            .validate(
+                PluginMethod::PlanCommand,
+                serde_json::json!({ "template_id": "envsync.status", "argv": argv }),
+            )
+            .expect_err("unsafe argv");
+        assert_eq!(error.code(), "plugin.host.invalid_command");
+    }
 }
 
 #[cfg(not(target_os = "macos"))]

@@ -300,6 +300,21 @@ pub enum HostError {
     /// policy 要求确认，但调用方没有给出确认。
     #[error("插件启用需要确认")]
     ConfirmationRequired,
+    /// plugin 返回的 proposal 不属于当前 method 的闭合 schema。
+    #[error("插件 capability proposal 无效")]
+    InvalidProposal,
+    /// plugin proposal 的相对目标不安全或不合规。
+    #[error("插件 capability target 无效")]
+    InvalidTarget,
+    /// plugin proposal 引用了没有注册的逻辑根。
+    #[error("插件 capability root 未注册")]
+    UnknownRoot,
+    /// plugin proposal 引用了没有注册的命令模板。
+    #[error("插件 capability command 未注册")]
+    UnknownCommand,
+    /// plugin proposal 的命令参数不符合 Host 模板。
+    #[error("插件 capability command 无效")]
+    InvalidCommand,
     /// 当前 Host 没有可验证的 sandbox runner，不能执行插件。
     #[error("当前 Host 没有可验证的插件 sandbox")]
     SandboxUnavailable,
@@ -347,6 +362,11 @@ impl HostError {
             Self::ApprovalStale(_) => "plugin.host.approval_stale",
             Self::PolicyDenied => "plugin.host.policy_denied",
             Self::ConfirmationRequired => "plugin.host.confirmation_required",
+            Self::InvalidProposal => "plugin.host.invalid_proposal",
+            Self::InvalidTarget => "plugin.host.invalid_target",
+            Self::UnknownRoot => "plugin.host.unknown_root",
+            Self::UnknownCommand => "plugin.host.unknown_command",
+            Self::InvalidCommand => "plugin.host.invalid_command",
             Self::SandboxUnavailable => "plugin.host.sandbox_unavailable",
             Self::Protocol => "plugin.host.protocol",
             Self::Timeout => "plugin.host.timeout",

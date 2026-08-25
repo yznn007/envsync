@@ -9,7 +9,7 @@ repository.workspace = true
 authors.workspace = true
 
 [features]
-test-support = ["dep:nix", "dep:serde_json", "dep:tempfile"]
+test-support = ["dep:nix", "dep:tempfile"]
 
 [dependencies]
 blake3.workspace = true
@@ -17,18 +17,18 @@ cap-primitives.workspace = true
 envsync-core.workspace = true
 envsync-crypto.workspace = true
 envsync-domain.workspace = true
+envsync-platform.workspace = true
 envsync-plugin-api.workspace = true
 envsync-policy.workspace = true
 nix = { workspace = true, optional = true }
 serde.workspace = true
-serde_json = { workspace = true, optional = true }
+serde_json.workspace = true
 tempfile = { workspace = true, optional = true }
 thiserror.workspace = true
 
 [dev-dependencies]
 base64.workspace = true
 envsync-plugin-host = { path = ".", features = ["test-support"] }
-serde_json.workspace = true
 
 [[bin]]
 name = "envsync-plugin-runner"

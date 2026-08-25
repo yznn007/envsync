@@ -1442,6 +1442,7 @@ dependencies = [
  "envsync-core",
  "envsync-crypto",
  "envsync-domain",
+ "envsync-platform",
  "envsync-plugin-api",
  "envsync-plugin-host",
  "envsync-policy",
