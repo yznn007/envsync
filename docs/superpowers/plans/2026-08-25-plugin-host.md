@@ -31,7 +31,7 @@
 - Modify: `crates/envsync-plugin-api/src/lib.rs`
 - Modify: `crates/envsync-plugin-api/tests/compatibility.rs`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 给 `valid_manifest_json()` 加入合法 `entrypoint_digest`，并断言缺失、42/44 字符、43 字符但非法 base64url 分别被拒绝：
 
@@ -47,13 +47,13 @@ assert_error_code(malformed, "plugin.manifest.invalid_artifact_digest");
 
 再断言完整 `signing_payload()` 原始字节包含该字段，改变任意摘要字节会改变 payload。
 
-- [ ] **Step 2: 验证红灯**
+- [x] **Step 2: 验证红灯**
 
 Run: `cargo test -p envsync-plugin-api --test compatibility manifest_`
 
 Expected: FAIL，因为 API 尚无 `entrypoint_digest`。
 
-- [ ] **Step 3: 实现最小值对象**
+- [x] **Step 3: 实现最小值对象**
 
 在私有 `RawManifest`、`PluginManifest` 和 `UnsignedManifest` 加入字段，定义并 re-export：
 
@@ -68,7 +68,7 @@ impl PluginArtifactDigest {
 
 专用解码器必须先检查无填充 base64url 的 43 字符长度，再解码为恰好 32 字节；失败使用新稳定码 `plugin.manifest.invalid_artifact_digest`。不得在 API crate 内计算 BLAKE3，也不得改变既有 targets/capabilities 的 v1 签名数组顺序。
 
-- [ ] **Step 4: 验证并提交**
+- [x] **Step 4: 验证并提交**
 
 Run: `cargo fmt --all --check && cargo test -p envsync-plugin-api && cargo clippy -p envsync-plugin-api --all-targets -- -D warnings`
 
