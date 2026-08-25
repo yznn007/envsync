@@ -67,6 +67,41 @@ fn manifest_rejects_unsafe_entrypoints_unknown_capabilities_and_incompatible_api
             "plugin.manifest.invalid_entrypoint",
         ),
         (
+            "entrypoint",
+            serde_json::json!("bin//plugin"),
+            "plugin.manifest.invalid_entrypoint",
+        ),
+        (
+            "entrypoint",
+            serde_json::json!("bin\\\\plugin"),
+            "plugin.manifest.invalid_entrypoint",
+        ),
+        (
+            "entrypoint",
+            serde_json::json!("bin\u{0000}plugin"),
+            "plugin.manifest.invalid_entrypoint",
+        ),
+        (
+            "entrypoint",
+            serde_json::json!("bin:plugin"),
+            "plugin.manifest.invalid_entrypoint",
+        ),
+        (
+            "entrypoint",
+            serde_json::json!("."),
+            "plugin.manifest.invalid_entrypoint",
+        ),
+        (
+            "entrypoint",
+            serde_json::json!("./bin"),
+            "plugin.manifest.invalid_entrypoint",
+        ),
+        (
+            "entrypoint",
+            serde_json::json!("bin/"),
+            "plugin.manifest.invalid_entrypoint",
+        ),
+        (
             "capabilities",
             serde_json::json!(["observe", "network.raw"]),
             "plugin.manifest.unknown_capability",
@@ -130,9 +165,17 @@ fn manifest_rejects_empty_or_duplicate_sets_and_windows_entrypoints() {
     empty_targets["targets"] = serde_json::json!([]);
     assert_error_code(empty_targets, "plugin.manifest.invalid_target");
 
+    let mut freebsd_target = valid_manifest_json();
+    freebsd_target["targets"] = serde_json::json!(["freebsd"]);
+    assert_error_code(freebsd_target, "plugin.manifest.invalid_target");
+
     let mut duplicate_targets = valid_manifest_json();
     duplicate_targets["targets"] = serde_json::json!(["linux", "linux"]);
     assert_error_code(duplicate_targets, "plugin.manifest.invalid_target");
+
+    let mut empty_capabilities = valid_manifest_json();
+    empty_capabilities["capabilities"] = serde_json::json!([]);
+    assert_error_code(empty_capabilities, "plugin.manifest.unknown_capability");
 
     let mut duplicate_capabilities = valid_manifest_json();
     duplicate_capabilities["capabilities"] = serde_json::json!(["observe", "observe"]);
@@ -151,6 +194,22 @@ fn manifest_error_text_does_not_echo_untrusted_input() {
     assert_eq!(error.code(), "plugin.manifest.invalid_signature");
     assert!(!error.to_string().contains("sensitive-signature-material"));
     assert!(!format!("{error:?}").contains("sensitive-signature-material"));
+}
+
+#[test]
+fn manifest_accepts_boundary_resource_limits() {
+    for (runtime, memory, output) in [
+        (100, 1_048_576_u64, 1_024_u64),
+        (30_000, 268_435_456_u64, 8_388_608_u64),
+    ] {
+        let mut json = valid_manifest_json();
+        json["limits"]["max_runtime_ms"] = serde_json::json!(runtime);
+        json["limits"]["max_memory_bytes"] = serde_json::json!(memory);
+        json["limits"]["max_output_bytes"] = serde_json::json!(output);
+
+        let manifest = PluginManifest::from_json_value(json).expect("边界值必须被接受");
+        assert_eq!(manifest.entrypoint().as_str(), "bin/plugin");
+    }
 }
 
 #[test]
