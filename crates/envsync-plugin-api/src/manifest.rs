@@ -49,7 +49,7 @@ impl PluginManifest {
     /// JSON 仅会先进入本模块的私有原始结构；公开值对象中的文本字段都经过逐项校验。
     pub fn from_json_value(value: serde_json::Value) -> Result<Self, PluginManifestError> {
         let raw: RawManifest =
-            serde_json::from_value(value).map_err(|_| PluginManifestError::InvalidId)?;
+            serde_json::from_value(value).map_err(|_| PluginManifestError::InvalidManifest)?;
         Self::try_from(raw)
     }
 
@@ -111,12 +111,12 @@ impl PluginManifest {
             },
             api: self.api.to_string(),
             entrypoint: self.entrypoint.as_str(),
-            targets: self.targets.iter().map(|target| target.as_str()).collect(),
-            capabilities: self
-                .capabilities
-                .iter()
-                .map(|capability| capability.as_str())
-                .collect(),
+            targets: canonical_wire_values(self.targets.iter().map(|target| target.as_str())),
+            capabilities: canonical_wire_values(
+                self.capabilities
+                    .iter()
+                    .map(|capability| capability.as_str()),
+            ),
             limits: UnsignedResourceLimits {
                 max_runtime_ms: self.limits.max_runtime_ms,
                 max_memory_bytes: self.limits.max_memory_bytes,
@@ -434,6 +434,9 @@ impl TryFrom<RawResourceLimits> for ResourceLimits {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum PluginManifestError {
+    /// manifest JSON 的字段、类型或封闭结构不符合协议。
+    #[error("插件 manifest 结构无效")]
+    InvalidManifest,
     /// 插件或发布者标识不符合小写反向域名格式。
     #[error("插件或发布者标识格式无效")]
     InvalidId,
@@ -467,6 +470,7 @@ impl PluginManifestError {
     /// 返回可供跨版本调用方依赖的稳定机器错误码。
     pub const fn code(self) -> &'static str {
         match self {
+            Self::InvalidManifest => "plugin.manifest.invalid_manifest",
             Self::InvalidId => "plugin.manifest.invalid_id",
             Self::InvalidSemver => "plugin.manifest.invalid_semver",
             Self::InvalidEntrypoint => "plugin.manifest.invalid_entrypoint",
@@ -573,11 +577,30 @@ fn parse_capabilities(
     Ok(capabilities)
 }
 
+fn canonical_wire_values(values: impl IntoIterator<Item = &'static str>) -> Vec<&'static str> {
+    let mut values = values.into_iter().collect::<Vec<_>>();
+    values.sort_unstable();
+    values
+}
+
 fn decode_fixed<const N: usize>(value: &str) -> Result<[u8; N], PluginManifestError> {
+    if value.len() != base64url_unpadded_len(N) {
+        return Err(PluginManifestError::InvalidSignature);
+    }
+
     let decoded = URL_SAFE_NO_PAD
         .decode(value)
         .map_err(|_| PluginManifestError::InvalidSignature)?;
     decoded
         .try_into()
         .map_err(|_| PluginManifestError::InvalidSignature)
+}
+
+const fn base64url_unpadded_len(byte_len: usize) -> usize {
+    (byte_len / 3) * 4
+        + match byte_len % 3 {
+            0 => 0,
+            1 => 2,
+            _ => 3,
+        }
 }

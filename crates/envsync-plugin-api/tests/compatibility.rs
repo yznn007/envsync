@@ -81,6 +81,45 @@ fn manifest_accepts_valid_value_and_produces_stable_unsigned_payload() {
 }
 
 #[test]
+fn manifest_rejects_structural_json_with_generic_safe_code() {
+    let mut missing_field = valid_manifest_json();
+    missing_field
+        .as_object_mut()
+        .expect("fixture 是 object")
+        .remove("id");
+    assert_error_code(missing_field, "plugin.manifest.invalid_manifest");
+
+    let mut wrong_field_type = valid_manifest_json();
+    wrong_field_type["limits"] = serde_json::json!("not-an-object");
+    assert_error_code(wrong_field_type, "plugin.manifest.invalid_manifest");
+
+    let mut unknown_field = valid_manifest_json();
+    unknown_field["future_untrusted_field"] = serde_json::json!(true);
+    assert_error_code(unknown_field, "plugin.manifest.invalid_manifest");
+}
+
+#[test]
+fn manifest_signing_payload_uses_lexicographic_wire_order() {
+    let mut json = valid_manifest_json();
+    json["targets"] = serde_json::json!(["windows", "wasi-p2", "macos", "linux"]);
+    json["capabilities"] = serde_json::json!(["verify", "render", "plan-command", "observe"]);
+
+    let manifest = PluginManifest::from_json_value(json).expect("合法 manifest");
+    let payload: serde_json::Value =
+        serde_json::from_slice(&manifest.signing_payload().expect("payload 必须可序列化"))
+            .expect("payload 是 JSON");
+
+    assert_eq!(
+        payload["targets"],
+        serde_json::json!(["linux", "macos", "wasi-p2", "windows"])
+    );
+    assert_eq!(
+        payload["capabilities"],
+        serde_json::json!(["observe", "plan-command", "render", "verify"])
+    );
+}
+
+#[test]
 fn manifest_rejects_unsafe_entrypoints_unknown_capabilities_and_incompatible_api() {
     for (field, value, code) in [
         (
@@ -189,6 +228,17 @@ fn manifest_rejects_bad_key_and_signature_shape() {
     bad_signature["signature"]["value"] =
         serde_json::json!(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([9u8; 63]));
     assert_error_code(bad_signature, "plugin.manifest.invalid_signature");
+}
+
+#[test]
+fn manifest_rejects_oversized_fixed_base64_values() {
+    let mut oversized_key = valid_manifest_json();
+    oversized_key["publisher"]["public_key"] = serde_json::json!("a".repeat(4_096));
+    assert_error_code(oversized_key, "plugin.manifest.invalid_signature");
+
+    let mut oversized_signature = valid_manifest_json();
+    oversized_signature["signature"]["value"] = serde_json::json!("a".repeat(4_096));
+    assert_error_code(oversized_signature, "plugin.manifest.invalid_signature");
 }
 
 #[test]
