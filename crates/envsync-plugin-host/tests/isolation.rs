@@ -4,12 +4,19 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+#[cfg(not(target_os = "macos"))]
+use std::time::{Duration, Instant};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use envsync_core::bundles::{publisher_fingerprint, publisher_namespace};
 use envsync_core::PublisherRegistry;
 use envsync_crypto::device::DeviceKeypair;
 use envsync_domain::{Arch, DeviceProfile, Os};
+#[cfg(not(target_os = "macos"))]
+use envsync_plugin_api::{
+    encode_frame, PluginMethod, RequestId, RpcMessage, RpcRequest, SchemaVersion,
+};
 use envsync_plugin_api::{PluginId, PluginManifest};
 use envsync_plugin_host::{
     ApprovalGap, HostError, PluginArtifact, PluginHost, PluginState, PLUGIN_SIGNATURE_DOMAIN,
@@ -46,6 +53,17 @@ impl Fixture {
             .expect("host roots")
     }
 
+    fn test_host(&self, registry: PublisherRegistry, runner: &Path) -> PluginHost {
+        let root = self.temp.path().canonicalize().expect("canonical tempdir");
+        PluginHost::for_test_runner(
+            root.join("quarantine"),
+            root.join("runtime"),
+            registry,
+            runner,
+        )
+        .expect("test host roots")
+    }
+
     fn artifact(&self, id: &str, bytes: &[u8], capabilities: &[&str]) -> PluginArtifact {
         artifact_signed_by(&self.signer, &self.signer, id, bytes, capabilities)
     }
@@ -71,7 +89,7 @@ fn artifact_signed_by(
         "capabilities": capabilities,
         "limits": {
             "max_runtime_ms": 1000,
-            "max_memory_bytes": 1048576,
+            "max_memory_bytes": 67108864,
             "max_output_bytes": 1024
         },
         "signature": { "algorithm": "ed25519", "value": URL_SAFE_NO_PAD.encode([0_u8; 64]) }
@@ -108,6 +126,30 @@ fn policy(decision: Decision) -> PolicySet {
         ]),
     )])
     .expect("policy")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn runner_path() -> &'static Path {
+    Path::new(env!("CARGO_BIN_EXE_envsync-plugin-runner"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn environment_check_script(request_id: &str) -> Vec<u8> {
+    let response = RpcMessage::new_success_response(
+        SchemaVersion::new(1, 0),
+        RequestId::parse(request_id).expect("request id"),
+        serde_json::json!({ "canary_visible": false, "cwd_empty": true }),
+    )
+    .expect("response");
+    let escaped_frame = encode_frame(&response)
+        .expect("frame")
+        .iter()
+        .map(|byte| format!("\\{byte:03o}"))
+        .collect::<String>();
+    format!(
+        "#!/bin/sh\nif [ -n \"${{ENVSYNC_PLUGIN_SECRET_CANARY+x}}\" ]; then exit 42; fi\nif [ -n \"$(/bin/ls -A)\" ]; then exit 43; fi\nprintf '%b' '{escaped_frame}'\n"
+    )
+    .into_bytes()
 }
 
 #[test]
@@ -318,6 +360,219 @@ fn default_host_refuses_to_create_an_executable_runtime() {
 }
 
 #[test]
+fn test_support_host_enables_a_verified_approved_entrypoint() {
+    let fixture = Fixture::new();
+    let runner = fixture.temp.path().join("runner");
+    let mut host = fixture.test_host(fixture.registry(), &runner);
+    let id = PluginId::parse("com.example.test-runner").expect("id");
+    let device = profile();
+    let allow = policy(Decision::Allow);
+
+    host.quarantine(
+        fixture.artifact(id.as_str(), b"#!/bin/sh\nexit 0\n", &["observe"]),
+        NOW,
+    )
+    .expect("quarantine");
+    let approval = host
+        .approve(&id, "work", &device, &allow, true, NOW + 1)
+        .expect("approve");
+
+    host.enable(&id, &approval, "work", &device, &allow, true, NOW + 2)
+        .expect("test-only launcher can enable a verified entrypoint");
+
+    assert_eq!(
+        host.record(&id).expect("record").state(),
+        PluginState::Enabled
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn test_runner_clears_environment_uses_empty_cwd_and_correlates_response() {
+    let fixture = Fixture::new();
+    let mut host = fixture.test_host(fixture.registry(), runner_path());
+    let id = PluginId::parse("com.example.environment").expect("id");
+    let device = profile();
+    let allow = policy(Decision::Allow);
+    let request = RpcRequest::new(
+        SchemaVersion::new(1, 0),
+        RequestId::parse("environment_check").expect("request id"),
+        PluginMethod::Observe,
+        serde_json::json!({}),
+    )
+    .expect("request");
+
+    host.quarantine(
+        fixture.artifact(
+            id.as_str(),
+            &environment_check_script(request.id().as_str()),
+            &["observe"],
+        ),
+        NOW,
+    )
+    .expect("quarantine");
+    let approval = host
+        .approve(&id, "work", &device, &allow, true, NOW + 1)
+        .expect("approve");
+    host.enable(&id, &approval, "work", &device, &allow, true, NOW + 2)
+        .expect("enable");
+
+    std::env::set_var("ENVSYNC_PLUGIN_SECRET_CANARY", "must-not-reach-plugin");
+    let mut session = host.start(&id, NOW + 3).expect("start test runner");
+    let response = session.call(request).expect("correlated response");
+    std::env::remove_var("ENVSYNC_PLUGIN_SECRET_CANARY");
+
+    assert_eq!(
+        response.result().expect("success result"),
+        &serde_json::json!({ "canary_visible": false, "cwd_empty": true })
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn test_runner_fails_closed_when_darwin_rejects_rlimit_as() {
+    let fixture = Fixture::new();
+    let runner = fixture.temp.path().join("runner");
+    let mut host = fixture.test_host(fixture.registry(), &runner);
+    let id = PluginId::parse("com.example.darwin-runner").expect("id");
+    let device = profile();
+    let allow = policy(Decision::Allow);
+
+    host.quarantine(
+        fixture.artifact(id.as_str(), b"#!/bin/sh\nexit 0\n", &["observe"]),
+        NOW,
+    )
+    .expect("quarantine");
+    let approval = host
+        .approve(&id, "work", &device, &allow, true, NOW + 1)
+        .expect("approve");
+    host.enable(&id, &approval, "work", &device, &allow, true, NOW + 2)
+        .expect("enable");
+
+    let error = match host.start(&id, NOW + 3) {
+        Ok(_) => panic!("Darwin must not run without a verifiable address-space limit"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), "plugin.host.sandbox_unavailable");
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn test_runner_times_out_and_terminates_a_looping_process_group() {
+    let fixture = Fixture::new();
+    let mut host = fixture.test_host(fixture.registry(), runner_path());
+    let id = PluginId::parse("com.example.loop").expect("id");
+    let device = profile();
+    let allow = policy(Decision::Allow);
+    let request = RpcRequest::new(
+        SchemaVersion::new(1, 0),
+        RequestId::parse("loop_request").expect("request id"),
+        PluginMethod::Observe,
+        serde_json::json!({}),
+    )
+    .expect("request");
+
+    host.quarantine(
+        fixture.artifact(
+            id.as_str(),
+            b"#!/bin/sh\nwhile :; do :; done\n",
+            &["observe"],
+        ),
+        NOW,
+    )
+    .expect("quarantine");
+    let approval = host
+        .approve(&id, "work", &device, &allow, true, NOW + 1)
+        .expect("approve");
+    host.enable(&id, &approval, "work", &device, &allow, true, NOW + 2)
+        .expect("enable");
+
+    let mut session = host.start(&id, NOW + 3).expect("start runner");
+    let started = Instant::now();
+    let error = match session.call(request) {
+        Ok(_) => panic!("looping plugin must time out"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), "plugin.host.timeout");
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn test_runner_enforces_a_combined_stderr_output_limit_without_echoing_diagnostics() {
+    let fixture = Fixture::new();
+    let mut host = fixture.test_host(fixture.registry(), runner_path());
+    let id = PluginId::parse("com.example.stderr-flood").expect("id");
+    let device = profile();
+    let allow = policy(Decision::Allow);
+    let request = RpcRequest::new(
+        SchemaVersion::new(1, 0),
+        RequestId::parse("stderr_flood").expect("request id"),
+        PluginMethod::Observe,
+        serde_json::json!({}),
+    )
+    .expect("request");
+
+    host.quarantine(
+        fixture.artifact(
+            id.as_str(),
+            b"#!/bin/sh\nwhile :; do printf 'fixture-secret-stderr' >&2; done\n",
+            &["observe"],
+        ),
+        NOW,
+    )
+    .expect("quarantine");
+    let approval = host
+        .approve(&id, "work", &device, &allow, true, NOW + 1)
+        .expect("approve");
+    host.enable(&id, &approval, "work", &device, &allow, true, NOW + 2)
+        .expect("enable");
+
+    let mut session = host.start(&id, NOW + 3).expect("start runner");
+    let error = match session.call(request) {
+        Ok(_) => panic!("stderr flood must exceed the combined output limit"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), "plugin.host.output_limit");
+    assert!(!error.to_string().contains("fixture-secret-stderr"));
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn test_runner_shutdown_times_out_when_plugin_ignores_the_request() {
+    let fixture = Fixture::new();
+    let mut host = fixture.test_host(fixture.registry(), runner_path());
+    let id = PluginId::parse("com.example.ignore-shutdown").expect("id");
+    let device = profile();
+    let allow = policy(Decision::Allow);
+
+    host.quarantine(
+        fixture.artifact(
+            id.as_str(),
+            b"#!/bin/sh\nwhile :; do :; done\n",
+            &["observe"],
+        ),
+        NOW,
+    )
+    .expect("quarantine");
+    let approval = host
+        .approve(&id, "work", &device, &allow, true, NOW + 1)
+        .expect("approve");
+    host.enable(&id, &approval, "work", &device, &allow, true, NOW + 2)
+        .expect("enable");
+
+    let mut session = host.start(&id, NOW + 3).expect("start runner");
+    let error = match session.shutdown() {
+        Ok(()) => panic!("plugin that ignores shutdown must be terminated"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.code(), "plugin.host.shutdown_timeout");
+}
+
+#[test]
 fn approval_cannot_cross_the_actual_device_profile() {
     let fixture = Fixture::new();
     let mut host = fixture.host(fixture.registry());
@@ -505,4 +760,33 @@ fn quarantine_publisher_revocation_disables_records_and_retains_audit() {
         host.record(&id).expect("record").signer_fingerprint(),
         publisher_fingerprint(&signer)
     );
+}
+
+#[test]
+fn revoked_plugin_cannot_be_replaced_by_a_resubmitted_artifact() {
+    let fixture = Fixture::new();
+    let mut host = fixture.host(fixture.registry());
+    let id = PluginId::parse("com.example.revoked-resubmission").expect("id");
+
+    host.quarantine(
+        fixture.artifact(id.as_str(), b"original", &["observe"]),
+        NOW,
+    )
+    .expect("quarantine");
+    host.revoke_publisher(fixture.signer.public().ed25519, NOW + 1);
+    let audit_before = host.audit_for(&id).len();
+
+    let record = host
+        .quarantine(
+            fixture.artifact(id.as_str(), b"resubmitted", &["observe"]),
+            NOW + 2,
+        )
+        .expect("revoked record remains addressable");
+
+    assert_eq!(record.state(), PluginState::Revoked);
+    assert_eq!(
+        host.record(&id).expect("record").state(),
+        PluginState::Revoked
+    );
+    assert_eq!(host.audit_for(&id).len(), audit_before);
 }

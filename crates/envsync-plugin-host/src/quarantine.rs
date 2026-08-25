@@ -26,6 +26,8 @@ use envsync_crypto::device::{verify, DevicePublic, Signature};
 use envsync_domain::cbor::CborCodec;
 use envsync_domain::id::Digest32;
 use envsync_domain::{DeviceProfile, Risk};
+#[cfg(all(feature = "test-support", not(target_os = "macos")))]
+use envsync_plugin_api::ResourceLimits;
 use envsync_plugin_api::{PluginCapability, PluginId, PluginManifest, PluginManifestError};
 use envsync_policy::{Decision, Operation, PolicyFacts, PolicySet, ResourceKind};
 
@@ -39,6 +41,8 @@ const PLUGIN_MANIFEST_DIGEST_DOMAIN: &str = "envsync:plugin-manifest:v1";
 const PLUGIN_PROFILE_DIGEST_DOMAIN: &str = "envsync:plugin-profile:v1";
 const QUARANTINE_DIR_MODE: u32 = 0o700;
 const QUARANTINE_FILE_MODE: u32 = 0o600;
+#[cfg(feature = "test-support")]
+const RUNTIME_FILE_MODE: u32 = 0o700;
 
 /// 插件在 Host 上的生命周期状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +106,10 @@ pub struct PluginRecord {
     artifact_digest: [u8; 32],
     signer: [u8; 32],
     capabilities: BTreeSet<PluginCapability>,
+    #[cfg(feature = "test-support")]
+    entrypoint: String,
+    #[cfg(all(feature = "test-support", not(target_os = "macos")))]
+    limits: ResourceLimits,
     state: PluginState,
     quarantined_entry: Option<PathBuf>,
     quarantine_relative: Option<PathBuf>,
@@ -294,6 +302,21 @@ pub enum HostError {
     /// 当前 Host 没有可验证的 sandbox runner，不能执行插件。
     #[error("当前 Host 没有可验证的插件 sandbox")]
     SandboxUnavailable,
+    /// runner 返回了不属于当前请求的消息，或消息不是 response。
+    #[error("插件 runner 协议无效")]
+    Protocol,
+    /// 插件没有在 manifest 声明的运行时限内完成当前请求。
+    #[error("插件请求超时")]
+    Timeout,
+    /// stdout 和 stderr 的合计字节数超过 manifest 上限。
+    #[error("插件输出超出限制")]
+    OutputLimit,
+    /// 插件进程在完成当前操作前终止。
+    #[error("插件进程提前终止")]
+    ProcessExited,
+    /// 插件未在 shutdown 宽限期内退出。
+    #[error("插件关闭超时")]
+    ShutdownTimeout,
     /// staging 后的入口字节与已签名摘要不一致。
     #[error("插件入口制品摘要不匹配")]
     ArtifactTampered,
@@ -324,6 +347,11 @@ impl HostError {
             Self::PolicyDenied => "plugin.host.policy_denied",
             Self::ConfirmationRequired => "plugin.host.confirmation_required",
             Self::SandboxUnavailable => "plugin.host.sandbox_unavailable",
+            Self::Protocol => "plugin.host.protocol",
+            Self::Timeout => "plugin.host.timeout",
+            Self::OutputLimit => "plugin.host.output_limit",
+            Self::ProcessExited => "plugin.host.process_exited",
+            Self::ShutdownTimeout => "plugin.host.shutdown_timeout",
             Self::ArtifactTampered => "plugin.host.artifact_tampered",
             Self::UnsafePath => "plugin.host.unsafe_path",
             Self::AlreadyStaged => "plugin.host.already_staged",
@@ -331,7 +359,7 @@ impl HostError {
         }
     }
 
-    fn io(operation: &'static str, error: &std::io::Error) -> Self {
+    pub(crate) fn io(operation: &'static str, error: &std::io::Error) -> Self {
         Self::Io {
             operation,
             kind: error.kind(),
@@ -342,6 +370,10 @@ impl HostError {
 /// 受 Host 控制的插件隔离仓和生命周期。
 pub struct PluginHost {
     quarantine_root: HostRoot,
+    #[cfg(feature = "test-support")]
+    runtime_root: HostRoot,
+    #[cfg(feature = "test-support")]
+    test_runner: PathBuf,
     publishers: PublisherRegistry,
     records: BTreeMap<PluginId, PluginRecord>,
     audit: BTreeMap<PluginId, Vec<PluginAuditEvent>>,
@@ -361,9 +393,40 @@ impl PluginHost {
         let quarantine_root = open_root(quarantine_root.as_ref())?;
         // runtime 根仍由 Host 在打开时创建并验证；普通构建不保留其路径，也不会生成
         // 可执行入口。受控 runner 在后续任务中以私有字段重新接管该目录。
-        let _ = open_root(runtime_root.as_ref())?;
+        let runtime_root = open_root(runtime_root.as_ref())?;
+        #[cfg(not(feature = "test-support"))]
+        let _ = runtime_root;
         Ok(Self {
             quarantine_root,
+            #[cfg(feature = "test-support")]
+            runtime_root,
+            #[cfg(feature = "test-support")]
+            test_runner: PathBuf::new(),
+            publishers,
+            records: BTreeMap::new(),
+            audit: BTreeMap::new(),
+        })
+    }
+
+    /// 创建只供集成测试使用的受控 launcher Host。
+    ///
+    /// 此构造器只在 `test-support` feature 中可见；它不代表生产 OS sandbox，也不会由
+    /// 默认构建导出。runner 必须是绝对路径，实际启动协议由后续 session API 负责。
+    #[cfg(feature = "test-support")]
+    pub fn for_test_runner(
+        quarantine_root: impl AsRef<Path>,
+        runtime_root: impl AsRef<Path>,
+        publishers: PublisherRegistry,
+        runner: impl AsRef<Path>,
+    ) -> Result<Self, HostError> {
+        let runner = runner.as_ref();
+        if !runner.is_absolute() {
+            return Err(HostError::UnsafePath);
+        }
+        Ok(Self {
+            quarantine_root: open_root(quarantine_root.as_ref())?,
+            runtime_root: open_root(runtime_root.as_ref())?,
+            test_runner: runner.to_path_buf(),
             publishers,
             records: BTreeMap::new(),
             audit: BTreeMap::new(),
@@ -380,6 +443,15 @@ impl PluginHost {
         now_unix_ms: u64,
     ) -> Result<PluginRecord, HostError> {
         let id = artifact.manifest.id().clone();
+        // 发布者撤销是不可自动恢复的降级。即使随后收到同一 ID 的新制品，也不能用
+        // `Blocked` 或 `Quarantined` 覆盖既有 `Revoked` 记录、触发写盘或伪造新迁移。
+        if let Some(record) = self
+            .records
+            .get(&id)
+            .filter(|record| record.state == PluginState::Revoked)
+        {
+            return Ok(record.clone());
+        }
         let record = match self.verify_artifact(&artifact)? {
             Verification::Blocked => self.blocked_record(&artifact)?,
             Verification::Trusted {
@@ -393,6 +465,10 @@ impl PluginHost {
                     artifact_digest,
                     signer: artifact.manifest.publisher().public_key,
                     capabilities: artifact.manifest.capabilities().clone(),
+                    #[cfg(feature = "test-support")]
+                    entrypoint: artifact.manifest.entrypoint().as_str().to_owned(),
+                    #[cfg(all(feature = "test-support", not(target_os = "macos")))]
+                    limits: *artifact.manifest.limits(),
                     state: PluginState::Quarantined,
                     quarantined_entry: Some(staged_entry.display_path),
                     quarantine_relative: Some(staged_entry.relative_path),
@@ -483,9 +559,73 @@ impl PluginHost {
             return Err(HostError::ArtifactTampered);
         }
 
+        #[cfg(feature = "test-support")]
+        if !self.test_runner.as_os_str().is_empty() {
+            self.stage_runtime_entry(&record, &entrypoint)?;
+            self.set_state(id, PluginState::Enabled, now_unix_ms)?;
+            return Ok(());
+        }
+
         // 普通构建没有可验证的 OS sandbox，因此即使制品已经通过批准，也绝不能把
         // runtime 入口写成可执行文件。Task 10.3 的 test-only runner 会在真正启动前
         // 再做一次摘要核验并以受控环境运行它。
+        Err(HostError::SandboxUnavailable)
+    }
+
+    /// 从 test-only runtime 启动已启用插件的受控 RPC 会话。
+    ///
+    /// 此 API 只在 `test-support` feature 中导出。每次启动前都会经由已打开的 runtime
+    /// 根重新读取入口并复核摘要；普通 `PluginHost::open()` 没有 runner 路径，仍然返回
+    /// `SandboxUnavailable`。
+    #[cfg(all(feature = "test-support", unix, not(target_os = "macos")))]
+    pub fn start(
+        &mut self,
+        id: &PluginId,
+        now_unix_ms: u64,
+    ) -> Result<crate::process::PluginSession, HostError> {
+        if self.test_runner.as_os_str().is_empty() {
+            return Err(HostError::SandboxUnavailable);
+        }
+        let record = self
+            .records
+            .get(id)
+            .cloned()
+            .ok_or(HostError::UnknownPlugin)?;
+        if record.state != PluginState::Enabled {
+            return Err(HostError::InvalidState);
+        }
+        if self.publishers.status(&record.signer) != PublisherStatus::Trusted {
+            self.set_state(id, PluginState::Blocked, now_unix_ms)?;
+            return Err(HostError::ArtifactTampered);
+        }
+        let entrypoint = match self.read_runtime_entry(&record) {
+            Ok(entrypoint) => entrypoint,
+            Err(error) => {
+                self.set_state(id, PluginState::Blocked, now_unix_ms)?;
+                return Err(error);
+            }
+        };
+        if artifact_digest(&entrypoint) != record.artifact_digest {
+            self.set_state(id, PluginState::Blocked, now_unix_ms)?;
+            return Err(HostError::ArtifactTampered);
+        }
+        crate::process::PluginSession::spawn(
+            &self.test_runner,
+            &self.runtime_entry_path(&record),
+            record.limits,
+        )
+    }
+
+    /// macOS 和非 Unix test-support 构建没有可验证的 `RLIMIT_AS` runner。
+    ///
+    /// Darwin 拒绝设置 `RLIMIT_AS`，不能把无内存上限的 launcher 伪装成受限 runner；因此
+    /// 这里和非 Unix 平台一样 fail closed。
+    #[cfg(all(feature = "test-support", any(not(unix), target_os = "macos")))]
+    pub fn start(
+        &mut self,
+        _: &PluginId,
+        _: u64,
+    ) -> Result<crate::process::PluginSession, HostError> {
         Err(HostError::SandboxUnavailable)
     }
 
@@ -561,6 +701,10 @@ impl PluginHost {
             artifact_digest: artifact_digest(&artifact.entrypoint),
             signer: artifact.manifest.publisher().public_key,
             capabilities: artifact.manifest.capabilities().clone(),
+            #[cfg(feature = "test-support")]
+            entrypoint: artifact.manifest.entrypoint().as_str().to_owned(),
+            #[cfg(all(feature = "test-support", not(target_os = "macos")))]
+            limits: *artifact.manifest.limits(),
             state: PluginState::Blocked,
             quarantined_entry: None,
             quarantine_relative: None,
@@ -598,6 +742,42 @@ impl PluginHost {
             .as_deref()
             .ok_or(HostError::InvalidState)?;
         read_entry(&self.quarantine_root, relative)
+    }
+
+    #[cfg(feature = "test-support")]
+    fn stage_runtime_entry(
+        &self,
+        record: &PluginRecord,
+        entrypoint: &[u8],
+    ) -> Result<(), HostError> {
+        let directory =
+            create_artifact_dir(&self.runtime_root, &record.id, record.manifest_digest)?;
+        write_entry(
+            &directory,
+            &record.entrypoint,
+            entrypoint,
+            RUNTIME_FILE_MODE,
+        )?;
+        Ok(())
+    }
+
+    #[cfg(all(feature = "test-support", not(target_os = "macos")))]
+    fn runtime_relative_path(&self, record: &PluginRecord) -> PathBuf {
+        PathBuf::from(record.id.as_str())
+            .join(record.manifest_digest.to_hex())
+            .join(&record.entrypoint)
+    }
+
+    #[cfg(all(feature = "test-support", not(target_os = "macos")))]
+    fn read_runtime_entry(&self, record: &PluginRecord) -> Result<Vec<u8>, HostError> {
+        read_entry(&self.runtime_root, &self.runtime_relative_path(record))
+    }
+
+    #[cfg(all(feature = "test-support", unix, not(target_os = "macos")))]
+    fn runtime_entry_path(&self, record: &PluginRecord) -> PathBuf {
+        self.runtime_root
+            .display_path
+            .join(self.runtime_relative_path(record))
     }
 
     fn enforce_policy(
