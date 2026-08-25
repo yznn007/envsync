@@ -26,7 +26,7 @@ use envsync_crypto::device::{verify, DevicePublic, Signature};
 use envsync_domain::cbor::CborCodec;
 use envsync_domain::id::Digest32;
 use envsync_domain::{DeviceProfile, Risk};
-#[cfg(all(feature = "test-support", not(target_os = "macos")))]
+#[cfg(all(feature = "test-support", unix, not(target_os = "macos")))]
 use envsync_plugin_api::ResourceLimits;
 use envsync_plugin_api::{PluginCapability, PluginId, PluginManifest, PluginManifestError};
 use envsync_policy::{Decision, Operation, PolicyFacts, PolicySet, ResourceKind};
@@ -108,7 +108,7 @@ pub struct PluginRecord {
     capabilities: BTreeSet<PluginCapability>,
     #[cfg(feature = "test-support")]
     entrypoint: String,
-    #[cfg(all(feature = "test-support", not(target_os = "macos")))]
+    #[cfg(all(feature = "test-support", unix, not(target_os = "macos")))]
     limits: ResourceLimits,
     state: PluginState,
     quarantined_entry: Option<PathBuf>,
@@ -467,7 +467,7 @@ impl PluginHost {
                     capabilities: artifact.manifest.capabilities().clone(),
                     #[cfg(feature = "test-support")]
                     entrypoint: artifact.manifest.entrypoint().as_str().to_owned(),
-                    #[cfg(all(feature = "test-support", not(target_os = "macos")))]
+                    #[cfg(all(feature = "test-support", unix, not(target_os = "macos")))]
                     limits: *artifact.manifest.limits(),
                     state: PluginState::Quarantined,
                     quarantined_entry: Some(staged_entry.display_path),
@@ -703,7 +703,7 @@ impl PluginHost {
             capabilities: artifact.manifest.capabilities().clone(),
             #[cfg(feature = "test-support")]
             entrypoint: artifact.manifest.entrypoint().as_str().to_owned(),
-            #[cfg(all(feature = "test-support", not(target_os = "macos")))]
+            #[cfg(all(feature = "test-support", unix, not(target_os = "macos")))]
             limits: *artifact.manifest.limits(),
             state: PluginState::Blocked,
             quarantined_entry: None,
@@ -761,14 +761,14 @@ impl PluginHost {
         Ok(())
     }
 
-    #[cfg(all(feature = "test-support", not(target_os = "macos")))]
+    #[cfg(all(feature = "test-support", unix, not(target_os = "macos")))]
     fn runtime_relative_path(&self, record: &PluginRecord) -> PathBuf {
         PathBuf::from(record.id.as_str())
             .join(record.manifest_digest.to_hex())
             .join(&record.entrypoint)
     }
 
-    #[cfg(all(feature = "test-support", not(target_os = "macos")))]
+    #[cfg(all(feature = "test-support", unix, not(target_os = "macos")))]
     fn read_runtime_entry(&self, record: &PluginRecord) -> Result<Vec<u8>, HostError> {
         read_entry(&self.runtime_root, &self.runtime_relative_path(record))
     }

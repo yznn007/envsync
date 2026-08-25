@@ -287,7 +287,7 @@ enum ProcessEvent {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 impl ProcessEvent {
-    const fn error(self) -> HostError {
+    fn error(self) -> HostError {
         match self {
             Self::Frame(_) | Self::Protocol => HostError::Protocol,
             Self::OutputLimit => HostError::OutputLimit,
@@ -401,8 +401,11 @@ fn spawn_stdout_reader(
         let mut reader = BudgetedReader::new(stdout, budget.clone());
         loop {
             match read_frame(&mut reader) {
-                Ok(message) if send_event(&sender, ProcessEvent::Frame(message)) => {}
-                Ok(_) => return,
+                Ok(message) => {
+                    if !send_event(&sender, ProcessEvent::Frame(message)) {
+                        return;
+                    }
+                }
                 Err(error) => {
                     let event = if budget.exceeded() {
                         ProcessEvent::OutputLimit
