@@ -38,6 +38,34 @@ pub enum ApplyOutcome {
     },
 }
 
+/// 在不破坏事务边界的安全点查询取消状态。
+///
+/// 取消只会在 preflight 完成前或发布前被采纳。一旦后端 Ref 已发布，继续收敛或执行显式
+/// 回滚才是安全路径；此时绝不能通过杀线程把 journal 留在不可信的半状态。
+pub trait ApplyCancellation {
+    /// 是否已经请求取消当前 operation。
+    fn is_cancelled(&self) -> bool;
+
+    /// 原子地关闭取消窗口。
+    ///
+    /// 返回 `true` 表示调用方已独占不可逆边界，可以继续发布或写入本地文件；返回 `false`
+    /// 表示取消请求与关闭窗口发生了竞争，事务必须中止。默认实现适用于同步、不可取消的
+    /// 调用方；可取消宿主必须提供线性化实现，避免“UI 显示已取消但 CAS 已发生”的竞态。
+    fn close_cancellation_window(&self) -> bool {
+        true
+    }
+}
+
+/// 默认的不可取消实现，供 CLI 等同步调用使用。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NeverCancelled;
+
+impl ApplyCancellation for NeverCancelled {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
 /// 应用引擎。
 pub struct ApplyEngine<'a> {
     backend: &'a dyn Backend,
@@ -64,6 +92,36 @@ impl<'a> ApplyEngine<'a> {
 
     /// 应用计划。
     pub fn apply(&mut self, plan: &Plan) -> CoreResult<ApplyOutcome> {
+        self.apply_with_operation(plan, OperationId::generate(), &NeverCancelled)
+    }
+
+    /// 用调用方预先分配的 operation ID 应用计划。
+    ///
+    /// 桌面端在后台启动事务前生成该 ID，从而可以在完成前订阅事件或请求取消。被策略
+    /// 阻塞与 no-op 仍不登记 operation，保持既有 journal 语义。
+    pub fn apply_with_operation(
+        &mut self,
+        plan: &Plan,
+        operation: OperationId,
+        cancellation: &dyn ApplyCancellation,
+    ) -> CoreResult<ApplyOutcome> {
+        if let Some(outcome) = Self::register_operation(self.journal, plan, operation)? {
+            return Ok(outcome);
+        }
+        self.apply_registered(plan, operation, cancellation)
+    }
+
+    /// 登记一个将要执行的 operation。
+    ///
+    /// 返回 [`Some`] 仅表示该 Plan 是无需写入也无需发布的 no-op；其他成功情形都已经
+    /// 在 journal 中留下 `planned` 记录，调用方随后必须调用 [`Self::apply_registered`]
+    /// 或将该记录安全地中止。应用服务会利用这个拆分，在上传不可变对象前就把桌面端
+    /// 预先分配的 operation ID 写入 journal。
+    pub(crate) fn register_operation(
+        journal: &mut Journal,
+        plan: &Plan,
+        operation: OperationId,
+    ) -> CoreResult<Option<ApplyOutcome>> {
         // 阻塞诊断在**登记操作之前**拦截：被策略拒绝的计划不应该在日志里留下
         // 一条永远不会推进的操作记录。
         if plan.is_blocked() {
@@ -79,11 +137,29 @@ impl<'a> ApplyEngine<'a> {
 
         let publish = requires_publish(plan);
         if plan.actions.is_empty() && !publish {
-            return Ok(ApplyOutcome::NoOp);
+            return Ok(Some(ApplyOutcome::NoOp));
         }
 
-        let record = self.journal.begin(plan)?;
-        let operation = record.operation;
+        journal.begin_with_id(operation, plan)?;
+        Ok(None)
+    }
+
+    /// 推进已处于 `planned` 状态的 operation。
+    ///
+    /// 调用方必须刚刚通过 [`Self::register_operation`] 登记 `operation`，且在此期间没有
+    /// 对它做状态迁移。这个入口仅供 application service 在“登记 → 上传不可变对象 →
+    /// 预检/发布/落盘”的安全顺序中复用，避免 UI 线程持有服务实例或绕过 journal。
+    pub(crate) fn apply_registered(
+        &mut self,
+        plan: &Plan,
+        operation: OperationId,
+        cancellation: &dyn ApplyCancellation,
+    ) -> CoreResult<ApplyOutcome> {
+        let publish = requires_publish(plan);
+
+        if cancellation.is_cancelled() {
+            return self.cancel(operation);
+        }
 
         // ---- 阶段 1：Preflight ----------------------------------------------
         // 预检期间**不做任何写入**；任何一个动作不通过，后端 Ref 与本地文件均不变。
@@ -94,8 +170,15 @@ impl<'a> ApplyEngine<'a> {
                 return Err(err);
             }
         };
+        if cancellation.is_cancelled() {
+            return self.cancel(operation);
+        }
         self.journal
             .transition(operation, OperationState::Preflighted)?;
+
+        if cancellation.is_cancelled() || !cancellation.close_cancellation_window() {
+            return self.cancel(operation);
+        }
 
         // ---- 阶段 2：Publish -------------------------------------------------
         if publish {
@@ -240,13 +323,29 @@ impl<'a> ApplyEngine<'a> {
     }
 
     fn abort(&mut self, operation: OperationId, cause: &CoreError) -> CoreResult<()> {
-        self.journal.record_error(
+        Self::abort_registered(self.journal, operation, cause)
+    }
+
+    /// 以给定原因安全中止仍处于可中止边界的 operation。
+    pub(crate) fn abort_registered(
+        journal: &mut Journal,
+        operation: OperationId,
+        cause: &CoreError,
+    ) -> CoreResult<()> {
+        journal.transition_failed(
             operation,
+            OperationState::Aborted,
             &ErrorDetail::new(cause.code(), cause.to_string()),
         )?;
-        self.journal
-            .transition(operation, OperationState::Aborted)?;
         Ok(())
+    }
+
+    fn cancel(&mut self, operation: OperationId) -> CoreResult<ApplyOutcome> {
+        let error = CoreError::OperationCancelled {
+            operation: operation.to_string(),
+        };
+        self.abort(operation, &error)?;
+        Err(error)
     }
 
     fn record_action_failure(

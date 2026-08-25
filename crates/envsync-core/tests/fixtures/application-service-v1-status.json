@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "request_id": "req-status-golden-v1",
+  "status": "ok",
+  "data": {
+    "workspace": {
+      "id": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+      "device_id": "1111111111111111111111111111111111111111111111111111111111111111",
+      "backend_kind": "local"
+    },
+    "state": "clean",
+    "backend_reachable": true,
+    "last_known_revision_at_unix_ms": null,
+    "revision": 42,
+    "head": null,
+    "draft_head": null,
+    "resources": [
+      {
+        "resource": "shell/zsh/main",
+        "observed": "present",
+        "disposition": "managed",
+        "needs_action": false
+      }
+    ],
+    "unfinished_operations": [],
+    "pending_actions": 0,
+    "open_conflicts": 0
+  },
+  "diagnostics": [
+    {
+      "severity": "warning",
+      "code": "status.network_slow",
+      "resource": "shell/zsh/main"
+    }
+  ]
+}

@@ -30,6 +30,8 @@
 //! | [`last_known`] | 「上次成功读到的后端 Ref」的本地留存，供后端不可达时降级作答 |
 //! | [`offline`] | 后端联系不上时的占位实现：服务照常打开，只有真正需要远端的调用才失败 |
 //! | [`service`] | CLI 与桌面端共用的应用服务门面 |
+//! | [`view`] | 面向桌面端的脱敏 View 类型（M4） |
+//! | [`api`] | 版本化应用服务响应信封（M4） |
 //! | [`ports`] | 时钟、观察、文件变更三个端口抽象及其平台实现 |
 //! | [`error`] | 带稳定错误码的统一错误类型 |
 //!
@@ -39,6 +41,7 @@
 //! 应用阶段只做「把这些字节写到那个位置」。这条分工让「计划生成后文件被外部修改」
 //! 这一竞态可以被摘要比对完整捕获，而不需要在写入路径上再放一份业务逻辑。
 
+pub mod api;
 pub mod apply;
 pub mod attestation;
 pub mod bundles;
@@ -60,8 +63,14 @@ pub mod rotation;
 pub mod service;
 pub mod sync;
 pub mod vault;
+pub mod view;
 
-pub use apply::{ApplyEngine, ApplyOutcome};
+pub use api::{
+    ApiEvent, ApiRequest, ApiRequestId, ApiRequestIdError, ApiResponse, ApiResponseError,
+    ApiSchemaVersionError, ApiStatus, CancelOperationRequest, ViewData,
+    APPLICATION_SERVICE_SCHEMA_VERSION,
+};
+pub use apply::{ApplyCancellation, ApplyEngine, ApplyOutcome, NeverCancelled};
 pub use attestation::{
     sign_index_attestation, verify_index_attestation, AttestationError, ATTESTATION_ALGORITHM,
     ATTESTATION_ALGORITHM_NONE, VAULT_ATTESTATION_DOMAIN,
@@ -82,8 +91,9 @@ pub use config::{
 };
 pub use device_admin::{
     create_recovery, forget_device, init_device, invite, join, list_devices, load_device,
-    restore_recovery, DeviceInvitation, DeviceSummary, RecoveryOutcome, INVITATION_DEFAULT_TTL_MS,
-    INVITATION_SIGNATURE_DOMAIN,
+    restore_recovery, verify_gist_bootstrap_for_checkpoint, verify_gist_bootstrap_for_invitation,
+    DeviceInvitation, DeviceSummary, GistBootstrapTrust, RecoveryOutcome,
+    INVITATION_DEFAULT_TTL_MS, INVITATION_SIGNATURE_DOMAIN,
 };
 pub use error::{CoreError, CoreResult};
 pub use last_known::{
@@ -95,9 +105,9 @@ pub use membership::{
     verify_membership_chain, MembershipError, VerifiedHead, MEMBERSHIP_SIGNATURE_DOMAIN,
 };
 pub use merge::{
-    merge, merge_structured, merge_structured_with, merge_text, IniPolicy, MergeError, MergeInput,
-    MergeOptions, MergeProvenance, MergeResult, MultiValuePolicy, MAX_INPUT_BYTES, MAX_NODES,
-    MAX_PARSE_DEPTH,
+    merge, merge_structured, merge_structured_with, merge_text, validate_structured_document,
+    IniPolicy, MergeError, MergeInput, MergeOptions, MergeProvenance, MergeResult,
+    MultiValuePolicy, MAX_INPUT_BYTES, MAX_NODES, MAX_PARSE_DEPTH,
 };
 pub use offline::UnreachableBackend;
 pub use packages::{
@@ -128,4 +138,13 @@ pub use vault::{
     KeyRing, SecretInput, SecretMetadata, SecretRef, VaultDeps, VaultError, VaultHead, VaultIndex,
     VaultService, VAULT_ATTESTATION_METADATA_KEY, VAULT_INDEX_METADATA_KEY,
     WORKSPACE_METADATA_PREFIX,
+};
+pub use view::{
+    ApplyStartView, ApplyView, CancellationView, ConflictDetailView, ConflictListView,
+    ConflictResolutionView, ConflictView, DeviceListView, DeviceMetadataView, DeviceRevocationView,
+    DiffListView, DiffView, OperationActionView, OperationDetailView, OperationHistoryView,
+    OperationReceiptView, OperationStatusView, OperationView, PlanActionView, PlanView,
+    ResourceStatusView, RollbackActionView, RollbackReviewView, RootCapabilityView, StatusView,
+    VaultMetadataView, VaultSecretMetadataView, ViewDiagnostic, WorkspaceRegistrationView,
+    WorkspaceSummary,
 };

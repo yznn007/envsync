@@ -33,14 +33,22 @@
 //! 新设备**不信任**后端给的链头，它信任的是邀请里那个 genesis 对象标识：链必须从那个
 //! genesis 完整延伸到当前头，中间任何一环不合法都拒绝。
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
+use envsync_backend::gist_bundle::{
+    unpack as unpack_gist_bundle, GistBundleBootstrap, GistBundleError, GistBundleObject,
+    GistBundleVerifier, UnpackedGistBundle,
+};
 use envsync_crypto::device::{verify, DeviceKeypair, DevicePublic, Signature};
+use envsync_crypto::envelope::{open_envelope, KeyEnvelope};
 use envsync_crypto::recovery::{Argon2Params, RecoveryPackage, RecoveryPhrase};
-use envsync_crypto::suite::{KeyEpoch, Plaintext};
+use envsync_crypto::suite::{DataKey, KeyEpoch, Plaintext};
 use envsync_domain::cbor::{encode, CborCodec, CborError, Value};
 use envsync_domain::id::{DeviceId, Digest32, WorkspaceId};
-use envsync_domain::membership::{DevicePublicBytes, MemberRole, MembershipAction};
+use envsync_domain::membership::{
+    DevicePublicBytes, MemberRole, MembershipAction, MembershipEvent, MembershipState,
+};
 use envsync_domain::object::{ObjectId, ObjectKind};
 use envsync_platform::secure_store::{SecureKey, SecurePurpose, SecureStore};
 
@@ -175,6 +183,110 @@ impl CborCodec for DeviceInvitation {
             signature: Vec::<u8>::from_value(&items[12])?,
         })
     }
+}
+
+/// 经过邀请锚定验证、但尚未持久化的 Gist Bundle 当前纪元信任材料。
+///
+/// 它只由 [`verify_gist_bootstrap_for_invitation`] 构造。其内部 `DataKey` 不对调用方借出；
+/// 只能由 [`Self::unpack`] 用于同一份 bundle 的完整 digest、签名与 AEAD 验证。验证失败时
+/// 该对象连同候选密钥一起被销毁；只有成功时才会把 `DataKey` 随已验证 bundle 一起交出。
+pub struct GistBootstrapTrust {
+    workspace: WorkspaceId,
+    epoch: KeyEpoch,
+    data_key: DataKey,
+    trusted_signers: BTreeMap<DeviceId, DevicePublic>,
+}
+
+impl std::fmt::Debug for GistBootstrapTrust {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GistBootstrapTrust")
+            .field("workspace", &self.workspace)
+            .field("epoch", &self.epoch)
+            .field("trusted_signer_count", &self.trusted_signers.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl GistBootstrapTrust {
+    /// 已验证的工作区标识。
+    pub fn workspace(&self) -> WorkspaceId {
+        self.workspace
+    }
+
+    /// 已验证的当前密钥纪元。
+    pub fn epoch(&self) -> KeyEpoch {
+        self.epoch
+    }
+
+    /// 验证并解开同一份 Gist Bundle，成功时交出已认证对象与当前数据密钥。
+    ///
+    /// 这条方法消费 `self`，从类型上禁止在完整解包成功前把候选密钥用于其他对象或写入
+    /// 安全存储。返回的 `UnpackedGistBundle` 已通过 outer digest、成员链公钥验签、AEAD 认证
+    /// 和 Snapshot/Vault 完整闭包检查。
+    pub fn unpack(self, encoded: &str) -> Result<(UnpackedGistBundle, DataKey), GistBundleError> {
+        let unpacked = {
+            let verifier = GistBundleVerifier::from_m2(
+                Some(self.workspace),
+                Some(&self.data_key),
+                Some(self.epoch),
+                Some(self.trusted_signers.clone()),
+            )?;
+            unpack_gist_bundle(encoded, &verifier)?
+        };
+        Ok((unpacked, self.data_key))
+    }
+}
+
+/// 用设备邀请锚定并验证 Gist 外层 bootstrap，取得仅供一次完整解包使用的候选信任材料。
+///
+/// Gist 公开 bootstrap 不是信任根：它在本函数中必须提供从邀请里的 genesis 到当前头的
+/// 完整成员链，邀请签名必须与签发时的链锚点相符，而目标设备只能打开当前纪元中发给自己
+/// 的 HPKE 信封。返回值仍不可直接持久化；必须对同一 bundle 调用
+/// [`GistBootstrapTrust::unpack`]，它成功后才会一并交出已认证对象和可持久化的当前密钥。
+pub fn verify_gist_bootstrap_for_invitation(
+    invitation: &DeviceInvitation,
+    bootstrap: &GistBundleBootstrap,
+    device: &DeviceKeypair,
+    now_unix_ms: u64,
+) -> CoreResult<GistBootstrapTrust> {
+    if bootstrap.workspace != invitation.workspace {
+        return Err(gist_bootstrap_error("Gist 引导区属于另一个工作区"));
+    }
+
+    let (genesis, events) = gist_membership_chain(bootstrap, invitation.genesis)?;
+    let state = validate_invitation_chain(
+        invitation,
+        bootstrap.workspace,
+        device.device_id(),
+        now_unix_ms,
+        invitation.genesis,
+        &genesis,
+        &events,
+    )?;
+    gist_bootstrap_trust(bootstrap, state, device)
+}
+
+/// 用本地反回滚 checkpoint 锚定 Gist bootstrap，供已加入设备取得轮换后的当前纪元密钥。
+///
+/// 设备先用已验证 checkpoint 中的成员链摘要、sequence 和最小密钥纪元约束外层引导区；只有
+/// bootstrap 给出的链严格延续这个锚点、设备仍是当前成员并含有发给本机的当前信封时，才会
+/// 返回临时 [`GistBootstrapTrust`]。与邀请路径一样，返回值只能通过
+/// [`GistBootstrapTrust::unpack`] 用于同一份 bundle，成功后才会交出新纪元 `DataKey`。
+pub fn verify_gist_bootstrap_for_checkpoint(
+    checkpoint: &Checkpoint,
+    expected_genesis: ObjectId,
+    bootstrap: &GistBundleBootstrap,
+    device: &DeviceKeypair,
+) -> CoreResult<GistBootstrapTrust> {
+    if bootstrap.workspace != checkpoint.workspace {
+        return Err(gist_bootstrap_error("Gist 引导区属于另一个工作区"));
+    }
+    let (genesis, events) = gist_membership_chain(bootstrap, expected_genesis)?;
+    let state = membership::verify_membership_chain(&genesis, &events, bootstrap.workspace)
+        .map_err(|_| gist_bootstrap_error("Gist 引导成员链无效"))?;
+    validate_checkpoint_anchor(checkpoint, &genesis, &events, &state)?;
+    gist_bootstrap_trust(bootstrap, state, device)
 }
 
 /// 设备清单里的一行。
@@ -407,71 +519,84 @@ pub fn invite(
     Ok(invitation)
 }
 
-/// 用一份邀请加入工作区，并建立本机的初始反回滚检查点。
-///
-/// 检查顺序刻意是「便宜的先做」：格式 → 工作区 → 有效期 → 信任根 → 链验证 → 邀请签名
-/// → 自己是不是成员 → 打开信封 → 写检查点。任何一步失败都不会在本机留下痕迹。
-pub fn join(
-    deps: VaultDeps,
-    state_dir: &Path,
-    invitation: &DeviceInvitation,
-) -> CoreResult<VaultService> {
-    if invitation.format_version != INVITATION_FORMAT_VERSION {
-        return Err(VaultError::InvitationInvalid {
-            reason: "格式版本不受支持",
-        }
-        .into());
-    }
-    if invitation.workspace != deps.workspace {
-        return Err(VaultError::InvitationInvalid {
-            reason: "邀请属于另一个工作区",
-        }
-        .into());
-    }
-    let now = deps.clock.now_unix_ms();
-    if now > invitation.expires_at_unix_ms {
-        return Err(VaultError::InvitationInvalid {
-            reason: "邀请已过期",
-        }
-        .into());
-    }
-    let checkpoints = std::sync::Arc::clone(&deps.checkpoints);
-    let clock = std::sync::Arc::clone(&deps.clock);
-    let workspace = deps.workspace;
+fn invitation_error(reason: &'static str) -> CoreError {
+    VaultError::InvitationInvalid { reason }.into()
+}
 
-    let service = VaultService::open(deps, state_dir)?;
-    if service.device_id() != invitation.subject {
-        return Err(VaultError::InvitationInvalid {
-            reason: "邀请不是发给本设备的",
-        }
-        .into());
+fn gist_bootstrap_error(reason: &'static str) -> CoreError {
+    VaultError::GistBootstrapInvalid { reason }.into()
+}
+
+/// 校验一份邀请绑定的完整成员链，并返回当前链状态。
+///
+/// `genesis_object` 由调用方的可信对象目录或 Gist bootstrap 提供；它必须与邀请中的
+/// genesis 标识一致。签发者权限与签名在**邀请锚点**处验证，目标设备成员资格则必须在
+/// 当前链状态仍然有效：这样撤销目标设备会立即生效，而后来撤销签发管理员不会追溯性地
+/// 使其已经有效签发的邀请失效。
+fn validate_invitation_chain(
+    invitation: &DeviceInvitation,
+    workspace: WorkspaceId,
+    local_device: DeviceId,
+    now_unix_ms: u64,
+    genesis_object: ObjectId,
+    genesis: &MembershipEvent,
+    events: &[MembershipEvent],
+) -> CoreResult<MembershipState> {
+    if invitation.format_version != INVITATION_FORMAT_VERSION {
+        return Err(invitation_error("格式版本不受支持"));
     }
-    // 信任根：链必须从**邀请里写的那个 genesis** 延伸而来。后端声称的 genesis 不作数。
-    if service.genesis_object() != Some(invitation.genesis) {
-        return Err(VaultError::InvitationInvalid {
-            reason: "后端上的 genesis 与邀请中的信任根不符",
-        }
-        .into());
+    if invitation.workspace != workspace {
+        return Err(invitation_error("邀请属于另一个工作区"));
     }
-    // `VaultService::open` 已经从 genesis 完整回放并验证了整条链，这里只需要用验证结果
-    // 判断「签发者当时是不是管理员」。
-    let state = service.membership()?;
-    let inviter = state
+    if invitation.expires_at_unix_ms < invitation.created_at_unix_ms {
+        return Err(invitation_error("邀请有效期非法"));
+    }
+    if now_unix_ms > invitation.expires_at_unix_ms {
+        return Err(invitation_error("邀请已过期"));
+    }
+    if invitation.subject != local_device {
+        return Err(invitation_error("邀请不是发给本设备的"));
+    }
+    if genesis_object != invitation.genesis
+        || membership::membership_object_id(genesis) != genesis_object
+    {
+        return Err(invitation_error("后端上的 genesis 与邀请中的信任根不符"));
+    }
+
+    let state = membership::verify_membership_chain(genesis, events, workspace)
+        .map_err(|_| invitation_error("成员链无效"))?;
+    let anchor_count = usize::try_from(invitation.membership_sequence)
+        .map_err(|_| invitation_error("邀请成员链锚点非法"))?;
+    let anchor_event = if invitation.membership_sequence == 0 {
+        genesis
+    } else {
+        events
+            .get(anchor_count.saturating_sub(1))
+            .filter(|event| event.sequence == invitation.membership_sequence)
+            .ok_or_else(|| invitation_error("邀请成员链锚点不符"))?
+    };
+    if anchor_event.digest() != invitation.membership_head
+        || anchor_event.epoch != invitation.key_epoch
+    {
+        return Err(invitation_error("邀请成员链锚点不符"));
+    }
+    let anchor_state = membership::verify_membership_chain(
+        genesis,
+        events
+            .get(..anchor_count)
+            .ok_or_else(|| invitation_error("邀请成员链锚点不符"))?,
+        workspace,
+    )
+    .map_err(|_| invitation_error("成员链无效"))?;
+    let inviter = anchor_state
         .member(&invitation.inviter)
-        .ok_or(VaultError::InvitationInvalid {
-            reason: "邀请签发者不是当前成员",
-        })?;
+        .ok_or_else(|| invitation_error("邀请签发者不是锚点成员"))?;
     if !inviter.role.can_administer() {
-        return Err(VaultError::InvitationInvalid {
-            reason: "邀请签发者不是管理员",
-        }
-        .into());
+        return Err(invitation_error("邀请签发者在锚点不是管理员"));
     }
     let signature =
         <[u8; envsync_crypto::suite::SIGNATURE_LEN]>::try_from(invitation.signature.as_slice())
-            .map_err(|_| VaultError::InvitationInvalid {
-                reason: "签名长度不符",
-            })?;
+            .map_err(|_| invitation_error("签名长度不符"))?;
     verify(
         &DevicePublic {
             x25519: inviter.public.x25519(),
@@ -482,15 +607,175 @@ pub fn join(
         &invitation.signing_payload(),
         &Signature::from_bytes(signature),
     )
-    .map_err(|_| VaultError::InvitationInvalid {
-        reason: "邀请签名验证失败",
-    })?;
+    .map_err(|_| invitation_error("邀请签名验证失败"))?;
     if !state.contains(&invitation.subject) {
-        return Err(VaultError::InvitationInvalid {
-            reason: "本设备尚未被加入成员链",
-        }
-        .into());
+        return Err(invitation_error("本设备已不在当前成员链"));
     }
+    Ok(state)
+}
+
+fn gist_membership_chain(
+    bootstrap: &GistBundleBootstrap,
+    expected_genesis: ObjectId,
+) -> CoreResult<(MembershipEvent, Vec<MembershipEvent>)> {
+    if bootstrap.membership.is_empty() {
+        return Err(gist_bootstrap_error("Gist 引导区缺少成员链"));
+    }
+    let mut records = BTreeMap::new();
+    for object in &bootstrap.membership {
+        if !gist_object_matches(object, ObjectKind::MembershipEvent) {
+            return Err(gist_bootstrap_error("Gist 引导成员记录非法"));
+        }
+        let event = MembershipEvent::from_canonical_slice(&object.bytes)
+            .map_err(|_| gist_bootstrap_error("Gist 引导成员记录非法"))?;
+        if event.workspace != bootstrap.workspace
+            || membership::membership_object_id(&event) != object.id
+            || records.insert(object.id, event).is_some()
+        {
+            return Err(gist_bootstrap_error("Gist 引导成员记录非法"));
+        }
+    }
+    let genesis = records
+        .remove(&expected_genesis)
+        .ok_or_else(|| gist_bootstrap_error("Gist 引导区缺少信任根"))?;
+    let mut events = records.into_values().collect::<Vec<_>>();
+    events.sort_by_key(|event| event.sequence);
+    Ok((genesis, events))
+}
+
+fn gist_recipient_envelope(
+    bootstrap: &GistBundleBootstrap,
+    recipient: DeviceId,
+) -> CoreResult<KeyEnvelope> {
+    if bootstrap.envelopes.is_empty() {
+        return Err(gist_bootstrap_error("Gist 引导区缺少当前密钥信封"));
+    }
+    let mut ids = BTreeMap::new();
+    let mut selected = None;
+    for object in &bootstrap.envelopes {
+        if !gist_object_matches(object, ObjectKind::KeyEnvelope)
+            || ids.insert(object.id, ()).is_some()
+        {
+            return Err(gist_bootstrap_error("Gist 引导密钥信封非法"));
+        }
+        let envelope = KeyEnvelope::from_canonical_slice(&object.bytes)
+            .map_err(|_| gist_bootstrap_error("Gist 引导密钥信封非法"))?;
+        if envelope.workspace() != bootstrap.workspace || envelope.epoch() != bootstrap.epoch {
+            return Err(gist_bootstrap_error("Gist 引导密钥信封非法"));
+        }
+        if envelope.recipient() == recipient && selected.replace(envelope).is_some() {
+            return Err(gist_bootstrap_error("Gist 引导区存在重复的本机密钥信封"));
+        }
+    }
+    selected.ok_or_else(|| gist_bootstrap_error("Gist 引导区没有发给本设备的当前密钥信封"))
+}
+
+fn gist_object_matches(object: &GistBundleObject, expected_kind: ObjectKind) -> bool {
+    object.id.kind == expected_kind && object.id.verifies(&object.bytes)
+}
+
+fn validate_checkpoint_anchor(
+    checkpoint: &Checkpoint,
+    genesis: &MembershipEvent,
+    events: &[MembershipEvent],
+    state: &MembershipState,
+) -> CoreResult<()> {
+    let anchor_count = usize::try_from(checkpoint.membership_sequence)
+        .map_err(|_| gist_bootstrap_error("本地成员链锚点非法"))?;
+    let anchor_event = if checkpoint.membership_sequence == 0 {
+        genesis
+    } else {
+        events
+            .get(anchor_count.saturating_sub(1))
+            .filter(|event| event.sequence == checkpoint.membership_sequence)
+            .ok_or_else(|| gist_bootstrap_error("Gist 成员链未延续本地锚点"))?
+    };
+    if anchor_event.digest() != checkpoint.membership_digest {
+        return Err(gist_bootstrap_error("Gist 成员链与本地锚点分叉"));
+    }
+    if state.epoch < checkpoint.key_epoch {
+        return Err(gist_bootstrap_error("Gist 引导区回退了密钥纪元"));
+    }
+    Ok(())
+}
+
+fn gist_bootstrap_trust(
+    bootstrap: &GistBundleBootstrap,
+    state: MembershipState,
+    device: &DeviceKeypair,
+) -> CoreResult<GistBootstrapTrust> {
+    if state.epoch != bootstrap.epoch.get() {
+        return Err(gist_bootstrap_error("Gist 引导区密钥纪元与成员链不符"));
+    }
+    if !state.contains(&bootstrap.signer) {
+        return Err(gist_bootstrap_error("Gist Bundle 签名者不是当前成员"));
+    }
+    if !state.contains(&device.device_id()) {
+        return Err(gist_bootstrap_error("本设备不是当前成员"));
+    }
+
+    let envelope = gist_recipient_envelope(bootstrap, device.device_id())?;
+    let data_key = open_envelope(device, &envelope)
+        .map_err(|_| gist_bootstrap_error("Gist 引导密钥信封无效"))?;
+    let trusted_signers = state
+        .members
+        .iter()
+        .map(|(device, record)| {
+            (
+                *device,
+                DevicePublic {
+                    x25519: record.public.x25519(),
+                    ed25519: record.public.ed25519(),
+                },
+            )
+        })
+        .collect();
+
+    Ok(GistBootstrapTrust {
+        workspace: bootstrap.workspace,
+        epoch: bootstrap.epoch,
+        data_key,
+        trusted_signers,
+    })
+}
+
+/// 用一份邀请加入工作区，并建立本机的初始反回滚检查点。
+///
+/// 检查顺序刻意是「便宜的先做」：格式 → 工作区 → 有效期 → 信任根 → 链验证 → 邀请签名
+/// → 自己是不是成员 → 打开信封 → 写检查点。任何一步失败都不会在本机留下痕迹。
+pub fn join(
+    deps: VaultDeps,
+    state_dir: &Path,
+    invitation: &DeviceInvitation,
+) -> CoreResult<VaultService> {
+    if invitation.format_version != INVITATION_FORMAT_VERSION {
+        return Err(invitation_error("格式版本不受支持"));
+    }
+    if invitation.workspace != deps.workspace {
+        return Err(invitation_error("邀请属于另一个工作区"));
+    }
+    let now = deps.clock.now_unix_ms();
+    if invitation.expires_at_unix_ms < invitation.created_at_unix_ms {
+        return Err(invitation_error("邀请有效期非法"));
+    }
+    if now > invitation.expires_at_unix_ms {
+        return Err(invitation_error("邀请已过期"));
+    }
+    let checkpoints = std::sync::Arc::clone(&deps.checkpoints);
+    let clock = std::sync::Arc::clone(&deps.clock);
+    let workspace = deps.workspace;
+
+    let service = VaultService::open(deps, state_dir)?;
+    let genesis_object = service.genesis_object().ok_or(VaultError::NotInitialized)?;
+    let state = validate_invitation_chain(
+        invitation,
+        workspace,
+        service.device_id(),
+        now,
+        genesis_object,
+        service.genesis()?,
+        service.events(),
+    )?;
 
     // 拿到当前纪元的数据密钥。拿不到就说明管理员还没给本设备发信封，此时**不**建立
     // 检查点：一个读不了任何内容的信任根只会让后续操作以更难懂的方式失败。
@@ -604,7 +889,256 @@ pub fn restore_recovery(service: &VaultService, phrase_text: &str) -> CoreResult
 #[cfg(test)]
 mod tests {
     use super::*;
+    use envsync_backend::gist_bundle::{inspect_bootstrap, pack, GistBundleSigner};
+    use envsync_crypto::envelope::seal_envelope;
+    use envsync_crypto::vault::{VaultIndex, VAULT_INDEX_METADATA_KEY};
+    use envsync_domain::{SnapshotBody, SnapshotId, StateRoot, WorkspaceRef};
     use envsync_platform::InMemorySecureStore;
+
+    fn gist_bootstrap_fixture() -> (String, DeviceInvitation, DeviceKeypair, DataKey) {
+        let workspace = WorkspaceId::generate();
+        let admin = DeviceKeypair::generate().expect("生成管理员设备");
+        let subject = DeviceKeypair::generate().expect("生成被邀请设备");
+        let genesis = membership::create_genesis(&admin, workspace, 100).expect("生成 genesis");
+        let initial =
+            membership::verify_membership_chain(&genesis, &[], workspace).expect("验证 genesis");
+        let subject_public = subject.public();
+        let add_subject = membership::append(
+            &initial,
+            &admin,
+            MembershipAction::AddMember {
+                subject: subject.device_id(),
+                public: DevicePublicBytes::from_parts(
+                    subject_public.x25519,
+                    subject_public.ed25519,
+                ),
+                role: MemberRole::Member,
+            },
+            workspace,
+            101,
+        )
+        .expect("加入设备");
+        let state = membership::verify_membership_chain(
+            &genesis,
+            std::slice::from_ref(&add_subject),
+            workspace,
+        )
+        .expect("验证成员链");
+        let data_key = DataKey::generate().expect("生成数据密钥");
+        let recipient_envelope =
+            seal_envelope(&subject_public, workspace, KeyEpoch::INITIAL, &data_key)
+                .expect("生成收件信封");
+
+        let genesis_bytes = genesis.to_canonical_vec();
+        let genesis_id = membership::membership_object_id(&genesis);
+        let add_bytes = add_subject.to_canonical_vec();
+        let add_id = membership::membership_object_id(&add_subject);
+        let envelope_bytes = recipient_envelope.to_canonical_vec();
+        let envelope_id = ObjectId::for_bytes(ObjectKind::KeyEnvelope, &envelope_bytes);
+        let mut index = VaultIndex::empty(workspace, state.epoch);
+        index.membership = vec![genesis_id, add_id];
+        index.envelopes = vec![envelope_id];
+        let index_bytes = index.to_canonical_vec();
+        let index_id = ObjectId::for_bytes(ObjectKind::Blob, &index_bytes);
+        let root = StateRoot::empty();
+        let mut metadata = BTreeMap::new();
+        metadata.insert(VAULT_INDEX_METADATA_KEY.to_owned(), index_id.to_string());
+        let snapshot = SnapshotBody::new(
+            workspace,
+            Vec::new(),
+            root.id(),
+            admin.device_id(),
+            102,
+            metadata,
+        )
+        .expect("构造头快照");
+        let reference = WorkspaceRef::initial(workspace).advance(snapshot.id());
+        let encoded = pack(
+            &reference,
+            vec![
+                GistBundleObject::new(ObjectId::from(snapshot.id()), snapshot.to_canonical_vec()),
+                GistBundleObject::new(ObjectId::from(root.id()), root.to_canonical_vec()),
+                GistBundleObject::new(index_id, index_bytes),
+                GistBundleObject::new(genesis_id, genesis_bytes),
+                GistBundleObject::new(add_id, add_bytes),
+                GistBundleObject::new(envelope_id, envelope_bytes),
+            ],
+            &GistBundleSigner::from_m2(Some(&data_key), Some(KeyEpoch::INITIAL), Some(&admin))
+                .expect("构造 Bundle 签名器"),
+        )
+        .expect("打包 Gist Bundle");
+
+        let mut invitation = DeviceInvitation {
+            format_version: INVITATION_FORMAT_VERSION,
+            workspace,
+            inviter: admin.device_id(),
+            subject: subject.device_id(),
+            role: MemberRole::Member,
+            genesis: genesis_id,
+            membership_head: state.head,
+            membership_sequence: state.sequence,
+            key_epoch: state.epoch,
+            challenge: [7u8; INVITATION_CHALLENGE_LEN],
+            created_at_unix_ms: 102,
+            expires_at_unix_ms: 200,
+            signature: Vec::new(),
+        };
+        invitation.signature = admin
+            .sign(
+                INVITATION_SIGNATURE_DOMAIN,
+                workspace,
+                &invitation.signing_payload(),
+            )
+            .expect("签发邀请")
+            .as_bytes()
+            .to_vec();
+        (encoded, invitation, subject, data_key)
+    }
+
+    fn rotated_gist_bootstrap_fixture() -> (
+        String,
+        Checkpoint,
+        ObjectId,
+        DeviceKeypair,
+        DeviceKeypair,
+        DataKey,
+    ) {
+        let workspace = WorkspaceId::generate();
+        let admin = DeviceKeypair::generate().expect("生成管理员设备");
+        let survivor = DeviceKeypair::generate().expect("生成保留设备");
+        let revoked = DeviceKeypair::generate().expect("生成待撤销设备");
+        let genesis = membership::create_genesis(&admin, workspace, 100).expect("生成 genesis");
+        let initial =
+            membership::verify_membership_chain(&genesis, &[], workspace).expect("验证 genesis");
+        let survivor_public = survivor.public();
+        let add_survivor = membership::append(
+            &initial,
+            &admin,
+            MembershipAction::AddMember {
+                subject: survivor.device_id(),
+                public: DevicePublicBytes::from_parts(
+                    survivor_public.x25519,
+                    survivor_public.ed25519,
+                ),
+                role: MemberRole::Member,
+            },
+            workspace,
+            101,
+        )
+        .expect("加入保留设备");
+        let state_after_survivor = membership::verify_membership_chain(
+            &genesis,
+            std::slice::from_ref(&add_survivor),
+            workspace,
+        )
+        .expect("验证第一段成员链");
+        let revoked_public = revoked.public();
+        let add_revoked = membership::append(
+            &state_after_survivor,
+            &admin,
+            MembershipAction::AddMember {
+                subject: revoked.device_id(),
+                public: DevicePublicBytes::from_parts(
+                    revoked_public.x25519,
+                    revoked_public.ed25519,
+                ),
+                role: MemberRole::Member,
+            },
+            workspace,
+            102,
+        )
+        .expect("加入待撤销设备");
+        let state_before_revoke = membership::verify_membership_chain(
+            &genesis,
+            &[add_survivor.clone(), add_revoked.clone()],
+            workspace,
+        )
+        .expect("验证撤销前成员链");
+        let revoke = membership::append(
+            &state_before_revoke,
+            &admin,
+            MembershipAction::Revoke {
+                subject: revoked.device_id(),
+            },
+            workspace,
+            103,
+        )
+        .expect("撤销设备并推进纪元");
+        let events = vec![add_survivor.clone(), add_revoked.clone(), revoke.clone()];
+        let state = membership::verify_membership_chain(&genesis, &events, workspace)
+            .expect("验证当前成员链");
+        assert_eq!(state.epoch, 2);
+
+        let data_key = DataKey::generate().expect("生成轮换后的数据密钥");
+        let current_epoch = KeyEpoch::new(state.epoch);
+        let survivor_envelope =
+            seal_envelope(&survivor_public, workspace, current_epoch, &data_key)
+                .expect("给保留设备生成当前信封");
+        let envelope_bytes = survivor_envelope.to_canonical_vec();
+        let envelope_id = ObjectId::for_bytes(ObjectKind::KeyEnvelope, &envelope_bytes);
+        let genesis_id = membership::membership_object_id(&genesis);
+        let membership_records = vec![
+            (genesis_id, genesis.to_canonical_vec()),
+            (
+                membership::membership_object_id(&add_survivor),
+                add_survivor.to_canonical_vec(),
+            ),
+            (
+                membership::membership_object_id(&add_revoked),
+                add_revoked.to_canonical_vec(),
+            ),
+            (
+                membership::membership_object_id(&revoke),
+                revoke.to_canonical_vec(),
+            ),
+        ];
+        let mut index = VaultIndex::empty(workspace, state.epoch);
+        index.membership = membership_records.iter().map(|(id, _)| *id).collect();
+        index.envelopes = vec![envelope_id];
+        let index_bytes = index.to_canonical_vec();
+        let index_id = ObjectId::for_bytes(ObjectKind::Blob, &index_bytes);
+        let root = StateRoot::empty();
+        let mut metadata = BTreeMap::new();
+        metadata.insert(VAULT_INDEX_METADATA_KEY.to_owned(), index_id.to_string());
+        let snapshot = SnapshotBody::new(
+            workspace,
+            Vec::new(),
+            root.id(),
+            admin.device_id(),
+            104,
+            metadata,
+        )
+        .expect("构造轮换后的头快照");
+        let reference = WorkspaceRef::initial(workspace).advance(snapshot.id());
+        let mut objects = vec![
+            GistBundleObject::new(ObjectId::from(snapshot.id()), snapshot.to_canonical_vec()),
+            GistBundleObject::new(ObjectId::from(root.id()), root.to_canonical_vec()),
+            GistBundleObject::new(index_id, index_bytes),
+            GistBundleObject::new(envelope_id, envelope_bytes),
+        ];
+        objects.extend(
+            membership_records
+                .into_iter()
+                .map(|(id, bytes)| GistBundleObject::new(id, bytes)),
+        );
+        let encoded = pack(
+            &reference,
+            objects,
+            &GistBundleSigner::from_m2(Some(&data_key), Some(current_epoch), Some(&admin))
+                .expect("构造轮换后的 Bundle 签名器"),
+        )
+        .expect("打包轮换后的 Gist Bundle");
+        let checkpoint = Checkpoint {
+            workspace,
+            revision: 1,
+            snapshot: SnapshotId::of(b"pre-rotation-snapshot"),
+            membership_digest: state_after_survivor.head,
+            membership_sequence: state_after_survivor.sequence,
+            key_epoch: state_after_survivor.epoch,
+            updated_at_unix_ms: 102,
+        };
+        (encoded, checkpoint, genesis_id, survivor, revoked, data_key)
+    }
 
     #[test]
     fn init_device_is_idempotent_and_persists_both_keys() {
@@ -667,5 +1201,62 @@ mod tests {
         tampered.signature = vec![1u8; 64];
         assert_eq!(tampered.signing_payload(), invitation.signing_payload());
         assert_ne!(tampered.object_id(), invitation.object_id());
+    }
+
+    #[test]
+    fn gist_bootstrap_uses_the_invitation_anchor_before_adopting_the_current_key() {
+        let (encoded, invitation, subject, expected_key) = gist_bootstrap_fixture();
+        let bootstrap = inspect_bootstrap(&encoded).expect("读取未验证引导区");
+        let trust = verify_gist_bootstrap_for_invitation(&invitation, &bootstrap, &subject, 150)
+            .expect("邀请锚定验证成功");
+        assert_eq!(trust.workspace(), invitation.workspace);
+        assert_eq!(trust.epoch(), KeyEpoch::INITIAL);
+
+        let (unpacked, adopted_key) = trust
+            .unpack(&encoded)
+            .expect("完整 Bundle 通过验签、认证和闭包后才交出数据密钥");
+        assert_eq!(unpacked.reference.workspace, invitation.workspace);
+        assert!(adopted_key == expected_key);
+    }
+
+    #[test]
+    fn gist_bootstrap_rejects_a_chain_without_the_invitation_anchor() {
+        let (encoded, invitation, subject, _) = gist_bootstrap_fixture();
+        let mut bootstrap = inspect_bootstrap(&encoded).expect("读取未验证引导区");
+        bootstrap
+            .membership
+            .retain(|object| object.id != invitation.genesis);
+
+        let error = verify_gist_bootstrap_for_invitation(&invitation, &bootstrap, &subject, 150)
+            .expect_err("没有邀请信任根不得打开候选信封");
+        assert_eq!(error.code(), "vault.gist_bootstrap_invalid");
+    }
+
+    #[test]
+    fn gist_bootstrap_uses_a_checkpoint_to_adopt_a_rotated_epoch() {
+        let (encoded, checkpoint, genesis, survivor, _, expected_key) =
+            rotated_gist_bootstrap_fixture();
+        let bootstrap = inspect_bootstrap(&encoded).expect("读取未验证引导区");
+        let trust =
+            verify_gist_bootstrap_for_checkpoint(&checkpoint, genesis, &bootstrap, &survivor)
+                .expect("成员链严格延续 checkpoint 后可取得当前信封");
+        assert_eq!(trust.epoch(), KeyEpoch::new(2));
+
+        let (unpacked, adopted_key) = trust
+            .unpack(&encoded)
+            .expect("当前纪元必须通过完整 Bundle 验证");
+        assert_eq!(unpacked.epoch, KeyEpoch::new(2));
+        assert!(adopted_key == expected_key);
+    }
+
+    #[test]
+    fn gist_bootstrap_never_reenables_a_revoked_checkpoint_holder() {
+        let (encoded, checkpoint, genesis, _, revoked, _) = rotated_gist_bootstrap_fixture();
+        let bootstrap = inspect_bootstrap(&encoded).expect("读取未验证引导区");
+
+        let error =
+            verify_gist_bootstrap_for_checkpoint(&checkpoint, genesis, &bootstrap, &revoked)
+                .expect_err("被撤销设备不得从公开 bootstrap 取得当前密钥");
+        assert_eq!(error.code(), "vault.gist_bootstrap_invalid");
     }
 }

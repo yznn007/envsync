@@ -23,17 +23,20 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use envsync_backend::git_auth::validate_remote_url;
 use envsync_backend::{Backend, BackendError, GitBackend, GitConfig, LocalBackend};
 use envsync_domain::{
-    Blob, BlobId, CborCodec, Conflict, ConflictId, ConflictResolution, DesiredDisposition,
-    DeviceId, DeviceProfile, FileMode, ObjectId, ObjectKind, Observation, ObservedState,
-    OperationId, Plan, PlanId, ProjectionNote, ResolutionChoice, ResourceEntry, ResourceId,
-    SnapshotBody, SnapshotId, SnapshotSignature, StateRoot, StateRootId, WorkspaceId, WorkspaceRef,
+    Blob, BlobId, CborCodec, Conflict, ConflictId, ConflictKind, ConflictResolution,
+    DesiredDisposition, DeviceId, DeviceProfile, FileMode, ObjectId, ObjectKind, Observation,
+    ObservedState, OperationId, Plan, PlanId, ProjectionNote, ResolutionChoice, ResourceEntry,
+    ResourceId, SnapshotBody, SnapshotId, SnapshotSignature, StateRoot, StateRootId, WorkspaceId,
+    WorkspaceRef,
 };
+use envsync_platform::secure_store::{open_system_store, SecureStore};
 use envsync_platform::{AuthorizedRoot, RelativeTarget, RootRegistry, SafeWriter};
 use envsync_storage::{ConflictRecord, ConflictStore, DraftStore, Journal, OperationState};
 
-use crate::apply::{ApplyEngine, ApplyOutcome};
+use crate::apply::{ApplyCancellation, ApplyEngine, ApplyOutcome, NeverCancelled};
 use crate::checkpoint::{CheckpointStore, SecureCheckpointStore};
 use crate::config::{BackendConfig, WorkspaceConfig};
 use crate::error::{CoreError, CoreResult};
@@ -46,6 +49,21 @@ use crate::projection::{self, DeviceView, ProjectionPolicy, ProjectionRules};
 use crate::recovery::{PlanSource, RecoveryDiagnosis, RecoveryEngine, RecoveryReport};
 use crate::render;
 use crate::sync::{self, ConflictDetail, FetchOutcome, MergeContext, MergeOutcome};
+use crate::view::{
+    ConflictDetailView, ConflictResolutionView, DeviceListView, DeviceRevocationView, DiffListView,
+    DiffView, OperationDetailView, OperationHistoryView, RollbackReviewView, VaultMetadataView,
+};
+use crate::{device_admin, vault, VaultDeps, VaultService};
+
+/// 桌面端单次手动冲突裁决正文的硬上限。
+///
+/// 这与资源自身 `max_bytes` 共同生效，防止 WebView 通过一个本来允许较大文件的资源把
+/// 无界正文塞进 IPC、SQLite 或日志路径。正文只在非秘密组件本地存在，并在提交后交由
+/// core 转为 Blob；不会进入 View/API 响应。
+pub const DESKTOP_MANUAL_RESOLUTION_MAX_BYTES: u64 = 256 * 1024;
+
+/// 用于差异摘要的内容大小阈值；超过它仍只显示无内容摘要。
+pub const DIFF_SUMMARY_PREVIEW_BYTES: usize = 96 * 1024;
 
 /// capture 的结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -358,6 +376,61 @@ impl EnvSyncService {
         device_name: &str,
         backend_path: &Path,
     ) -> CoreResult<WorkspaceConfig> {
+        Self::init_workspace_with_optional_root_and_backend(
+            config_path,
+            device_name,
+            BackendConfig::Local {
+                path: backend_path.to_path_buf(),
+            },
+            None,
+        )
+    }
+
+    /// 初始化一个新工作区，并把已由宿主授权的目录设为 `home` 根。
+    ///
+    /// 该入口供桌面端等原生宿主使用：路径不能来自 WebView，而必须先经平台目录选择器
+    /// 和能力注册。服务会 canonicalize 并验证目录，再将其写进配置；UI 只会收到宿主
+    /// 分配的根能力 token，绝不接触这个路径。
+    pub fn init_workspace_with_root(
+        config_path: &Path,
+        device_name: &str,
+        backend_path: &Path,
+        authorized_root: &Path,
+    ) -> CoreResult<WorkspaceConfig> {
+        Self::init_workspace_with_optional_root_and_backend(
+            config_path,
+            device_name,
+            BackendConfig::Local {
+                path: backend_path.to_path_buf(),
+            },
+            Some(authorized_root),
+        )
+    }
+
+    /// 初始化一个新工作区，并指定已经经过宿主安全校验的后端配置。
+    ///
+    /// 此入口用于需要 Git 等非本地后端的原生宿主。它验证远端 URL 与认证方式，却不接收
+    /// 任何凭据明文；本地工作区状态仍从配置文件相邻的私有 state 目录派生。
+    pub fn init_workspace_with_root_and_backend(
+        config_path: &Path,
+        device_name: &str,
+        backend: BackendConfig,
+        authorized_root: &Path,
+    ) -> CoreResult<WorkspaceConfig> {
+        Self::init_workspace_with_optional_root_and_backend(
+            config_path,
+            device_name,
+            backend,
+            Some(authorized_root),
+        )
+    }
+
+    fn init_workspace_with_optional_root_and_backend(
+        config_path: &Path,
+        device_name: &str,
+        backend: BackendConfig,
+        authorized_root: Option<&Path>,
+    ) -> CoreResult<WorkspaceConfig> {
         if config_path.exists() {
             return Err(CoreError::ManualInterventionRequired(format!(
                 "配置文件 `{}` 已存在；初始化不会覆盖已有工作区",
@@ -367,17 +440,46 @@ impl EnvSyncService {
         let base_dir = config_path.parent().unwrap_or(Path::new("."));
         std::fs::create_dir_all(base_dir)
             .map_err(|err| envsync_platform::PlatformError::io("创建配置目录", &err))?;
-        std::fs::create_dir_all(backend_path)
-            .map_err(|err| envsync_platform::PlatformError::io("创建后端目录", &err))?;
+        let local_backend_path = match &backend {
+            BackendConfig::Local { path } => {
+                std::fs::create_dir_all(path)
+                    .map_err(|err| envsync_platform::PlatformError::io("创建后端目录", &err))?;
+                Some(path.as_path())
+            }
+            BackendConfig::Git {
+                remote_url, auth, ..
+            } => {
+                validate_remote_url(remote_url)?;
+                auth.validate()?;
+                None
+            }
+        };
 
-        let config =
-            WorkspaceConfig::scaffold(WorkspaceId::generate(), device_name, backend_path, base_dir);
+        let mut config = WorkspaceConfig::scaffold(
+            WorkspaceId::generate(),
+            device_name,
+            local_backend_path.unwrap_or(base_dir),
+            base_dir,
+        );
+        if !matches!(&backend, BackendConfig::Local { .. }) {
+            config.backend = backend;
+        }
+        if let Some(root) = authorized_root {
+            let root = AuthorizedRoot::open("home", root)?;
+            config.roots.clear();
+            config
+                .roots
+                .insert("home".to_owned(), root.path().to_path_buf());
+        }
         let yaml = config.to_yaml()?;
         std::fs::write(config_path, yaml)
             .map_err(|err| envsync_platform::PlatformError::io("写入配置文件", &err))?;
 
-        // 提前建立后端布局与状态目录，让 `init` 之后的任何命令都能直接工作。
-        LocalBackend::open(backend_path.to_path_buf())?;
+        // 提前建立本地后端布局与状态目录，让 `init` 之后的任何命令都能直接工作。Git
+        // 后端刻意不在此处主动连网：`open` 会把不可达远端降级成明确的离线状态。
+        if let BackendConfig::Local { path } = &config.backend {
+            LocalBackend::open(path.clone())?;
+        }
         std::fs::create_dir_all(&config.state_dir)
             .map_err(|err| envsync_platform::PlatformError::io("创建状态目录", &err))?;
         Ok(config)
@@ -396,6 +498,48 @@ impl EnvSyncService {
     /// 只读访问操作日志。
     pub fn journal(&self) -> &Journal {
         &self.journal
+    }
+
+    /// 返回 Vault 的 metadata-only 清单。
+    ///
+    /// 这条 application-service 入口每次都新开 Vault，避免把成员链、密钥环或后端头的
+    /// 旧缓存跨越两次桌面 command 复用。返回值只包含逻辑 ID、更新时间与引用资源，不能
+    /// 用它读取、复制或显示任何秘密值。
+    pub fn vault_metadata_view(&self) -> CoreResult<VaultMetadataView> {
+        let service = self.open_vault_service()?;
+        let entries = service.list()?;
+        let index_missing = service.vault_index_missing()?;
+        Ok(VaultMetadataView::new(
+            self.config.workspace_id,
+            index_missing,
+            &entries,
+        ))
+    }
+
+    /// 列出已经过成员链验证的设备；不暴露私钥、公开材料、邀请或恢复短语。
+    pub fn device_list_view(&self) -> CoreResult<DeviceListView> {
+        let service = self.open_vault_service()?;
+        let membership = service.membership()?;
+        let devices = device_admin::list_devices(&service)?;
+        Ok(DeviceListView::new(
+            self.config.workspace_id,
+            membership.epoch,
+            membership.sequence,
+            &devices,
+        ))
+    }
+
+    /// 撤销一台非本机设备并完成或恢复密钥轮换。
+    ///
+    /// 核心层会再次验证管理员身份、成员关系与“不能撤销当前设备”等不变量；桌面端的
+    /// 文本确认仅是防误触，绝不是安全决策。
+    pub fn revoke_device_for_desktop(
+        &mut self,
+        device: DeviceId,
+    ) -> CoreResult<DeviceRevocationView> {
+        let mut service = self.open_vault_service()?;
+        let outcome = service.revoke_device(device)?;
+        Ok(DeviceRevocationView::from(&outcome))
     }
 
     // ---- capture -------------------------------------------------------------
@@ -668,6 +812,67 @@ impl EnvSyncService {
         Ok(outcome.plan)
     }
 
+    /// 读取一个此前由 [`EnvSyncService::build_plan`] 保存的不可变计划。
+    ///
+    /// 桌面端只能用此路径查看或申请应用计划；它不能合成 Action、绕过草稿库，或用路径
+    /// 替代计划标识。
+    pub fn saved_plan(&self, plan_id: PlanId) -> CoreResult<Plan> {
+        self.drafts
+            .get_plan(plan_id)?
+            .ok_or(CoreError::PlanNotFound(plan_id))
+    }
+
+    /// 返回一个已保存计划的无内容差异摘要。
+    ///
+    /// 即使资源不是秘密，这里也只返回类别、大小和摘要，不返回 Blob 正文。这样 Diff UI
+    /// 可以区分文本、结构化、二进制和受管区块，而不把用户文件变成 application-service
+    /// 的通用读取接口。
+    pub fn plan_diffs(&self, plan_id: PlanId) -> CoreResult<DiffListView> {
+        let plan = self.saved_plan(plan_id)?;
+        let mut diffs = Vec::with_capacity(plan.actions.len());
+        for action in &plan.actions {
+            let resource = self
+                .config
+                .resource(&action.resource)
+                .ok_or_else(|| CoreError::UnknownResource(action.resource.clone()))?;
+            let presentation = self.diff_presentation(action, resource)?;
+            diffs.push(presentation);
+        }
+        Ok(DiffListView::new(&plan, diffs))
+    }
+
+    fn diff_presentation(
+        &self,
+        action: &envsync_domain::Action,
+        resource: &crate::config::ResourceConfig,
+    ) -> CoreResult<DiffView> {
+        let view = DiffView::from_action(action);
+        if action.secret {
+            return Ok(view);
+        }
+        let bytes = action
+            .content
+            .map(|content| self.drafts.get(ObjectId::from(content)))
+            .transpose()?
+            .flatten();
+        let content_bytes = bytes.as_ref().map(Vec::len);
+        let is_binary = bytes.as_deref().is_some_and(is_binary_content);
+        let presentation = if is_binary {
+            "binary"
+        } else {
+            match resource.mode {
+                FileMode::ManagedBlock => "managed_block",
+                FileMode::StructuredMerge => "structured",
+                FileMode::FullFile | FileMode::GeneratedInclude => "text",
+            }
+        };
+        Ok(view.with_presentation(
+            presentation,
+            content_bytes,
+            content_bytes.is_some_and(|size| size > DIFF_SUMMARY_PREVIEW_BYTES),
+        ))
+    }
+
     // ---- sync ----------------------------------------------------------------
 
     /// 应用指定计划。
@@ -675,6 +880,21 @@ impl EnvSyncService {
     /// 启动时自动运行恢复流程（M0 任务 13 的要求），随后校验计划新鲜度：重新生成的
     /// 计划标识必须与提交的一致，否则返回 [`CoreError::StalePlan`]。
     pub fn apply_plan(&mut self, plan_id: PlanId) -> CoreResult<ApplyOutcome> {
+        self.apply_plan_with_operation(plan_id, OperationId::generate(), &NeverCancelled)
+    }
+
+    /// 用调用方预先分配的 operation ID 应用指定计划。
+    ///
+    /// 桌面 worker 会在后台启动时分配 ID，因此 UI 可以在事务完成前订阅事件或请求取消。
+    /// service 仍然负责恢复、重新计划和新鲜度检查；只有计划确认可执行后才登记 journal。
+    /// 登记后，取消会在上传完成后的预检前或后端 Ref 发布前被采纳，并转换为可审计的
+    /// `aborted` 终态。已经发布的 operation 不接受取消，避免把本地收敛留在半状态。
+    pub fn apply_plan_with_operation(
+        &mut self,
+        plan_id: PlanId,
+        operation: OperationId,
+        cancellation: &dyn ApplyCancellation,
+    ) -> CoreResult<ApplyOutcome> {
         // 未解决的冲突一票否决，而且必须排在最前面：此后的任何一步都会动本地文件
         // 或远端 Ref，而「有冲突时两者都不变」是 M1 的硬性承诺。
         let open = self.conflicts_list()?;
@@ -692,10 +912,9 @@ impl EnvSyncService {
             );
         }
 
-        let submitted = self
-            .drafts
-            .get_plan(plan_id)?
-            .ok_or(CoreError::PlanNotFound(plan_id))?;
+        if self.drafts.get_plan(plan_id)?.is_none() {
+            return Err(CoreError::PlanNotFound(plan_id));
+        }
 
         // 重新观察并重新计划；标识不一致即判定失效。
         let current = self.build_plan()?;
@@ -706,8 +925,22 @@ impl EnvSyncService {
             });
         }
 
-        if planner::requires_publish(&submitted) {
-            self.upload_snapshot_closure(submitted.target_snapshot)?;
+        // 先登记再上传：桌面端在这里之后可以可靠地把 operation ID 关联到 journal，并且
+        // 在上传期间发出的取消会由后续安全边界采纳。阻塞/no-op 仍由 ApplyEngine 保持既有
+        // 语义，不产生 operation 记录。
+        {
+            let EnvSyncService { journal, .. } = self;
+            if let Some(outcome) = ApplyEngine::register_operation(journal, &current, operation)? {
+                return Ok(outcome);
+            }
+        }
+
+        if planner::requires_publish(&current) {
+            if let Err(error) = self.upload_snapshot_closure(current.target_snapshot) {
+                let EnvSyncService { journal, .. } = self;
+                ApplyEngine::abort_registered(journal, operation, &error)?;
+                return Err(error);
+            }
         }
 
         let EnvSyncService {
@@ -722,7 +955,7 @@ impl EnvSyncService {
             backend: backend.as_ref(),
         };
         let mut engine = ApplyEngine::new(backend.as_ref(), mutator.as_ref(), journal, &blobs);
-        let outcome = engine.apply(&current)?;
+        let outcome = engine.apply_registered(&current, operation, cancellation)?;
 
         if matches!(outcome, ApplyOutcome::Completed { .. }) {
             self.drafts.clear_head_draft()?;
@@ -798,6 +1031,65 @@ impl EnvSyncService {
             record,
             conflict: Conflict::from_canonical_slice(&bytes)?,
         })
+    }
+
+    /// 返回一个冲突的安全裁决元数据。
+    ///
+    /// Blob、三侧正文和原始冲突诊断都留在 core；桌面端只能据此选择 `ours`、`theirs`、
+    /// `delete`，或在明确允许时提交一段非秘密文本供 core 验证。
+    pub fn conflict_detail_view(&self, conflict: ConflictId) -> CoreResult<ConflictDetailView> {
+        let detail = self.conflicts_show(conflict)?;
+        let resource = self
+            .config
+            .resource(&detail.record.resource)
+            .ok_or_else(|| CoreError::UnknownResource(detail.record.resource.clone()))?;
+        let manual_limit = resource
+            .policy
+            .max_bytes
+            .min(DESKTOP_MANUAL_RESOLUTION_MAX_BYTES);
+        Ok(ConflictDetailView::from_detail(
+            &detail,
+            resource,
+            manual_limit,
+        ))
+    }
+
+    /// 以桌面端允许的受限意图裁决冲突。
+    ///
+    /// 普通 `conflicts_resolve` 仍服务 CLI（可从受控文件读取人工内容）；桌面 WebView 必须
+    /// 走此方法，使 `policy.secret`、文本语义、结构化语法和字节上限都在跨 IPC 前重新
+    /// 生效。非手动裁决也拒绝携带内容，避免无意把正文送进审计/错误路径。
+    pub fn conflicts_resolve_for_desktop(
+        &mut self,
+        conflict: ConflictId,
+        choice: ResolutionChoice,
+        manual_content: Option<&str>,
+    ) -> CoreResult<ConflictResolutionView> {
+        let detail = self.conflicts_show(conflict)?;
+        let resource = self
+            .config
+            .resource(&detail.record.resource)
+            .ok_or_else(|| CoreError::UnknownResource(detail.record.resource.clone()))?;
+        match choice {
+            ResolutionChoice::Manual => {
+                let content =
+                    manual_content.ok_or_else(|| CoreError::ManualResolutionInvalidText {
+                        resource: resource.id.clone(),
+                    })?;
+                validate_desktop_manual_resolution(resource, detail.conflict.kind, content)?;
+            }
+            ResolutionChoice::Ours | ResolutionChoice::Theirs | ResolutionChoice::Delete => {
+                if manual_content.is_some() {
+                    return Err(CoreError::ManualResolutionNotAllowed {
+                        resource: resource.id.clone(),
+                        reason: "content_only_allowed_for_manual",
+                    });
+                }
+            }
+        }
+        let resolution =
+            self.conflicts_resolve(conflict, choice, manual_content.map(str::as_bytes))?;
+        Ok(ConflictResolutionView::from(&resolution))
     }
 
     /// 记录用户对冲突的裁决。
@@ -1157,6 +1449,44 @@ impl EnvSyncService {
         engine.recover_all()
     }
 
+    /// 返回已注册工作区的完整 journal 历史（无原始错误、收据路径或内容）。
+    pub fn operation_history_view(&self) -> CoreResult<OperationHistoryView> {
+        let records = self.journal.list_all()?;
+        Ok(OperationHistoryView::from_records(
+            self.config.workspace_id,
+            &records,
+        ))
+    }
+
+    /// 返回单个 operation 的动作、收据与恢复可用性摘要。
+    pub fn operation_detail_view(&self, operation: OperationId) -> CoreResult<OperationDetailView> {
+        let record = self
+            .journal
+            .operation(operation)?
+            .ok_or_else(|| CoreError::OperationNotFound(operation.to_string()))?;
+        let actions = self.journal.actions(operation)?;
+        let receipts = self.journal.receipts(operation)?;
+        Ok(OperationDetailView::from_records(
+            &record, &actions, &receipts,
+        ))
+    }
+
+    /// 生成一次回滚前的逆向计划审核摘要，但**绝不执行回滚**。
+    ///
+    /// 仅返回已经具备收据、且 recovery 支持的 operation；desktop 层随后发放一次性审核
+    /// token，并要求每项 inverse action 明确确认。真正执行时 recovery 仍会重新核对目标
+    /// 摘要，因此审核不能绕过外部并发修改保护。
+    pub fn rollback_review_view(&self, operation: OperationId) -> CoreResult<RollbackReviewView> {
+        let record = self
+            .journal
+            .operation(operation)?
+            .ok_or_else(|| CoreError::OperationNotFound(operation.to_string()))?;
+        let actions = self.journal.actions(operation)?;
+        let receipts = self.journal.receipts(operation)?;
+        RollbackReviewView::from_records(&record, &actions, &receipts)
+            .ok_or_else(|| CoreError::Rollback("操作当前状态或收据不支持生成逆向计划".to_owned()))
+    }
+
     /// 显式回滚一次操作。
     pub fn rollback(&mut self, operation: OperationId) -> CoreResult<RecoveryReport> {
         let EnvSyncService {
@@ -1277,6 +1607,25 @@ impl EnvSyncService {
             .as_ref()
     }
 
+    /// 为单次 Vault / 设备管理 command 重新打开服务。
+    ///
+    /// 普通同步服务与 Vault 使用同一份工作区配置、后端类型和时钟，但 Vault 必须从系统
+    /// 凭据库取得设备私钥与密钥环。这里没有任何明文文件回退：系统存储不可用时直接把
+    /// 平台错误交给上层，由 UI 显示稳定错误码并要求用户解锁凭据库。
+    fn open_vault_service(&self) -> CoreResult<VaultService> {
+        let secure: Arc<dyn SecureStore> = Arc::from(open_system_store()?);
+        let checkpoints: Arc<dyn CheckpointStore> =
+            Arc::new(SecureCheckpointStore::new(Arc::clone(&secure)));
+        let deps = VaultDeps {
+            workspace: self.config.workspace_id,
+            backend: vault::open_backend(&self.config.backend)?,
+            secure,
+            checkpoints,
+            clock: Arc::clone(&self.clock),
+        };
+        VaultService::open(deps, &self.config.vault_dir())
+    }
+
     /// 读取后端引用，读不到时降级为本地记录的**上次已知** Ref。
     ///
     /// 返回值的第二项为 `None` 表示后端可达（第一项就是刚读到的真实 Ref）；为
@@ -1330,6 +1679,68 @@ impl EnvSyncService {
     }
 }
 
+/// 判定内容是否不适合文本差异或桌面手动编辑。
+///
+/// 这里不尝试“修复”编码：任何 NUL、非 UTF-8 或不允许的控制字符都会被保守地当作
+/// 二进制。这样不会把二进制或终端控制序列带进 WebView 文本控件。
+fn is_binary_content(bytes: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return true;
+    };
+    text.chars().any(|character| {
+        character == '\0' || (character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+    })
+}
+
+/// 对 WebView 提交的手动冲突内容实施资源策略。
+fn validate_desktop_manual_resolution(
+    resource: &crate::config::ResourceConfig,
+    kind: ConflictKind,
+    content: &str,
+) -> CoreResult<()> {
+    if resource.policy.secret {
+        return Err(CoreError::ManualResolutionNotAllowed {
+            resource: resource.id.clone(),
+            reason: "secret_resource",
+        });
+    }
+    if matches!(kind, ConflictKind::BinaryBoth) {
+        return Err(CoreError::ManualResolutionNotAllowed {
+            resource: resource.id.clone(),
+            reason: "binary_conflict",
+        });
+    }
+    if !matches!(
+        resource.mode,
+        FileMode::FullFile | FileMode::ManagedBlock | FileMode::StructuredMerge
+    ) {
+        return Err(CoreError::ManualResolutionNotAllowed {
+            resource: resource.id.clone(),
+            reason: "unsupported_resource_mode",
+        });
+    }
+    let limit = resource
+        .policy
+        .max_bytes
+        .min(DESKTOP_MANUAL_RESOLUTION_MAX_BYTES);
+    if content.len() as u64 > limit {
+        return Err(CoreError::ManualResolutionTooLarge {
+            resource: resource.id.clone(),
+            limit,
+        });
+    }
+    if is_binary_content(content.as_bytes()) {
+        return Err(CoreError::ManualResolutionInvalidText {
+            resource: resource.id.clone(),
+        });
+    }
+    if let Some(format) = resource.policy.structured_format {
+        crate::merge::validate_structured_document(content.as_bytes(), format)
+            .map_err(CoreError::Merge)?;
+    }
+    Ok(())
+}
+
 /// 只保留文件名用于错误信息，避免泄露绝对路径。
 fn file_label(path: &Path) -> String {
     path.file_name()
@@ -1340,4 +1751,75 @@ fn file_label(path: &Path) -> String {
 /// 便于外部构造备份根路径。
 pub fn backup_root_of(state_dir: &Path) -> PathBuf {
     state_dir.join("backups")
+}
+
+#[cfg(test)]
+mod manual_resolution_tests {
+    use std::collections::BTreeMap;
+
+    use envsync_domain::{
+        ConflictKind, DesiredDisposition, FileMode, ResourceId, ResourcePolicy, StructuredFormat,
+    };
+
+    use crate::config::ResourceConfig;
+
+    use super::validate_desktop_manual_resolution;
+
+    fn resource(
+        secret: bool,
+        mode: FileMode,
+        structured_format: Option<StructuredFormat>,
+    ) -> ResourceConfig {
+        ResourceConfig {
+            id: ResourceId::parse("desktop/manual").expect("测试资源标识有效"),
+            root: "home".to_owned(),
+            target: "manual.conf".to_owned(),
+            mode,
+            disposition: DesiredDisposition::Managed,
+            policy: ResourcePolicy {
+                secret,
+                structured_format,
+                max_bytes: 1024,
+                ..ResourcePolicy::default()
+            },
+            comment_prefix: "# ".to_owned(),
+            selector: None,
+            device_overrides: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn desktop_manual_resolution_never_accepts_secret_or_binary_content() {
+        let secret = resource(true, FileMode::FullFile, None);
+        let error =
+            validate_desktop_manual_resolution(&secret, ConflictKind::TextOverlap, "token=canary")
+                .expect_err("秘密资源不得进入手动编辑通道");
+        assert_eq!(error.code(), "conflict.manual_not_allowed");
+        assert!(!error.to_string().contains("canary"));
+
+        let text = resource(false, FileMode::FullFile, None);
+        let error =
+            validate_desktop_manual_resolution(&text, ConflictKind::TextOverlap, "text\0binary")
+                .expect_err("含 NUL 的内容不得进入文本编辑通道");
+        assert_eq!(error.code(), "conflict.manual_invalid_text");
+    }
+
+    #[test]
+    fn desktop_manual_resolution_reuses_the_structured_parser() {
+        let json = resource(
+            false,
+            FileMode::StructuredMerge,
+            Some(StructuredFormat::Json),
+        );
+        validate_desktop_manual_resolution(
+            &json,
+            ConflictKind::StructuredKey,
+            "{\"safe\": true}\n",
+        )
+        .expect("合法 JSON 应可作为手动裁决");
+        let error =
+            validate_desktop_manual_resolution(&json, ConflictKind::StructuredKey, "{broken")
+                .expect_err("core 必须拒绝 UI 未能解析的结构化内容");
+        assert_eq!(error.code(), "merge.parse");
+    }
 }

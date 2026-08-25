@@ -1,0 +1,217 @@
+# Application Service API v1
+
+本契约定义 EnvSync application service 面向桌面壳及其他受控宿主的**脱敏** JSON 边界。
+它不是后端存储格式，也不是对用户文件、Vault 或任意错误文本的访问接口。
+
+## 版本与兼容性
+
+- 当前版本为 `schema_version: 1`，常量为
+  `envsync_core::APPLICATION_SERVICE_SCHEMA_VERSION`。
+- 每个 request、response 和 event 均携带 `schema_version` 与 `request_id`。
+- `request_id` 由宿主生成，只允许 1–128 个 ASCII 字母、数字、`-`、`_`、`.`；它用于
+  关联调用、事件和本地化诊断，不能承载路径、内容或秘密。
+- request envelope 与每个 command payload 都拒绝未知字段；收到不受支持的
+  `schema_version` 时，宿主只回显已校验的 `request_id` 和
+  `api.unsupported_schema_version`，不会猜测调用方意图。
+- v1 已发布字段不可删除、改名或改变 JSON 类型。新增字段必须可选，或者仅在新的 minor
+  规则下由显式协商的客户端消费。客户端必须忽略未知字段。
+- `crates/envsync-core/tests/fixtures/application-service-v1-status.json` 是 v1 状态响应的
+  golden fixture。测试按 JSON 结构而非字段顺序比较；移除或改名 fixture 中的字段会失败。
+
+## 统一信封
+
+请求：
+
+```json
+{
+  "schema_version": 1,
+  "request_id": "req-status-v1",
+  "data": { "workspace_id": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0" }
+}
+```
+
+成功响应：
+
+```json
+{
+  "schema_version": 1,
+  "request_id": "req-status-v1",
+  "status": "ok",
+  "data": { "...": "审核过的 View" },
+  "diagnostics": []
+}
+```
+
+失败响应：
+
+```json
+{
+  "schema_version": 1,
+  "request_id": "req-status-v1",
+  "status": "error",
+  "data": null,
+  "diagnostics": [
+    {
+      "severity": "blocking",
+      "code": "status.backend_unreachable",
+      "resource": null
+    }
+  ]
+}
+```
+
+`status = "error"` 时 `data` 必须为 `null`，并且至少有一条诊断。诊断只含稳定的
+`severity`、`code` 和可选 `resource`；UI 根据 `code` 本地化文案，绝不显示或记录原始
+诊断正文。
+
+## 审核过的 View
+
+`ApiResponse<T>` 与 `ApiEvent<T>` 的 `T` 受 `ViewData` 密封约束，只能是 core 审核过的
+View：
+
+| View | 用途 | 明确不包含 |
+| --- | --- | --- |
+| `WorkspaceSummary` | 工作区、设备、后端类别 | 后端 URL、凭据、授权根绝对路径 |
+| `RootCapabilityView` | 原生已授权根的进程内令牌与安全标签 | 任何目录路径或可反推路径的文本 |
+| `WorkspaceRegistrationView` | 已注册工作区与其根能力 | 配置路径、状态目录、后端 URL、凭据 |
+| `StatusView` | 状态、ref、资源摘要、未完成操作计数 | 文件内容、诊断正文 |
+| `PlanView` | 计划与动作审核 | Blob ID、文件正文、绝对路径 |
+| `DiffView` / `DiffListView` | 变化类别、大小与摘要列表 | 文件正文、Blob、绝对路径；敏感资源的摘要与大小 |
+| `ConflictView` | 冲突状态与已选策略 | base/ours/theirs/resolved Blob |
+| `ConflictListView` | 一个工作区的开放冲突 | 冲突正文、Blob、绝对路径 |
+| `ConflictDetailView` | 可用裁决方式、资源模式和手动裁决上限 | 三侧正文、Blob、原始冲突诊断 |
+| `ConflictResolutionView` | 已保存的裁决方式和时刻 | 手动提交的正文、合并或同步成功暗示 |
+| `OperationView` | journal 操作状态 | 原始错误消息、收据内容 |
+| `OperationHistoryView` / `OperationDetailView` | 操作状态机、动作进度、收据保证与恢复可用性 | 备份路径、摘要、原始错误消息 |
+| `RollbackReviewView` | 一次性逆向计划审核与逐项确认要求 | 备份路径、文件内容、可重放审核能力 |
+| `ApplyStartView` | 已交给后台 worker 的 apply | 文件内容、路径、后端 URL |
+| `CancellationView` | 已送达 worker 的取消请求 | 是否跨过发布边界之外的内部状态 |
+| `ApplyView` | apply 的最终 no-op 或完成结果 | 文件内容、收据、错误正文 |
+| `VaultMetadataView` | Secret ID、更新时间、引用资源与索引缺失状态 | 值、密文对象、密钥纪元、批量读取入口 |
+| `DeviceListView` | 已验证成员设备、角色、纪元和成员链序号 | 私钥、设备公开材料、邀请、恢复短语 |
+| `DeviceRevocationView` | 已撤销设备与密钥轮换阶段摘要 | 轮换密钥、旧条目内容、恢复材料 |
+
+敏感动作的 `DiffView` 仅报告 `sensitive: true` 与变化类型；`before_digest`、
+`after_digest`、`content_bytes` 均为 `null`。`presentation` 只决定 UI 显示“文本、结构化、
+二进制、受管区块或摘要”哪种**无内容**说明，不能用来请求文件正文。大型内容通过
+`preview_truncated` 明确保持摘要模式，宿主不得以此为由扩展 Blob 或路径读取权限。
+
+## 长操作、事件与取消
+
+`workspace_apply` 在接受一个已审核 `plan_id` 后，先返回 `ApplyStartView`。其中的
+`operation` 在 worker 创建时生成，`state` 为 `queued`；core 仍会重新检查 Plan 新鲜度，
+因此对应 journal 行只会在该检查通过后建立。
+
+```json
+{
+  "schema_version": 1,
+  "request_id": "req-apply-v1",
+  "status": "ok",
+  "data": {
+    "operation": "12345678-1234-4234-8234-123456789abc",
+    "state": "queued"
+  },
+  "diagnostics": []
+}
+```
+
+后台 worker 完成后通过 `ApiEvent<ApplyView>` 发出一个终态事件；失败或取消时 event 的
+`status` 为 `error`、`data` 为 `null`，仅带稳定错误码：
+
+```json
+{
+  "schema_version": 1,
+  "request_id": "req-apply-v1",
+  "sequence": 1,
+  "status": "ok",
+  "data": { "outcome": "completed", "operation": { "...": "状态 View" } },
+  "diagnostics": []
+}
+```
+
+`sequence` 只在同一个 `request_id` 内单调递增。客户端可去重；若序号缺失或窗口重连，必须
+重新查询 operation，不能自行推断事务结果。
+
+取消为显式的 `operation_cancel` 命令，负载只能是已排队 operation 的 ID：
+
+```json
+{
+  "schema_version": 1,
+  "request_id": "req-cancel-v1",
+  "data": {
+    "workspace_id": "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0",
+    "operation_id": "12345678-1234-4234-8234-123456789abc"
+  }
+}
+```
+
+接受请求后响应为 `CancellationView { operation, state: "requested" }`。该请求只写入
+worker 共享的取消令牌，不会杀线程或绕过 journal；application service 在 preflight 前、
+preflight 后和后端 Ref 发布前检查令牌。若在这些边界采纳取消，journal 记录为 `aborted`，
+worker 随后发出 `operation.cancelled` 错误事件。发布后或 worker 已结束时响应
+`operation.not_cancellable`，避免伪造一个不安全的“已取消”。
+
+回滚采用两步式协议，避免一个点击直接启动恢复：
+
+1. `operation_rollback_review` 只读取 journal，返回 `RollbackReviewView`。其中列出已有
+   收据的逆向动作（逆序），并由 Rust 进程发放一个不透明、一次性的 `review_token`。
+2. `operation_rollback` 必须回传同一 `operation_id`、该 token，以及**恰好全部**逆向动作
+   序号。桌面 state 校验后立即消费 token，core/recovery 仍会重新核对现场摘要；任何失败都
+   要重新生成逆向计划，不能重放旧审核。
+
+`operation_rollback` 同步返回并发送 `OperationView` 事件；窗口关闭只会隐藏主窗口，不会
+终止仍持有后台 operation lease 的 worker。
+
+## 宿主边界
+
+桌面壳只可传递已注册的 workspace/resource/plan/operation 标识。它不得提供任意文件路径、
+shell 命令、HTTP 请求或 Vault 明文参数。实际 command allowlist、Tauri capability 与参数
+解析将在桌面壳中执行，但必须继续使用本契约的 request、response 和 event 信封。
+
+### 原生首次使用
+
+`onboarding_select_root`、`onboarding_create_workspace` 与 `onboarding_open_workspace` 是
+桌面壳专用的受限扩展，仍使用相同的 v1 信封：
+
+- `onboarding_select_root` 与 `onboarding_open_workspace` 的 `data` 均为空对象。前者只由
+  原生系统 dialog 选取目录并返回 `RootCapabilityView`；后者先由原生 dialog 选取配置，再
+  对配置声明的**每个**授权根要求一次原生重新确认。
+- `onboarding_create_workspace` 只接受不透明的 `root_capability_token`、受限设备显示名与
+  后端意图。Local 后端不接受额外的 Git 字段；Git 后端只接受经校验的远端 URL，以及
+  `ssh-agent` 或 `credential-helper` 两种无明文认证方式。
+- 所有配置、Local backend、Git cache 和状态目录均由 Rust 从应用私有数据目录派生。WebView
+  不得传入、保存或显示目录路径、后端 cache 路径、私钥、密码或访问令牌。
+
+首次创建或打开成功后返回 `WorkspaceRegistrationView`；它只有工作区/设备/后端摘要与一个
+不透明根 token。即使 native 或远端组件返回了额外字段，Vue 端也会只投影该 View 的已审核
+字段，并把失败收敛为稳定诊断码。
+
+### Plan、冲突与历史恢复扩展
+
+- `plan_diff` 的负载只含 `{ workspace_id, plan_id }`，返回 `DiffListView`。它只允许查看
+  已保存的不可变计划；客户端不得用“最新状态”替换正在审核的 Plan ID。
+- `conflict_show` 返回 `ConflictDetailView`；`conflict_resolve` 只接受
+  `{ workspace_id, conflict_id, choice, manual_content? }`。`manual_content` 只在
+  `choice=manual` 时允许，core 会拒绝秘密、二进制、非文本、超限和结构化语法无效的内容，
+  且响应不会回显该内容。保存裁决不等于重新 merge 或同步成功。
+- `operation_history` 与 `operation_detail` 只返回状态、稳定错误码、动作进度与收据保证；
+  它们不提供备份路径、对象摘要、任意文件读取或错误正文。
+
+### Vault 与设备管理扩展
+
+- `vault_metadata` 的负载仅为 `{ workspace_id }`，返回 `VaultMetadataView`。每条 entry
+  只有 `id`、`updated_at_unix_ms` 和 `referenced_by`；没有 `get`、批量复制或默认 reveal
+  command。若 `index_missing=true`，空条目列表表示“读不到”，不是“Vault 为空”。
+- 桌面端不提供 `vault_set_secret` 或任何等价的明文 IPC。当前 Tauri IPC 会在 command
+  获得参数前解析整个 JSON payload，无法在 Rust command 内可靠地实施输入体上限；因此
+  设置值必须走 CLI 的 stdin / 环境变量名 / 隐藏输入三条受限通道。桌面页只显示 metadata，
+  不提供 `vault get`、复制 API 或默认 reveal。
+- `device_list` 的负载仅为 `{ workspace_id }`，返回已验证成员链的 `DeviceListView`。
+  `device_revoke` 只接受 `{ workspace_id, device_id, confirmation }`，其中
+  `confirmation` 必须逐字匹配公开的 `device_id`；这只是防误触，core 仍会强制管理员身份、
+  成员关系以及“不能撤销当前设备”。成功后返回 `DeviceRevocationView`，明确轮换阶段。
+- 设备邀请 payload 可以是不含私钥的已签名公开材料，但短码/QR 的跨设备传输服务尚未进入
+  此 API；桌面端不得伪造可加入的邀请码，也不得把恢复短语、私钥或 key envelope 放进 UI。
+- 包计划和 Bundle manifest 尚无持久化 application-service 来源时，页面必须呈现“无受控
+  审核数据”，不能伪造 policy、签名、capability、SecretRef 或版本差异，更不能从 UI 直接
+  执行 quarantine 内容。

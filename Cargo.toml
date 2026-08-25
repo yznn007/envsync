@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "apps/desktop",
     "crates/envsync-adapters",
     "crates/envsync-domain",
     "crates/envsync-backend",
@@ -12,6 +13,8 @@ members = [
     "crates/envsync-e2e",
     "crates/envsync-crypto",
     "crates/envsync-policy",
+    "crates/envsync-plugin-api",
+    "crates/envsync-plugin-host",
 ]
 
 [workspace.package]
@@ -32,10 +35,13 @@ envsync-core = { path = "crates/envsync-core", version = "0.1.0" }
 envsync-adapters = { path = "crates/envsync-adapters", version = "0.1.0" }
 envsync-crypto = { path = "crates/envsync-crypto", version = "0.1.0" }
 envsync-policy = { path = "crates/envsync-policy", version = "0.1.0" }
+envsync-plugin-api = { path = "crates/envsync-plugin-api", version = "0.1.0" }
 
 blake3 = "1"
 cap-std = "3"
+cap-primitives = "3"
 clap = { version = "4", features = ["derive"] }
+nix = { version = "0.29", default-features = false, features = ["process", "resource", "signal"] }
 git2 = { version = "0.20", default-features = false, features = ["vendored-libgit2"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 semver = "1"
@@ -48,6 +54,11 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
+tauri = { version = "2.11.5", default-features = false, features = ["wry"] }
+tauri-build = "2.6.3"
+tauri-plugin-dialog = "2.7.2"
+tauri-plugin-single-instance = "2.4.3"
 
 # 密码学依赖：全部来自 RustCrypto / dalek 生态，不自研原语。
 ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
@@ -57,6 +68,7 @@ hkdf = "0.12"
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 sha2 = "0.10"
 argon2 = "0.5"
+base64 = "0.22"
 zeroize = { version = "1", features = ["derive"] }
 subtle = "2"
 rand_core = { version = "0.6", features = ["getrandom"] }

@@ -42,22 +42,22 @@ Playwright、shadcn-vue、reqwest、JSON-RPC、WASI Preview 2（实验适配器�
 - Test: `crates/envsync-core/tests/view_api.rs`
 - Create: `docs/api/application-service-v1.md`
 
-- [ ] **Step 1: 写脱敏 view 测试**
+- [x] **Step 1: 写脱敏 view 测试**
 
 WorkspaceSummary、StatusView、PlanView、DiffView、ConflictView、OperationView 均可
 序列化；放入 canary secret 后任何 JSON 不出现 canary。
 
-- [ ] **Step 2: 定义版本化 Request/Response**
+- [x] **Step 2: 定义版本化 Request/Response**
 
 所有 response 含 `schema_version`、request ID、status、data、diagnostics。长操作通过
 operation ID 和 event stream 更新；取消是显式 command。
 
-- [ ] **Step 3: 写兼容性 golden tests**
+- [x] **Step 3: 写兼容性 golden tests**
 
 将 v1 JSON 保存为 fixture，字段顺序不作为契约；删除/改名已有字段使测试失败。新增字段
 必须有默认或 minor version 规则。
 
-- [ ] **Step 4: 验证并提交**
+- [x] **Step 4: 验证并提交**
 
 ```bash
 cargo test -p envsync-core --test view_api
@@ -77,27 +77,27 @@ git commit -am "feat(api): 冻结桌面应用服务契约"
 - Create: `apps/desktop/capabilities/default.json`
 - Test: `apps/desktop/tests/commands.rs`
 
-- [ ] **Step 1: 写 command allowlist 测试**
+- [x] **Step 1: 写 command allowlist 测试**
 
 前端只能调用 workspace/status/plan/apply/rollback/conflict/vault metadata/bundle review
 命令；没有任意路径读写、任意 shell、任意 HTTP 或直接 secret get command。
 
-- [ ] **Step 2: 初始化 Tauri 壳**
+- [x] **Step 2: 初始化 Tauri 壳**
 
 CSP 禁止 remote script、`eval` 和任意 connect-src；只打包本地 UI。关闭不需要的
 shell/fs/http 插件。single-instance 仅转发安全的 deep-link action，不转发 secret。
 
-- [ ] **Step 3: command 参数验证**
+- [x] **Step 3: command 参数验证**
 
 所有 path 使用已经注册的 Workspace ID/Resource ID，不接收前端绝对路径。apply 必须接收
 Plan ID；Rust core 再次检查新鲜度。
 
-- [ ] **Step 4: 事件与取消**
+- [x] **Step 4: 事件与取消**
 
 事件只发送 view API；窗口关闭不杀死正在 journaled apply，后台完成后通知。取消只在安全
 边界生效并留下 operation 状态。
 
-- [ ] **Step 5: 验证并提交**
+- [x] **Step 5: 验证并提交**
 
 ```bash
 cargo test -p envsync-desktop
@@ -116,22 +116,22 @@ git commit -am "feat(desktop): 建立安全 Tauri 应用壳"
 - Create: `apps/desktop-ui/src/router.ts`
 - Test: `apps/desktop-ui/src/App.test.ts`
 
-- [ ] **Step 1: 建立设计 token**
+- [x] **Step 1: 建立设计 token**
 
 定义中性背景、语义状态色、4/8px spacing、字体层级、focus ring、motion duration；支持
 dark/light/high-contrast 和 reduced-motion。
 
-- [ ] **Step 2: 写导航测试**
+- [x] **Step 2: 写导航测试**
 
 Workspace、Changes、Conflicts、Packages、Agents、Vault、Devices、History、Settings。
 键盘可达，当前页面有 `aria-current`，窄窗口降级为 drawer。
 
-- [ ] **Step 3: 实现 app shell**
+- [x] **Step 3: 实现 app shell**
 
 Pinia 只存 view model 与 UI 状态，不存 secret plaintext。error boundary 展示 request ID
 和脱敏诊断。
 
-- [ ] **Step 4: lint/typecheck/test**
+- [x] **Step 4: lint/typecheck/test**
 
 ```bash
 pnpm --dir apps/desktop-ui lint
@@ -141,7 +141,7 @@ pnpm --dir apps/desktop-ui test
 
 Expected: 全部 exit 0。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add apps/desktop-ui
@@ -158,21 +158,21 @@ git commit -m "feat(ui): 建立桌面导航与设计系统"
 - Create: `apps/desktop-ui/src/stores/workspace.ts`
 - Test: `apps/desktop-ui/src/pages/OnboardingPage.test.ts`
 
-- [ ] **Step 1: 写 onboarding 测试**
+- [x] **Step 1: 写 onboarding 测试**
 
 创建/打开 Workspace、选择 Local/Git/Gist、授权根、设备 Profile。路径选择通过 Tauri
 dialog 后由 Rust 注册 capability，前端不保留绝对路径。
 
-- [ ] **Step 2: 实现状态 dashboard**
+- [x] **Step 2: 实现状态 dashboard**
 
 显示后端、head、设备、最近 sync、drift、未收敛 operation、安全告警。每个异常都有明确
 下一动作，不能只显示通用 error。
 
-- [ ] **Step 3: offline 与 loading 状态**
+- [x] **Step 3: offline 与 loading 状态**
 
 Git/Gist 不可达时展示本地最后状态及其时间；不得把不可达显示为 clean。
 
-- [ ] **Step 4: 验证并提交**
+- [x] **Step 4: 验证并提交**
 
 ```bash
 pnpm --dir apps/desktop-ui test -- OnboardingPage
@@ -189,27 +189,27 @@ git commit -am "feat(ui): 添加首次使用与工作区状态"
 - Create: `apps/desktop-ui/src/pages/HistoryPage.vue`
 - Test: `apps/desktop-ui/src/components/DiffViewer.test.ts`
 
-- [ ] **Step 1: Diff 测试**
+- [x] **Step 1: Diff 测试**
 
 支持文本、structured key diff、binary summary、create/delete、Managed Block 边界；秘密只
 显示“值已更改”。大文件虚拟滚动并有截断提示。
 
-- [ ] **Step 2: Plan 审核**
+- [x] **Step 2: Plan 审核**
 
 按风险分组 action，显示 source/target、备份和 rollback guarantee。High risk 逐项确认；
 apply 按钮只发送当前 Plan ID，stale 后强制重新加载。
 
-- [ ] **Step 3: Conflict 解决**
+- [x] **Step 3: Conflict 解决**
 
 ours/theirs/manual 三种选择，manual 编辑器只处理非秘密文本并在提交前解析/验证。冲突未
 解决时不出现误导性的“同步成功”。
 
-- [ ] **Step 4: History 与回滚**
+- [x] **Step 4: History 与回滚**
 
 展示 operation 状态机、receipt、失败点和 recovery action。回滚先生成逆向 Plan 并再次
 审核。
 
-- [ ] **Step 5: 验证并提交**
+- [x] **Step 5: 验证并提交**
 
 ```bash
 pnpm --dir apps/desktop-ui test
@@ -226,27 +226,28 @@ git commit -am "feat(ui): 添加差异冲突与历史恢复"
 - Create: `apps/desktop-ui/src/pages/DevicesPage.vue`
 - Test: `apps/desktop-ui/src/pages/SecurityPages.test.ts`
 
-- [ ] **Step 1: Package 风险测试**
+- [x] **Step 1: Package 风险测试**
 
 install/upgrade/downgrade/uninstall/elevation 有不同标签。批量批准不能包含被 policy deny 的
 action。
 
-- [ ] **Step 2: Bundle 审核测试**
+- [x] **Step 2: Bundle 审核测试**
 
 显示 signer、digest、文件、capability、SecretRef 和版本 diff。新 capability 必须单独
 确认；quarantine 内容不能从 UI 直接执行。
 
-- [ ] **Step 3: Vault UI**
+- [x] **Step 3: Vault UI（metadata-only）**
 
-列表只显示 Secret ID、更新时间、引用者。设置 secret 使用单次 modal buffer，提交或关闭后
-清空；不提供复制全部 vault 或 reveal-by-default。
+列表只显示 Secret ID、更新时间、引用者。Tauri IPC 在 command 参数校验前会解析完整 JSON，
+无法可靠地约束秘密正文；因此桌面端不接收 Vault 值，设置操作保留给 CLI 的 stdin、环境变量
+名或隐藏输入通道；不提供复制全部 vault 或 reveal-by-default。
 
-- [ ] **Step 4: Device UI**
+- [x] **Step 4: Device UI**
 
 邀请二维码/短码不得含 private material；撤销展示将触发 key rotation。恢复流程要求明确
 展示旧设备重新授权影响。
 
-- [ ] **Step 5: 验证并提交**
+- [x] **Step 5: 验证并提交**
 
 ```bash
 pnpm --dir apps/desktop-ui test -- SecurityPages
@@ -261,27 +262,27 @@ git commit -am "feat(ui): 添加包 Agent Vault 与设备管理"
 - Test: `crates/envsync-backend/tests/gist_bundle.rs`
 - Create: `docs/backends/gist.md`
 
-- [ ] **Step 1: 写格式测试**
+- [x] **Step 1: 写格式测试**
 
 一个 Gist 文件 `envsync-<workspace>.bundle`，内容为 base64url canonical envelope：
-version、workspace、revision、head、objects、bundle digest、signature。最多 256 resources
-和 5 MiB encoded size。
+version、workspace、revision、head、密封对象目录、仅含成员链和当前 KeyEnvelope 的受限
+bootstrap、bundle digest、signature。最多 256 resources 和 5 MiB encoded size。
 
-- [ ] **Step 2: sealed-only 测试**
+- [x] **Step 2: sealed-only 测试**
 
 配置 Vault 或普通资源时 bundle payload 始终是 ciphertext；fixture 扫描不得出现资源明文、
 路径、Secret ID 或 metadata。未启用 M2 密钥的 Workspace 不能选择 Gist。
 
-- [ ] **Step 3: 实现 pack/unpack**
+- [x] **Step 3: 实现 pack/unpack**
 
 对象排序确定；解包先检查 encoded size、版本和计数，再验证 digest/signature，最后解密。
 拒绝压缩炸弹和重复 object ID。
 
-- [ ] **Step 4: 验证并提交**
+- [x] **Step 4: 验证并提交**
 
 ```bash
 cargo test -p envsync-backend --test gist_bundle
-git commit -am "feat(backend): 添加密封 Gist bundle 格式"
+git commit -m "feat(backend): 添加可引导的密封 Gist bundle"
 ```
 
 ### Task 8: GitHub Gist Backend 与 CAS
@@ -292,32 +293,35 @@ git commit -am "feat(backend): 添加密封 Gist bundle 格式"
 - Test: `crates/envsync-backend/tests/gist_backend.rs`
 - Create: `crates/envsync-backend/tests/support/mock_github.rs`
 
-- [ ] **Step 1: 写 HTTP contract tests**
+- [x] **Step 1: 写 HTTP contract tests**
 
 mock API 覆盖 create/read/update、ETag/If-Match、rate limit、401/403/404、超时、截断响应和
 服务端返回旧 revision。
 
-- [ ] **Step 2: 实现 CAS**
+- [x] **Step 2: 实现 CAS**
 
 读取保存 ETag 与 revision；更新同时发送 If-Match，并在响应后重读验证 revision/head。
 GitHub 不保证的条件不能被描述为强 CAS；检测竞争后返回 conflict 并保持本地零变更。
 
-- [ ] **Step 3: Token 集成**
+- [x] **Step 3: Token 集成**
 
 Token 只来自 Vault SecretRef，最小 scope，日志只显示 GitHub request ID。URL、header 和
 错误 body 统一 redaction。
 
-- [ ] **Step 4: rate-limit/backoff**
+- [x] **Step 4: rate-limit/backoff**
 
 尊重 Retry-After 和 rate headers；重试只用于幂等 GET。未知 PATCH 结果先 GET 判定，不能
 盲目重复发布。
 
-- [ ] **Step 5: 验证并提交**
+- [x] **Step 5: 验证并提交**
 
 ```bash
 cargo test -p envsync-backend --test gist_backend
 git commit -am "feat(backend): 添加 GitHub Gist 后端"
 ```
+
+Gist 后端不接入通用 `Backend` trait：该 trait 要求对象级强 CAS 语义，而 Gist 只有单文件
+更新和写后完整 bytes 验证的弱 CAS；将二者等同会错误承诺服务端并不提供的原子性。
 
 ### Task 9: 插件 manifest 与版本化 RPC
 
@@ -330,22 +334,22 @@ git commit -am "feat(backend): 添加 GitHub Gist 后端"
 - Create: `crates/envsync-plugin-api/src/rpc.rs`
 - Test: `crates/envsync-plugin-api/tests/compatibility.rs`
 
-- [ ] **Step 1: manifest 测试**
+- [x] **Step 1: manifest 测试**
 
 manifest 含 ID、semver、publisher、API range、entrypoint、目标平台、capability、资源限制和
 签名。拒绝绝对 entrypoint、路径穿越、重复 ID、未知 capability 和不兼容 API。
 
-- [ ] **Step 2: RPC schema**
+- [x] **Step 2: RPC schema**
 
 长度前缀 JSON-RPC，仅允许 initialize、describe、observe、render、plan-command、verify、
 shutdown。每条消息带 schema version、request ID 和 8 MiB 限制。
 
-- [ ] **Step 3: compatibility tests**
+- [x] **Step 3: compatibility tests**
 
 Host 支持一个 major 的两个 minor；未知字段按 minor 规则忽略，未知 method/version 拒绝。
 golden fixtures 固定 request/response。
 
-- [ ] **Step 4: 验证并提交**
+- [x] **Step 4: 验证并提交**
 
 ```bash
 cargo test -p envsync-plugin-api
@@ -363,32 +367,38 @@ git commit -am "feat(plugins): 定义插件 manifest 与 RPC"
 - Create: `crates/envsync-plugin-host/src/capability.rs`
 - Test: `crates/envsync-plugin-host/tests/isolation.rs`
 
-- [ ] **Step 1: 写 malicious plugin fixtures**
+- [x] **Step 1: 写 malicious plugin fixtures**
 
 测试无限循环、超大输出、崩溃、协议欺骗、读取未授权路径、请求未知命令、泄露环境变量和在
 shutdown 后继续运行。
 
-- [ ] **Step 2: 独立进程执行**
+- [x] **Step 2: 独立进程执行**
 
 清空环境后只注入协议 channel；cwd 为临时空目录。timeout、内存/输出限制、进程树清理。
 平台 sandbox capability 不可用时，插件默认禁止启用，不伪称已隔离。
 
-- [ ] **Step 3: Host-mediated capability**
+- [x] **Step 3: Host-mediated capability**
 
 插件只返回 declarative observation/render/command proposal；Host 重新验证路径和命令，
 再进入普通 Plan/policy/apply 流程。插件不能获得 Vault plaintext。
 
-- [ ] **Step 4: 签名与 quarantine**
+- [x] **Step 4: 签名与 quarantine**
 
 复用 Bundle publisher trust；安装、更新、权限扩张均进入 quarantine 审核。撤销 publisher
 会禁用其插件但保留审计数据。
 
-- [ ] **Step 5: 验证并提交**
+- [x] **Step 5: 验证并提交**
 
 ```bash
 cargo test -p envsync-plugin-host --test isolation
 git commit -am "feat(plugins): 添加隔离插件 Host"
 ```
+
+> **完成记录（2026-08-25）：** 普通构建在缺少可验证 OS sandbox 时默认拒绝执行；
+> `test-support` runner 只用于恶意 fixture 隔离验证，不能作为生产隔离声明。stdout/stderr
+> 共用原子输出预算，stdout 在分配 frame body 前预留完整 frame；reader 发现终止性错误即杀掉
+> 进程组。完整 CI（Linux、macOS、Windows、Clippy、审计、桌面前端）已通过：
+> <https://github.com/yznn007/envsync/actions/runs/32810006946>。
 
 ### Task 11: 桌面 E2E、无障碍与视觉回归
 

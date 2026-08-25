@@ -139,6 +139,34 @@ pub enum CoreError {
     #[error("配置中没有资源 `{0}`")]
     UnknownResource(ResourceId),
 
+    /// 该资源不允许通过桌面端提交手动冲突内容。
+    ///
+    /// 这通常表示资源属于秘密、二进制或非文本受管模式。UI 收到此错误码时只能保留
+    /// `ours` / `theirs` / `delete` 等不搬运正文的裁决方式。
+    #[error("资源 `{resource}` 不允许手动冲突裁决：{reason}")]
+    ManualResolutionNotAllowed {
+        /// 相关资源。
+        resource: ResourceId,
+        /// 仅供日志的稳定原因，不含正文。
+        reason: &'static str,
+    },
+
+    /// 手动冲突内容超出该资源或桌面 API 的有界上限。
+    #[error("资源 `{resource}` 的手动冲突内容超过上限 {limit} 字节")]
+    ManualResolutionTooLarge {
+        /// 相关资源。
+        resource: ResourceId,
+        /// 实际允许的最大字节数。
+        limit: u64,
+    },
+
+    /// 手动冲突内容不是可由文本编辑器安全承载的内容。
+    #[error("资源 `{resource}` 的手动冲突内容不是有效文本")]
+    ManualResolutionInvalidText {
+        /// 相关资源。
+        resource: ResourceId,
+    },
+
     /// 找不到计划。
     #[error("找不到计划 {0}")]
     PlanNotFound(PlanId),
@@ -146,6 +174,13 @@ pub enum CoreError {
     /// 找不到操作。
     #[error("找不到操作 {0}")]
     OperationNotFound(String),
+
+    /// operation 在任何不可逆步骤之前被显式取消。
+    #[error("操作 {operation} 已取消")]
+    OperationCancelled {
+        /// 被取消的操作标识。
+        operation: String,
+    },
 
     /// 引用了不存在的对象。
     #[error("引用了缺失的对象：{0}")]
@@ -185,8 +220,12 @@ impl CoreError {
             CoreError::Rollback(_) => "rollback.failed",
             CoreError::ManualInterventionRequired(_) => "recovery.manual_required",
             CoreError::UnknownResource(_) => "resource.unknown",
+            CoreError::ManualResolutionNotAllowed { .. } => "conflict.manual_not_allowed",
+            CoreError::ManualResolutionTooLarge { .. } => "conflict.manual_too_large",
+            CoreError::ManualResolutionInvalidText { .. } => "conflict.manual_invalid_text",
             CoreError::PlanNotFound(_) => "plan.not_found",
             CoreError::OperationNotFound(_) => "operation.not_found",
+            CoreError::OperationCancelled { .. } => "operation.cancelled",
             CoreError::MissingObject(_) => "object.missing",
             CoreError::Invariant(_) => "internal.invariant",
         }

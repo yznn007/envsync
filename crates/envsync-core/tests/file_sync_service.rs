@@ -21,11 +21,11 @@ mod support;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use envsync_backend::{Backend, BackendError, LocalBackend};
-use envsync_core::config::WorkspaceConfig;
+use envsync_backend::{Backend, BackendError, GitAuth, LocalBackend};
+use envsync_core::config::{BackendConfig, WorkspaceConfig};
 use envsync_core::ports::FixedClock;
 use envsync_core::service::{EnvSyncService, WorkspaceState};
-use envsync_core::ApplyOutcome;
+use envsync_core::{ApplyCancellation, ApplyOutcome};
 use envsync_domain::{
     BlobId, DesiredDisposition, FileMode, ObjectId, PlanId, SnapshotId, StateRootId,
 };
@@ -191,6 +191,67 @@ fn init_workspace_writes_a_config_that_loads_back() {
     // 读回的配置可以直接打开服务。
     let service = EnvSyncService::open_with_clock(loaded, Arc::new(FixedClock(FIXED_NOW)));
     assert!(service.is_ok(), "读回的配置必须可用");
+}
+
+/// 桌面端从原生目录选择器取得授权根后，初始化必须使用这条已授权能力，不能悄悄退回
+/// 默认 HOME。配置仍需可以回读并打开 service。
+#[test]
+fn init_workspace_with_selected_root_preserves_the_authorized_root() {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let config_path = dir.path().join("workspace.yaml");
+    let backend_path = dir.path().join("backend");
+    let selected_root = dir.path().join("authorized-root");
+    std::fs::create_dir_all(&selected_root).expect("创建已授权根");
+
+    let created = EnvSyncService::init_workspace_with_root(
+        &config_path,
+        "workstation",
+        &backend_path,
+        &selected_root,
+    )
+    .expect("用已授权根初始化成功");
+    let canonical_root = std::fs::canonicalize(&selected_root).expect("规范化已授权根");
+
+    assert_eq!(
+        created.root_path("home").expect("home 根存在"),
+        canonical_root.as_path()
+    );
+    let loaded = WorkspaceConfig::load(&config_path).expect("配置必须能读回");
+    assert_eq!(
+        loaded.root_path("home").expect("读回的 home 根存在"),
+        canonical_root
+    );
+    assert!(EnvSyncService::open(loaded).is_ok(), "选择的根必须可打开");
+}
+
+/// 桌面端创建 Git 工作区时，只保存受控认证方式与私有 cache 位置；远端 URL 通过 core
+/// 校验，但初始化本身不把任何 token 或私钥写进配置。
+#[test]
+fn init_workspace_with_selected_root_persists_a_git_backend() {
+    let dir = tempfile::tempdir().expect("临时目录");
+    let config_path = dir.path().join("workspace.yaml");
+    let selected_root = dir.path().join("authorized-root");
+    std::fs::create_dir_all(&selected_root).expect("创建已授权根");
+    let cache_dir = dir.path().join("state").join("git-cache");
+    let backend = BackendConfig::Git {
+        remote_url: "ssh://git@example.invalid/envsync.git".to_owned(),
+        branch: "envsync".to_owned(),
+        cache_dir: cache_dir.clone(),
+        auth: GitAuth::SshAgent,
+    };
+
+    let created = EnvSyncService::init_workspace_with_root_and_backend(
+        &config_path,
+        "workstation",
+        backend.clone(),
+        &selected_root,
+    )
+    .expect("Git 配置初始化成功");
+
+    assert_eq!(created.backend, backend);
+    let loaded = WorkspaceConfig::load(&config_path).expect("Git 配置必须可读回");
+    assert_eq!(loaded.backend, backend);
+    assert!(loaded.root_path("home").is_ok());
 }
 
 /// 验收条件：重复 `init` 必须报错且**不覆盖**已有配置。
@@ -431,6 +492,42 @@ fn apply_plan_rejects_an_unknown_plan_id() {
         .expect_err("未知计划必须被拒绝");
     assert_eq!(error.code(), "plan.not_found");
     assert_eq!(world.revision(), 0, "被拒绝的计划不得发布");
+}
+
+/// 桌面后台 worker 预先分配的 operation ID 必须原样进入 journal；若 UI 在 publish 前已经
+/// 请求取消，则事务留下 aborted 审计记录且后端 Ref 不前进。
+#[test]
+fn apply_plan_with_operation_id_honours_cancellation_before_publish() {
+    struct AlreadyCancelled;
+
+    impl ApplyCancellation for AlreadyCancelled {
+        fn is_cancelled(&self) -> bool {
+            true
+        }
+    }
+
+    let world = World::new();
+    let device = world.device("one", SEED_A);
+    seed_device_one(&device, BLOCK_V1);
+    let mut service = device.service();
+    service.capture().expect("capture");
+    let plan = service.build_plan().expect("build_plan");
+    let operation = "12345678-1234-4234-8234-123456789abc"
+        .parse()
+        .expect("固定 operation 标识有效");
+
+    let error = service
+        .apply_plan_with_operation(plan.id(), operation, &AlreadyCancelled)
+        .expect_err("取消必须阻止 publish");
+
+    assert_eq!(error.code(), "operation.cancelled");
+    assert_eq!(world.revision(), 0, "取消前不得推进后端 Ref");
+    let record = service
+        .journal()
+        .operation(operation)
+        .expect("读取 operation")
+        .expect("取消仍必须留下 journal 记录");
+    assert_eq!(record.state, OperationState::Aborted);
 }
 
 /// 验收条件：应用前文件被外部修改时 Plan 失效（设计文档 §12）。

@@ -14,7 +14,7 @@
 mod support;
 
 use envsync_backend::{Backend, LocalBackend};
-use envsync_core::apply::{ApplyEngine, ApplyOutcome};
+use envsync_core::apply::{ApplyCancellation, ApplyEngine, ApplyOutcome};
 use envsync_core::error::CoreError;
 use envsync_domain::{BlobId, Diagnostic, Digest32, Plan, SnapshotId, WorkspaceRef};
 use envsync_storage::{Journal, OperationState};
@@ -219,6 +219,101 @@ fn preflight_failure_leaves_backend_and_local_untouched() {
         state_of(&harness.journal, operation),
         OperationState::Aborted,
         "尚未发布就失败，应当中止而不是进入未收敛状态"
+    );
+}
+
+/// 已收到取消请求的 operation 必须在任何 preflight、CAS 或本地写入之前记录为 aborted。
+/// 取消不能通过杀线程实现，否则会破坏 journal 对真实现场的描述。
+#[test]
+fn cancellation_before_preflight_aborts_the_registered_operation_without_side_effects() {
+    struct AlreadyCancelled;
+
+    impl ApplyCancellation for AlreadyCancelled {
+        fn is_cancelled(&self) -> bool {
+            true
+        }
+    }
+
+    let mut harness = Harness::new();
+    let plan = three_write_plan(&harness);
+    let operation = "12345678-1234-4234-8234-123456789abc"
+        .parse()
+        .expect("固定操作标识有效");
+    let mutator = FakeMutator::new();
+    let error = {
+        let mut engine = ApplyEngine::new(
+            &harness.backend,
+            &mutator,
+            &mut harness.journal,
+            &harness.blobs,
+        );
+        engine
+            .apply_with_operation(&plan, operation, &AlreadyCancelled)
+            .expect_err("取消必须阻止事务开始")
+    };
+
+    assert_eq!(error.code(), "operation.cancelled");
+    assert_eq!(mutator.apply_count(), 0);
+    assert!(mutator.rolled_back().is_empty());
+    assert_eq!(harness.revision(), 0);
+    let journal_path = harness.journal_path.clone();
+    drop(harness.journal);
+
+    // 模拟进程在取消结果写入后立刻退出；重开 journal 时必须同时看到最终状态与原因。
+    // `transition_failed` 是单条 UPDATE，不能留下「已有取消错误但仍是 planned」的半成品。
+    let reopened = Journal::open(&journal_path).expect("重开取消后的 journal");
+    let record = reopened
+        .operation(operation)
+        .expect("读取重开后的操作")
+        .expect("取消操作必须保留");
+    assert_eq!(record.state, OperationState::Aborted);
+    assert_eq!(
+        record.error.as_ref().map(|detail| detail.code.as_str()),
+        Some("operation.cancelled"),
+        "重开后必须保留取消原因"
+    );
+}
+
+/// 若 UI 的取消请求与“关闭发布窗口”竞争，core 必须优先中止。这样 UI 得到 `requested`
+/// 响应就意味着 CAS 尚未发生，而不是一个无效的乐观提示。
+#[test]
+fn cancellation_racing_with_publish_window_aborts_before_cas() {
+    struct CancelAtPublishBoundary;
+
+    impl ApplyCancellation for CancelAtPublishBoundary {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+
+        fn close_cancellation_window(&self) -> bool {
+            false
+        }
+    }
+
+    let mut harness = Harness::new();
+    let plan = three_write_plan(&harness);
+    let operation = "22345678-1234-4234-8234-123456789abc"
+        .parse()
+        .expect("固定 operation 标识有效");
+    let mutator = FakeMutator::new();
+    let error = {
+        let mut engine = ApplyEngine::new(
+            &harness.backend,
+            &mutator,
+            &mut harness.journal,
+            &harness.blobs,
+        );
+        engine
+            .apply_with_operation(&plan, operation, &CancelAtPublishBoundary)
+            .expect_err("发布窗口竞争时必须取消")
+    };
+
+    assert_eq!(error.code(), "operation.cancelled");
+    assert_eq!(harness.revision(), 0, "取消不得推进 CAS");
+    assert_eq!(mutator.apply_count(), 0, "取消不得写入本地文件");
+    assert_eq!(
+        state_of(&harness.journal, operation),
+        OperationState::Aborted
     );
 }
 

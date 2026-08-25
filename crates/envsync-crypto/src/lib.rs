@@ -84,6 +84,7 @@ pub mod envelope;
 pub mod recovery;
 pub mod sealed;
 pub mod suite;
+pub mod vault;
 
 use envsync_domain::cbor::CborError;
 
