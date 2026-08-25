@@ -58,6 +58,11 @@ fn manifest_rejects_unsafe_entrypoints_unknown_capabilities_and_incompatible_api
     for (field, value, code) in [
         (
             "entrypoint",
+            serde_json::json!(""),
+            "plugin.manifest.invalid_entrypoint",
+        ),
+        (
+            "entrypoint",
             serde_json::json!("/etc/passwd"),
             "plugin.manifest.invalid_entrypoint",
         ),
