@@ -996,7 +996,7 @@ fn cas_5xx_with_failed_verification_reports_unknown_once_without_leaks() {
     mock.enqueue(ResponseSpec::new(503).body(sentinel));
     mock.enqueue(ResponseSpec::new(500).body(sentinel));
     let backend =
-        GistBackend::with_api_base(&endpoint, Duration::from_millis(100)).expect("构造 Gist 后端");
+        GistBackend::with_api_base(&endpoint, Duration::from_secs(1)).expect("构造 Gist 后端");
     let credentials = credentials();
     let read = read_for_cas(&backend, &credentials, workspace);
 

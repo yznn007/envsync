@@ -232,11 +232,11 @@ pub struct DeviceRevokeRequest {
 pub async fn onboarding_select_root(
     app: AppHandle,
     request: ApiRequest<SelectRootRequest>,
-) -> Result<ApiResponse<RootCapabilityView>, ()> {
+) -> ApiResponse<RootCapabilityView> {
     let state = app.state::<DesktopState>();
-    // Tauri 要求带 native dialog 的 async command 返回 Result；这里绝不把错误交给 Tauri
-    // 的字符串通道，而是始终返回版本化 ApiResponse，保持 UI 的脱敏错误契约。
-    Ok(onboarding_select_root_impl(&app, state.inner(), request))
+    // 所有失败都编码为版本化 ApiResponse，绝不进入 Tauri 的字符串错误通道，保持 UI 的
+    // 脱敏错误契约。
+    onboarding_select_root_impl(&app, state.inner(), request)
 }
 
 fn onboarding_select_root_impl(
@@ -338,9 +338,9 @@ pub fn onboarding_create_workspace(
 pub async fn onboarding_open_workspace(
     app: AppHandle,
     request: ApiRequest<OpenWorkspaceRequest>,
-) -> Result<ApiResponse<WorkspaceRegistrationView>, ()> {
+) -> ApiResponse<WorkspaceRegistrationView> {
     let state = app.state::<DesktopState>();
-    Ok(onboarding_open_workspace_impl(&app, state.inner(), request))
+    onboarding_open_workspace_impl(&app, state.inner(), request)
 }
 
 fn onboarding_open_workspace_impl(
