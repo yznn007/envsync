@@ -339,17 +339,17 @@ Gist 后端不接入通用 `Backend` trait：该 trait 要求对象级强 CAS �
 manifest 含 ID、semver、publisher、API range、entrypoint、目标平台、capability、资源限制和
 签名。拒绝绝对 entrypoint、路径穿越、重复 ID、未知 capability 和不兼容 API。
 
-- [ ] **Step 2: RPC schema**
+- [x] **Step 2: RPC schema**
 
 长度前缀 JSON-RPC，仅允许 initialize、describe、observe、render、plan-command、verify、
 shutdown。每条消息带 schema version、request ID 和 8 MiB 限制。
 
-- [ ] **Step 3: compatibility tests**
+- [x] **Step 3: compatibility tests**
 
 Host 支持一个 major 的两个 minor；未知字段按 minor 规则忽略，未知 method/version 拒绝。
 golden fixtures 固定 request/response。
 
-- [ ] **Step 4: 验证并提交**
+- [x] **Step 4: 验证并提交**
 
 ```bash
 cargo test -p envsync-plugin-api
