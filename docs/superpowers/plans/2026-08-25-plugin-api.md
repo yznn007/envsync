@@ -156,6 +156,7 @@ pub struct PluginManifest {
     publisher: Publisher,
     api: semver::VersionReq,
     entrypoint: PluginEntrypoint,
+    entrypoint_digest: PluginArtifactDigest,
     targets: std::collections::BTreeSet<PluginTarget>,
     capabilities: std::collections::BTreeSet<PluginCapability>,
     limits: ResourceLimits,
@@ -167,6 +168,7 @@ pub struct PluginCatalog {
 pub struct PluginId(String);
 pub struct Publisher { pub id: String, pub public_key: [u8; 32] }
 pub struct PluginEntrypoint(String);
+pub struct PluginArtifactDigest([u8; 32]);
 pub struct PluginSignature { pub algorithm: SignatureAlgorithm, pub value: [u8; 64] }
 pub enum SignatureAlgorithm { Ed25519 }
 pub enum PluginTarget { Macos, Windows, Linux, WasiP2 }
@@ -179,11 +181,11 @@ pub struct ResourceLimits {
 #[non_exhaustive]
 pub enum PluginManifestError {
     InvalidId, InvalidSemver, InvalidEntrypoint, DuplicateId, UnknownCapability,
-    IncompatibleApi, InvalidLimit, InvalidSignature, InvalidTarget,
+    IncompatibleApi, InvalidLimit, InvalidSignature, InvalidTarget, InvalidArtifactDigest,
 }
 ~~~
 
-实现 PluginManifestError::code()，至少包括 plugin.manifest.invalid_id、invalid_semver、invalid_entrypoint、duplicate_id、unknown_capability、incompatible_api、invalid_limit、invalid_signature 与 invalid_target。每个 Display 只说明字段和结构原因，不能回显 signature 或完整输入 JSON。
+实现 PluginManifestError::code()，至少包括 plugin.manifest.invalid_id、invalid_semver、invalid_entrypoint、duplicate_id、unknown_capability、incompatible_api、invalid_limit、invalid_signature、invalid_target 与 invalid_artifact_digest。每个 Display 只说明字段和结构原因，不能回显 signature 或完整输入 JSON。
 
 - [x] **Step 2: 实现 ID、entrypoint、版本、capability 与限制校验**
 
@@ -204,7 +206,7 @@ capabilities 和 targets 反序列化为封闭 enum；空 target/capability 集�
 
 - [x] **Step 3: 实现 publisher/signature 与确定性 payload**
 
-对 publisher.public_key 与 signature.value 使用 URL_SAFE_NO_PAD base64url 解码并严格要求 32/64 字节。PluginManifest::signing_payload() 构造一个不含 signature 的私有 UnsignedManifest；集合去重用 BTreeSet，签名 payload 则固定使用 v1 wire order（targets：macos、windows、linux、wasi-p2；capabilities：observe、render、plan-command、verify），不能依赖 enum 派生顺序或字典序。它返回 JSON bytes，供 Host 在固定插件签名 domain 下验签；本 crate 不调用 crypto verifier。
+对 publisher.public_key、entrypoint_digest 与 signature.value 使用 URL_SAFE_NO_PAD base64url 解码并严格要求 32/32/64 字节。entrypoint_digest 只保存被声明的 BLAKE3 字节，不在 API crate 计算摘要。PluginManifest::signing_payload() 构造一个不含 signature 的私有 UnsignedManifest，并包含 entrypoint_digest；集合去重用 BTreeSet，签名 payload 则固定使用 v1 wire order（targets：macos、windows、linux、wasi-p2；capabilities：observe、render、plan-command、verify），不能依赖 enum 派生顺序或字典序。它返回 JSON bytes，供 Host 在固定插件签名 domain 下验签；本 crate 不调用 crypto verifier。
 
 PluginCatalog::new 将已验证 manifest 的 PluginId 放入 BTreeMap，第二次插入同 ID 返回 duplicate_id，禁止后者覆盖前者。
 
@@ -214,8 +216,8 @@ PluginCatalog::new 将已验证 manifest 的 PluginId 放入 BTreeMap，第二�
 
 ~~~rust
 pub use manifest::{
-    PluginCapability, PluginCatalog, PluginEntrypoint, PluginId, PluginManifest,
-    PluginManifestError, PluginSignature, PluginTarget, Publisher, ResourceLimits,
+    PluginArtifactDigest, PluginCapability, PluginCatalog, PluginEntrypoint, PluginId,
+    PluginManifest, PluginManifestError, PluginSignature, PluginTarget, Publisher, ResourceLimits,
     SignatureAlgorithm, HOST_PLUGIN_API_VERSIONS,
 };
 ~~~

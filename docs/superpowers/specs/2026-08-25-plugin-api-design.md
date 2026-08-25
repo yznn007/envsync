@@ -53,6 +53,7 @@ envsync-core 的普通 Plan / policy / apply 流程
   },
   "api": ">=1.0.0, <2.0.0",
   "entrypoint": "bin/plugin",
+  "entrypoint_digest": "base64url-no-padding-blake3-entrypoint-digest",
   "targets": ["macos", "linux"],
   "capabilities": ["observe", "render"],
   "limits": {
@@ -75,13 +76,20 @@ envsync-core 的普通 Plan / policy / apply 流程
 `entrypoint` 是最大 512 字节的相对 Unix 风格路径：不得为空、绝对、含 `.` / `..` 段、反斜杠、
 NUL、盘符或 UNC 表示。它在任何平台按同一规则拒绝，避免 Windows/Unix 解释差异。
 
+`entrypoint_digest` 是入口文件原始字节的 BLAKE3 摘要，必须以无填充 base64url 表示且解码后
+恰为 32 字节。API crate 只验证并保存该声明，绝不自行计算摘要；Host 在 quarantine、批准后的
+runtime copy 与每次启动前计算入口文件摘要并与它比对。该字段是无签名 manifest payload 的一部分，
+因此发布者签名同时绑定入口路径和实际入口字节；缺失字段按结构错误拒绝，错误编码或长度则返回
+`plugin.manifest.invalid_artifact_digest`。
+
 `targets` 必须非空，且只能是 `macos`、`windows`、`linux`、`wasi-p2`；`capabilities` 是有序去重
 集合，且只能是 `observe`、`render`、`plan-command`、`verify`。`initialize`、`describe` 与
 `shutdown` 是协议生命周期消息，不是可申请的高权限 capability。
 
 资源限制采用固定请求上限：`100..=30_000` ms、`1 MiB..=256 MiB` memory、`1 KiB..=8 MiB`
 output。超出、零值与不合法签名编码都拒绝。`signature.algorithm` 仅接受 `ed25519`，公钥解码后
-必须正好 32 字节、签名必须正好 64 字节。签名覆盖除 `signature` 外的确定性 JSON payload；
+必须正好 32 字节、签名必须正好 64 字节。签名覆盖除 `signature` 外的确定性 JSON payload，
+包括 `entrypoint_digest`；
 `targets` 与 `capabilities` 数组固定沿用 v1 协议顺序（分别为 `macos`、`windows`、`linux`、
 `wasi-p2` 和 `observe`、`render`、`plan-command`、`verify`），该顺序是签名字节兼容性的
 一部分，不能因 enum 重排或字典排序而改变。本 crate 只构造 payload 并验证编码形状，Task 10
