@@ -39,6 +39,7 @@ pub const PLUGIN_SIGNATURE_DOMAIN: &str = "envsync-plugin";
 
 const PLUGIN_MANIFEST_DIGEST_DOMAIN: &str = "envsync:plugin-manifest:v1";
 const PLUGIN_PROFILE_DIGEST_DOMAIN: &str = "envsync:plugin-profile:v1";
+#[cfg(unix)]
 const QUARANTINE_DIR_MODE: u32 = 0o700;
 const QUARANTINE_FILE_MODE: u32 = 0o600;
 #[cfg(feature = "test-support")]
@@ -359,6 +360,7 @@ impl HostError {
         }
     }
 
+    #[cfg(unix)]
     pub(crate) fn io(operation: &'static str, error: &std::io::Error) -> Self {
         Self::Io {
             operation,

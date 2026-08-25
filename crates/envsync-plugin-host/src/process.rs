@@ -35,6 +35,8 @@ use crate::HostError;
 
 #[cfg(all(unix, not(target_os = "macos")))]
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
+#[cfg(all(unix, not(target_os = "macos")))]
+const OUTPUT_READ_CHUNK: usize = 4096;
 
 /// 一个由 test-only runner 启动的插件 RPC 会话。
 ///
@@ -313,30 +315,24 @@ impl OutputBudget {
         }
     }
 
-    fn reserve(&self, desired: usize) -> Option<usize> {
+    fn consume(&self, bytes: usize) -> bool {
+        let bytes = u64::try_from(bytes).expect("usize fits u64");
         loop {
             let consumed = self.consumed.load(Ordering::Acquire);
-            if consumed >= self.limit {
-                return None;
+            let Some(updated) = consumed.checked_add(bytes) else {
+                return false;
+            };
+            if updated > self.limit {
+                return false;
             }
-            let remaining = self.limit - consumed;
-            let reserved = remaining.min(u64::try_from(desired).expect("usize fits u64"));
-            let updated = consumed + reserved;
             if self
                 .consumed
                 .compare_exchange(consumed, updated, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                return Some(usize::try_from(reserved).expect("reserved size fits usize"));
+                return true;
             }
         }
-    }
-
-    fn release(&self, unused: usize) {
-        self.consumed.fetch_sub(
-            u64::try_from(unused).expect("usize fits u64"),
-            Ordering::AcqRel,
-        );
     }
 
     fn mark_exceeded(&self) {
@@ -367,26 +363,17 @@ impl<R: Read> Read for BudgetedReader<R> {
         if buffer.is_empty() {
             return Ok(0);
         }
-        let Some(reserved) = self.budget.reserve(buffer.len()) else {
-            let mut probe = [0_u8; 1];
-            return match self.inner.read(&mut probe) {
-                Ok(0) => Ok(0),
-                Ok(_) => {
-                    self.budget.mark_exceeded();
-                    Err(io::Error::other("plugin output limit"))
-                }
-                Err(error) => Err(error),
-            };
-        };
-        match self.inner.read(&mut buffer[..reserved]) {
-            Ok(read) => {
-                self.budget.release(reserved - read);
-                Ok(read)
-            }
-            Err(error) => {
-                self.budget.release(reserved);
-                Err(error)
-            }
+        let read = self
+            .inner
+            .read(&mut buffer[..buffer.len().min(OUTPUT_READ_CHUNK)])?;
+        if read == 0 {
+            return Ok(0);
+        }
+        if self.budget.consume(read) {
+            Ok(read)
+        } else {
+            self.budget.mark_exceeded();
+            Err(io::Error::other("plugin output limit"))
         }
     }
 }
