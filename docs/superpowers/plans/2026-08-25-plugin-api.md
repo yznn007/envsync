@@ -30,7 +30,7 @@
 - Create: crates/envsync-plugin-api/src/lib.rs
 - Create: crates/envsync-plugin-api/tests/compatibility.rs
 
-- [ ] **Step 1: 建立最小可编译 crate 骨架并把它加入 workspace**
+- [x] **Step 1: 建立最小可编译 crate 骨架并把它加入 workspace**
 
 在根 Cargo.toml 的 members 中加入 crates/envsync-plugin-api。创建以下 manifest，依赖只能是协议和校验所需的库：
 
@@ -63,7 +63,7 @@ thiserror.workspace = true
 pub mod manifest;
 ~~~
 
-- [ ] **Step 2: 写 manifest 失败测试与可复用合法 fixture**
+- [x] **Step 2: 写 manifest 失败测试与可复用合法 fixture**
 
 在 tests/compatibility.rs 中先引入还不存在的 PluginManifest、PluginCatalog 和 PluginManifestError，以及 `use base64::Engine;`，并提供一个完整的合法 JSON：
 
@@ -118,7 +118,7 @@ fn catalog_rejects_duplicate_normalized_plugin_ids() {
 
 补充独立断言：合法 manifest 可读取 ID、版本、entrypoint 与 signing payload；非法 semver、零值/越界 resource limit、错误长度的 public key/signature、空 target 与 Windows 盘符均有稳定 error code。
 
-- [ ] **Step 3: 运行红灯测试**
+- [x] **Step 3: 运行红灯测试**
 
 运行：
 
@@ -128,7 +128,7 @@ cargo test -p envsync-plugin-api --test compatibility
 
 预期：编译失败，提示 manifest 模块或 PluginManifest 尚未定义；不得以 ignore、空断言或放宽测试绕过。
 
-- [ ] **Step 4: 保留红灯状态，不单独提交无法编译的 workspace**
+- [x] **Step 4: 保留红灯状态，不单独提交无法编译的 workspace**
 
 不要提交此时的红灯骨架。立即继续本任务的实现步骤，使最终 commit 始终保持 workspace 可编译、可测试；红灯命令与失败原因记入实现报告即可。
 
@@ -140,7 +140,7 @@ cargo test -p envsync-plugin-api --test compatibility
 - Modify: crates/envsync-plugin-api/src/lib.rs
 - Modify: crates/envsync-plugin-api/tests/compatibility.rs
 
-- [ ] **Step 1: 定义公开类型与稳定错误码**
+- [x] **Step 1: 定义公开类型与稳定错误码**
 
 在 manifest.rs 定义并文档化以下接口：
 
@@ -185,7 +185,7 @@ pub enum PluginManifestError {
 
 实现 PluginManifestError::code()，至少包括 plugin.manifest.invalid_id、invalid_semver、invalid_entrypoint、duplicate_id、unknown_capability、incompatible_api、invalid_limit、invalid_signature 与 invalid_target。每个 Display 只说明字段和结构原因，不能回显 signature 或完整输入 JSON。
 
-- [ ] **Step 2: 实现 ID、entrypoint、版本、capability 与限制校验**
+- [x] **Step 2: 实现 ID、entrypoint、版本、capability 与限制校验**
 
 实现 PluginId::parse 和 PluginEntrypoint::parse。路径检查必须逐段扫描，不能依赖当前平台的 Path 行为：拒绝空串、/ 开头、反斜杠、NUL、冒号、.、.. 与空段；仅允许由普通段通过 / 连接的相对路径。PluginManifest::from_json_value 必须先反序列化为私有 Raw 类型，再逐字段构造值对象，不能让未验证 String 进入公开结构。
 
@@ -202,13 +202,13 @@ pub const MAX_RPC_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 capabilities 和 targets 反序列化为封闭 enum；空 target/capability 集合或重复项目均拒绝。api 用 semver::VersionReq 解析，并要求至少匹配 HOST_PLUGIN_API_VERSIONS 中一个版本。
 
-- [ ] **Step 3: 实现 publisher/signature 与确定性 payload**
+- [x] **Step 3: 实现 publisher/signature 与确定性 payload**
 
 对 publisher.public_key 与 signature.value 使用 URL_SAFE_NO_PAD base64url 解码并严格要求 32/64 字节。PluginManifest::signing_payload() 构造一个不含 signature 的私有 UnsignedManifest，所有集合用 BTreeSet、字段以声明顺序由 serde_json::to_vec 输出。它返回 JSON bytes，供 Host 在固定插件签名 domain 下验签；本 crate 不调用 crypto verifier。
 
 PluginCatalog::new 将已验证 manifest 的 PluginId 放入 BTreeMap，第二次插入同 ID 返回 duplicate_id，禁止后者覆盖前者。
 
-- [ ] **Step 4: 导出 API 并让 manifest 测试转绿**
+- [x] **Step 4: 导出 API 并让 manifest 测试转绿**
 
 在 lib.rs re-export：
 
@@ -230,7 +230,7 @@ cargo clippy -p envsync-plugin-api --all-targets -- -D warnings
 
 预期：所有 manifest 合约通过，Clippy 无 warning。
 
-- [ ] **Step 5: 提交 manifest 实现**
+- [x] **Step 5: 提交 manifest 实现**
 
 ~~~bash
 git add Cargo.toml crates/envsync-plugin-api

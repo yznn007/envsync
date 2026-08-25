@@ -334,7 +334,7 @@ Gist 后端不接入通用 `Backend` trait：该 trait 要求对象级强 CAS �
 - Create: `crates/envsync-plugin-api/src/rpc.rs`
 - Test: `crates/envsync-plugin-api/tests/compatibility.rs`
 
-- [ ] **Step 1: manifest 测试**
+- [x] **Step 1: manifest 测试**
 
 manifest 含 ID、semver、publisher、API range、entrypoint、目标平台、capability、资源限制和
 签名。拒绝绝对 entrypoint、路径穿越、重复 ID、未知 capability 和不兼容 API。
